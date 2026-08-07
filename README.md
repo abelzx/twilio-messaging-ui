@@ -56,18 +56,14 @@ npm install
 
 ### 2. Configure Environment Variables
 
-Create a `.env` file in the root directory:
-
-```bash
-cp .env.example .env
-```
-
-For **local development**, add your Twilio credentials:
+Only needed for **local development**. Create a `.env` file in the root directory containing the *deployment's* own credentials — these are used for Twilio Sync access, and are unrelated to the OAuth credentials each user signs in with:
 
 ```env
 ACCOUNT_SID=your_account_sid
 AUTH_TOKEN=your_auth_token
 ```
+
+`.env` is gitignored. There is no `.env.example` to copy.
 
 **Note**: When deploying to Twilio, you don't need to set `ACCOUNT_SID` and `AUTH_TOKEN` in `.env` as the Functions runtime provides these automatically.
 
@@ -185,7 +181,6 @@ messaging-ui/
 │   ├── styles.css               # Styling
 │   └── twilio-oauth.private.js  # Shared OAuth client helper (private asset)
 ├── package.json
-├── .env.example
 └── README.md
 ```
 
@@ -204,8 +199,12 @@ messaging-ui/
 ### Sign-In Fails
 
 - *"Invalid OAuth credentials"* — check the Client ID and Client Secret, and that the secret has not been rotated. The secret is shown only once at creation; if it was lost, create a new one.
-- *"These OAuth credentials do not belong to that Account SID"* (Twilio error 70051) — either the Account SID is mistyped, or the OAuth app was created under a different account or subaccount.
-- Sign-in deliberately reads one phone number to prove the credentials match the Account SID. If the app lacks the Phone Numbers read scope, sign-in fails even with a valid Client ID and Secret.
+- *"Those OAuth credentials are valid, but they do not grant access to that Account SID"* (Twilio error 70051) — the credentials work, but not against this account. Either the Account SID is mistyped, or the OAuth app lacks the Phone Numbers read scope.
+- *"Those OAuth credentials do not belong to that Account SID"* — the same underlying mistake reported via a plain HTTP 401 rather than error 70051, usually an OAuth app created under a different account or subaccount.
+- *"That Account SID was not found"* (Twilio error 20404) — check the SID against the Console dashboard.
+- *"Twilio's token endpoint did not respond in time"* — a transient upstream problem, not a credential problem. Try again.
+
+Sign-in deliberately reads one phone number to prove the credentials match the Account SID. That is why a missing Phone Numbers read scope fails sign-in even with a valid Client ID and Secret.
 
 ### Template Picker Is Empty
 
