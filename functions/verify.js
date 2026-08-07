@@ -19,22 +19,10 @@ const TOKEN_URL = 'https://oauth.twilio.com/v2/token';
 const TOKEN_TIMEOUT_MS = 4000;
 const PROBE_TIMEOUT_MS = 4000;
 
-/**
- * Rejects if `promise` outlives `ms`. The SDK client has no request deadline of
- * its own (30s default, plus up to three retries on a 429), so without this the
- * platform can kill the invocation mid-probe and the user sees an opaque
- * timeout instead of the message below.
- */
-function withDeadline(promise, ms, message) {
-  let timer;
-  const deadline = new Promise((_, reject) => {
-    timer = setTimeout(
-      () => reject(Object.assign(new Error(message), { name: 'DeadlineError' })),
-      ms
-    );
-  });
-  return Promise.race([promise, deadline]).finally(() => clearTimeout(timer));
-}
+// `withDeadline` comes from the shared helper rather than being redefined here.
+// The SDK client has no request deadline of its own (30s default, plus up to three
+// retries on a 429), so without it the platform can kill the invocation mid-probe
+// and the user sees an opaque timeout instead of the message below.
 
 function describeTokenError(status, rawBody) {
   let parsed;
@@ -140,7 +128,7 @@ exports.handler = async function (context, event, callback) {
   //    confusingly on first send.
   try {
     const { client } = oauth.createOAuthClient(creds);
-    await withDeadline(
+    await oauth.withDeadline(
       client.incomingPhoneNumbers.list({ limit: 1 }),
       PROBE_TIMEOUT_MS,
       'Timed out reading phone numbers for that Account SID. Try again.'

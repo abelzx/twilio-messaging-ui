@@ -2,8 +2,9 @@ const twilio = require('twilio');
 const oauth = require(Runtime.getAssets()['/twilio-oauth.js'].path);
 
 /**
- * Send messages endpoint with chunking and timeout handling
- * Uses Twilio Sync to track progress and enable resumable execution
+ * POST /send-messages — sends a chunk of messages via the caller's OAuth app,
+ * with chunking and timeout handling.
+ * Uses Twilio Sync to track progress and enable resumable execution.
  */
 
 /**

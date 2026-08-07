@@ -86,16 +86,62 @@ function createOAuthClient(creds) {
   return { client, authStrategy };
 }
 
+/** Default ceiling on a token exchange. See `authenticate`. */
+const TOKEN_DEADLINE_MS = 4000;
+
+/**
+ * Rejects if `promise` outlives `ms`, with an Error named `DeadlineError`.
+ *
+ * `clearTimeout` runs in `.finally()` so a fast success does not leave a dangling
+ * timer holding the Function invocation open for the full duration.
+ */
+function withDeadline(promise, ms, message) {
+  let timer;
+  const deadline = new Promise((_, reject) => {
+    timer = setTimeout(
+      () => reject(Object.assign(new Error(message), { name: 'DeadlineError' })),
+      ms
+    );
+  });
+  return Promise.race([promise, deadline]).finally(() => clearTimeout(timer));
+}
+
 /**
  * Builds a client and proves the credentials work before returning it, so bad
  * credentials cost one clear failure instead of the same error repeated once per
  * message in a chunk. Throws a 401-flagged Error with a readable message.
+ *
+ * The token exchange is deadline-bounded, and that is load-bearing rather than
+ * defensive. `createOAuthClient` builds a fresh provider with an empty token
+ * cache, so this is a real network round trip on every call, and the SDK's
+ * `RequestClient` applies no deadline of its own — it defaults to 30s and retries
+ * a 429 up to three times. Left unbounded inside a 10s Function budget, a slow
+ * token endpoint strands the whole invocation: the platform kills it and the
+ * caller gets no response at all rather than a readable error.
+ *
+ * That matters most in `send-messages.js` and `resume-execution.js`, which call
+ * this once per 100-message chunk — roughly 50 times for a 5,000-message
+ * campaign, each one a fresh chance to lose an invocation. Worse, a kill
+ * mid-chunk can leave messages sent but not yet recorded in Sync, so the
+ * browser's retry re-sends them and a recipient gets the message twice.
+ *
+ * Bounding it here rather than in each Function is deliberate: all six callers
+ * inherit the protection, including any added later.
  */
-async function authenticate(creds) {
+async function authenticate(creds, timeoutMs = TOKEN_DEADLINE_MS) {
   const { client, authStrategy } = createOAuthClient(creds);
   try {
-    await authStrategy.getAuthString();
+    await withDeadline(
+      authStrategy.getAuthString(),
+      timeoutMs,
+      "Twilio's token endpoint did not respond in time. Try again."
+    );
   } catch (err) {
+    // A deadline is not a credential problem, so it must not be reported as a
+    // 401 — that would tell the user to check a Client Secret that is fine.
+    if (err.name === 'DeadlineError') {
+      throw httpError(504, err.message);
+    }
     throw httpError(401, tokenErrorMessage(err));
   }
   return client;
@@ -151,10 +197,14 @@ async function getOrCreateSyncService(client) {
 // module-interface sketch listed `tokenErrorMessage`, but no Function calls either
 // one: callers read `error.statusCode` off the thrown Error (see Task 3 onward) and
 // never need to construct one. Exporting them would advertise surface nobody uses.
+//
+// `withDeadline` IS exported, because verify.js needs it for its phone-number probe
+// — a second unbounded SDK call that `authenticate` does not cover.
 module.exports = {
   credsFrom,
   createOAuthClient,
   authenticate,
   ownerKeyFor,
   getOrCreateSyncService,
+  withDeadline,
 };
