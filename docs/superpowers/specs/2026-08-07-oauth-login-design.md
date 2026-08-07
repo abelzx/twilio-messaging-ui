@@ -267,8 +267,16 @@ Secret in a query string is recorded in request logs and browser history; an opa
 
 ### Configuration
 
-`twilio.json` replaces its `auth` entry with `verify`. No dependency changes:
-`twilio@5.10.6` is already installed and already exports
+`twilio.json` is deleted rather than updated, because nothing reads it. `twilio-run`
+loads configuration through cosmiconfig under the module name `twilioserverless`
+(`twilio-run/dist/config/utils/configLoader.js:9`), which searches `package.json`,
+`.twilioserverlessrc[.json|.yaml|.js]` and `twilioserverless.config.js` — never
+`twilio.json`. Function and asset visibility is derived from the filename
+(`.private.js` → `access = 'private'`, `serverless-api/dist/utils/fs.js:113`), not from
+a manifest. The file is also already stale: it omits `list-campaigns.js`, which
+deploys and works regardless. Keeping it would only invite the next reader to trust it.
+
+No dependency changes: `twilio@5.10.6` is already installed and already exports
 `ClientCredentialProviderBuilder`.
 
 ## Error handling
@@ -280,7 +288,7 @@ Secret in a query string is recorded in request logs and browser history; an opa
 | Account SID mismatch | Caught at login by the phone-number probe; Twilio error 70051 mapped to "these OAuth credentials do not belong to that Account SID" |
 | Secret rotated mid-campaign | The client loop's non-OK branch calls `showResumeOption()` (`app.js:726`); the campaign pauses and is resumable after re-login |
 | Campaign requested by a non-owner | HTTP 404, so a guessed campaign ID is not confirmed to exist |
-| Missing scope | Twilio error 70051. Content template failures degrade to a warning in `#content-template-help`, which already renders `data.error` this way (`app.js:250-256`), rather than breaking the WhatsApp or RCS channel |
+| Missing scope | Twilio error 70051. A Content scope miss fails soft on the existing non-OK branch (`app.js:288-297`): the picker falls back to "None (Use custom message)" and `#content-template-help` shows the error in red, rather than breaking the WhatsApp or RCS channel |
 | Token endpoint hangs | 8-second abort inside `/verify`; readable message instead of a platform timeout |
 | Rate limiting | `retryWithExponentialBackoff` is untouched |
 
