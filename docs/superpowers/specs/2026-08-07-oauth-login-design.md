@@ -381,6 +381,34 @@ Required from the deployer: the OAuth app's Client ID and Secret, and the list o
 scopes granted. Minimum for full function is Messaging read and write, Phone Numbers
 read, and whatever scope governs Content read.
 
+## Known limitation: duplicate sends on a lost Sync write
+
+Not introduced by this change, not fixed by it, and recorded because a code review
+surfaced it and the next reader deserves to know.
+
+`send-messages.js` and `resume-execution.js` both fetch the campaign document, send a
+chunk with `Promise.all`, then write `startIndex` back. There is no optimistic
+concurrency check — no `If-Match` on the document revision — between the read and the
+write. Two consequences, both reachable:
+
+- **Concurrent invocations.** Two tabs, or a double-clicked Resume button, both read the
+  same `startIndex`, compute the same chunk, and send to the same recipients. Real
+  duplicate messages; the losing write's statistics are silently discarded.
+- **A write that fails after the sends succeed.** If `Promise.all` resolves but the
+  follow-up `documents().update()` throws (rate limit, transient error), the request
+  500s with `startIndex` unadvanced. The browser retries, re-reads the stale
+  `startIndex`, and sends the same chunk again. No process kill is required — an
+  ordinary Sync API error is enough.
+
+It is left alone deliberately. The flaw is symmetric across both Functions, so fixing
+only the one under review would create exactly the silent divergence between the two
+copies that is the real cost of keeping them separate. A correct fix means a revision
+check in both, plus verifying Twilio Sync's `If-Match` semantics, which is its own piece
+of work rather than a footnote to an auth migration.
+
+Bounding the token exchange (§ Components) reduces the *odds* of the second case by
+keeping the invocation inside its budget. It does not close either case.
+
 ## Out of scope
 
 - Deduplicating the send loop between `send-messages.js` and `resume-execution.js`.

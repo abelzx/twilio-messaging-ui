@@ -1343,7 +1343,13 @@ exports.handler = async function(context, event, callback) {
       messages,
       channel,
       from,
-      resumeFrom: campaignData.startIndex || 0
+      resumeFrom: campaignData.startIndex || 0,
+      // Pass the handler's own start time down. Measuring from inside
+      // sendMessagesChunk would exclude the token exchange and the ownership
+      // fetch above it, so the 9s ceiling would no longer bound total elapsed
+      // time — the exact accounting send-messages.js gets right by capturing
+      // startTime at the top of its handler.
+      startTime
     });
 
     response.setStatusCode(200);
@@ -1371,10 +1377,10 @@ async function sendMessagesChunk(params) {
     messages,
     channel,
     from,
-    resumeFrom
+    resumeFrom,
+    startTime
   } = params;
 
-  const startTime = Date.now();
   const MAX_EXECUTION_TIME = 9000;
   const CHUNK_SIZE = 100; // Process 100 messages at a time for full-speed sending
 
@@ -1410,6 +1416,18 @@ async function sendMessagesChunk(params) {
         // Add content template if provided (for WhatsApp/RCS)
         if (message.contentSid) {
           messageParams.contentSid = message.contentSid;
+
+          // contentVariables MUST travel with contentSid. send-messages.js does
+          // this (lines 207-210); the pre-migration version of this file did not,
+          // so a resumed chunk of a personalised template campaign sent the
+          // template with its placeholders unfilled. app.js puts the variables on
+          // every message object, so the data was there — it was simply dropped.
+          if (message.contentVariables) {
+            messageParams.contentVariables =
+              typeof message.contentVariables === 'string'
+                ? message.contentVariables
+                : JSON.stringify(message.contentVariables);
+          }
         }
 
         if (channel === 'whatsapp') {
@@ -1432,6 +1450,12 @@ async function sendMessagesChunk(params) {
           // RCS can also use content templates
           if (message.contentSid) {
             messageParams.contentSid = message.contentSid;
+            if (message.contentVariables) {
+              messageParams.contentVariables =
+                typeof message.contentVariables === 'string'
+                  ? message.contentVariables
+                  : JSON.stringify(message.contentVariables);
+            }
           }
         }
 
@@ -2555,6 +2579,8 @@ Send roughly 250 messages, which exceeds one `CHUNK_SIZE = 100` invocation and f
 Expected: the campaign runs to completion without manual intervention, and the count matches what was submitted.
 
 This step is what proves Task 8's `ReferenceError` fix. `resume-execution.js` returned `hasMore: !isComplete` with `isComplete` never declared, so **every** resume threw before this change. No local check substitutes for this one.
+
+**Use a WhatsApp or RCS content template with at least one variable for this step, not a plain SMS.** The browser's own chunk loop calls `send-messages`, so a plain 250-message SMS run never exercises `resume-execution` at all — click "Resume Campaign" explicitly to force it. Then read the delivered messages: the variables must be **filled on every chunk**, not just the first. Before this change `resume-execution` dropped `contentVariables` entirely, and nothing in this checklist would have caught it, because no other step asserts on message *content*.
 
 If a resume stalls, click "Resume Campaign" and confirm it continues from the checkpoint rather than restarting from message 1.
 
