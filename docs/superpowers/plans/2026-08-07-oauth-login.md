@@ -1865,16 +1865,30 @@ async function handleLogin(e) {
             body: JSON.stringify(candidate)
         });
 
-        const data = await response.json();
+        // /verify answers HTTP 200 with valid:false for a credential rejection, so
+        // "rejected" is told apart from "transport failed" by `valid`, not by status.
+        //
+        // Parse defensively though: a platform-level failure returns an HTML error
+        // page, and calling .json() on that throws a SyntaxError whose message
+        // ("Unexpected token '<'…") is useless on a login screen. Substitute
+        // something a user can act on.
+        let data;
+        try {
+            data = await response.json();
+        } catch {
+            throw new Error(
+                `Sign-in failed unexpectedly (HTTP ${response.status}). Try again.`
+            );
+        }
 
-        // /verify answers HTTP 200 with valid:false for a credential rejection,
-        // so "rejected" is told apart from "transport failed" by `valid`, not by
-        // status.
         if (!data.valid) {
             throw new Error(data.error || 'Verification failed.');
         }
 
         saveCreds(candidate);
+        // Blank the form now rather than waiting for sign-out, so the Client Secret
+        // does not sit in a DOM input for the life of the tab.
+        document.getElementById('login-form').reset();
         showAppScreen();
     } catch (error) {
         errorDiv.textContent = error.message;
