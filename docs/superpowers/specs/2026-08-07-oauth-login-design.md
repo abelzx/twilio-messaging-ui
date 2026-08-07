@@ -292,6 +292,24 @@ No dependency changes: `twilio@5.10.6` is already installed and already exports
 | Token endpoint hangs | 8-second abort inside `/verify`; readable message instead of a platform timeout |
 | Rate limiting | `retryWithExponentialBackoff` is untouched |
 
+### Settled: raw upstream text in error responses
+
+`tokenErrorMessage`'s fallback branch returns `Could not obtain a Twilio access token
+— <raw>`, forwarding the SDK's own error text into the HTTP response body. Every
+migrated Function echoes `error.message` this way. This was raised independently by
+two reviewers, so the decision is recorded here rather than re-litigated per Function.
+
+**It stays.** The raw text originates from Twilio's OAuth endpoint or the SDK, never
+from this deployment, and it carries no credential — `ApiTokenManager.fetchToken()`
+discards the original error and throws a fresh `Error` holding only a status and
+message, so the submitted secret cannot ride along. `tokenErrorMessage` already
+collapses whitespace to a single line. Suppressing the text would make a genuine
+transient outage undiagnosable from the UI, which is a worse failure than an
+occasionally ugly message.
+
+Bad credentials — the common case — never reach this branch; they are matched by
+`/\b401\b|invalid credentials|invalid_client/i` and get a clean message instead.
+
 ## Security properties
 
 - No user credential is stored server-side, in environment variables, or in logs.
