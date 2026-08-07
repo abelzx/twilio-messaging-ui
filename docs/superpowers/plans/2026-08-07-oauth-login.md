@@ -779,7 +779,10 @@ exports.handler = async function(context, event, callback) {
 
       // Campaigns are owned by the OAuth app that created them. Documents
       // written before this migration carry no ownerKey and are never listed.
-      if (campaignData.ownerKey !== ownerKey) {
+      // `!campaignData` guard so one malformed document skips itself rather than
+      // throwing and turning the caller's whole campaign list into a 500. Same
+      // shape as the checks in check-status.js and resume-execution.js.
+      if (!campaignData || campaignData.ownerKey !== ownerKey) {
         continue;
       }
 
@@ -1065,7 +1068,9 @@ Replace everything from `    // Get or create campaign document in Sync` through
       // it. 404 rather than 403, so a guessed campaign ID is not confirmed to
       // exist. Documents predating this migration have no ownerKey and so fail
       // this check, consistent with their absence from the campaign list.
-      if (campaignDoc.data.ownerKey !== ownerKey) {
+      // Same `!data` guard as list-campaigns.js and check-status.js — a document
+      // with no data must fail the ownership check, not throw.
+      if (!campaignDoc.data || campaignDoc.data.ownerKey !== ownerKey) {
         response.setStatusCode(404);
         response.setBody({ error: 'Campaign not found' });
         return callback(null, response);
