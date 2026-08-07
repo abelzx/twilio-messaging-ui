@@ -10,8 +10,31 @@ const oauth = require(Runtime.getAssets()['/twilio-oauth.js'].path);
 
 const TOKEN_URL = 'https://oauth.twilio.com/v2/token';
 
-/** Leaves headroom inside the 10s Function timeout for a readable error. */
-const TOKEN_TIMEOUT_MS = 8000;
+// This handler makes TWO token exchanges, not one: the raw fetch below, and a
+// second one inside the SDK when `createOAuthClient` builds a fresh provider for
+// step 2. The raw fetch is still worth its cost — it is the only way to get a
+// precise HTTP status to map to a message — but it means the 10s Function budget
+// has to cover two round trips, so each step gets roughly half and its own
+// deadline. Neither step may be left unbounded.
+const TOKEN_TIMEOUT_MS = 4000;
+const PROBE_TIMEOUT_MS = 4000;
+
+/**
+ * Rejects if `promise` outlives `ms`. The SDK client has no request deadline of
+ * its own (30s default, plus up to three retries on a 429), so without this the
+ * platform can kill the invocation mid-probe and the user sees an opaque
+ * timeout instead of the message below.
+ */
+function withDeadline(promise, ms, message) {
+  let timer;
+  const deadline = new Promise((_, reject) => {
+    timer = setTimeout(
+      () => reject(Object.assign(new Error(message), { name: 'DeadlineError' })),
+      ms
+    );
+  });
+  return Promise.race([promise, deadline]).finally(() => clearTimeout(timer));
+}
 
 function describeTokenError(status, rawBody) {
   let parsed;
@@ -30,9 +53,22 @@ function describeTokenError(status, rawBody) {
   return detail || `Token request failed (HTTP ${status}).`;
 }
 
-/** The credentials are known good by this point, so the fault is the SID or a scope. */
+/**
+ * Maps a step-2 failure to a message. Step 1 proved the credentials, but that
+ * does NOT make every failure here the SID's fault: the client built in step 2
+ * runs its own token exchange, so a transient token failure can surface at this
+ * step too. Those arrive as a plain Error carrying neither `status` nor `code`,
+ * and must not be blamed on the Account SID.
+ */
 function describeAccountError(err) {
   const code = err.code ?? err.status;
+
+  if (err.name === 'DeadlineError') {
+    return err.message;
+  }
+  if (code === undefined && /access token/i.test(err.message || '')) {
+    return 'Could not obtain a Twilio access token while checking the Account SID. This is usually transient — try again.';
+  }
   if (code === 70051 || err.status === 403) {
     return 'Those OAuth credentials are valid, but they do not grant access to that Account SID. Check the Account SID, and that the OAuth app has the Phone Numbers read scope. (Twilio error 70051)';
   }
@@ -104,7 +140,11 @@ exports.handler = async function (context, event, callback) {
   //    confusingly on first send.
   try {
     const { client } = oauth.createOAuthClient(creds);
-    await client.incomingPhoneNumbers.list({ limit: 1 });
+    await withDeadline(
+      client.incomingPhoneNumbers.list({ limit: 1 }),
+      PROBE_TIMEOUT_MS,
+      'Timed out reading phone numbers for that Account SID. Try again.'
+    );
   } catch (err) {
     console.error('Verify account probe failed:', err);
     response.setBody({ valid: false, error: describeAccountError(err) });
