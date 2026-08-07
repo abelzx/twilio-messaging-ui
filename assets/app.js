@@ -222,34 +222,93 @@ function showAppScreen() {
     startStatusAutoRefresh();
 }
 
-async function loadPhoneNumbers() {
+async function loadPhoneNumbers(channel) {
     if (!creds) return;
 
+    const select = document.getElementById('from-number-select');
+    const ch = channel || document.getElementById('channel').value || 'sms';
+
+    select.innerHTML = '<option value="">Loading senders…</option>';
+
     try {
-        const response = await postToFunction('get-phone-numbers');
+        const response = await postToFunction('get-phone-numbers', { channel: ch });
         const data = await response.json();
 
-        if (response.ok && data.phoneNumbers) {
-            const select = document.getElementById('from-number-select');
-            select.innerHTML = '<option value="">Select a number...</option>';
-            
-            data.phoneNumbers.forEach(number => {
-                const option = document.createElement('option');
-                option.value = number.phoneNumber;
-                option.textContent = `${number.friendlyName} (${number.phoneNumber})`;
-                option.dataset.phoneNumber = number.phoneNumber;
-                select.appendChild(option);
-            });
+        if (!response.ok || !data.success) {
+            throw new Error(data.error || 'Could not load senders.');
         }
+
+        renderSenderOptions(data);
     } catch (error) {
-        console.error('Error loading phone numbers:', error);
+        console.error('Error loading senders:', error);
+        select.innerHTML = '<option value="">Could not load senders</option>';
+        setSenderHelp(`Could not load senders — ${error.message}`, true);
     }
+}
+
+const CHANNEL_SENDER_NOUN = {
+    sms: 'SMS-capable number',
+    mms: 'SMS-capable number',
+    whatsapp: 'WhatsApp sender',
+    rcs: 'RCS agent',
+    messenger: 'Facebook Page',
+};
+
+function setSenderHelp(text, isProblem) {
+    const help = document.getElementById('from-number-help');
+    if (!help) return;
+    help.textContent = text;
+    help.classList.toggle('field-help--problem', Boolean(isProblem));
+}
+
+function renderSenderOptions(data) {
+    const select = document.getElementById('from-number-select');
+    const noun = CHANNEL_SENDER_NOUN[data.channel] || 'sender';
+    const senders = Array.isArray(data.senders) ? data.senders : [];
+
+    select.innerHTML = '';
+
+    if (!senders.length) {
+        const opt = document.createElement('option');
+        opt.value = '';
+        opt.disabled = true;
+        // Distinguish "none exist" from "some exist but none usable" — the
+        // second is a fixable configuration problem and should say so.
+        opt.textContent = data.totalRegistered
+            ? `No usable ${noun}s — ${data.totalRegistered} registered but not online`
+            : `No ${noun}s registered on this account`;
+        select.appendChild(opt);
+        setSenderHelp(opt.textContent, true);
+        return;
+    }
+
+    const placeholder = document.createElement('option');
+    placeholder.value = '';
+    placeholder.textContent = `Select a ${noun}…`;
+    select.appendChild(placeholder);
+
+    for (const sender of senders) {
+        const opt = document.createElement('option');
+        opt.value = sender.value;
+        opt.textContent = sender.label;
+        select.appendChild(opt);
+    }
+
+    const hidden = data.totalRegistered - senders.length;
+    setSenderHelp(
+        hidden > 0
+            ? `${senders.length} ${noun}${senders.length === 1 ? '' : 's'} available · ${hidden} not online`
+            : `${senders.length} ${noun}${senders.length === 1 ? '' : 's'} available`,
+        false
+    );
 }
 
 async function handleChannelChange() {
     if (!creds) return;
 
     const channel = document.getElementById('channel').value;
+    // The sender list is channel-specific — a WhatsApp sender is not a phone number.
+    loadPhoneNumbers(channel);
     const contentTemplateGroup = document.getElementById('content-template-group');
     const contentTemplateSelect = document.getElementById('content-template');
     const contentTemplateHelp = document.getElementById('content-template-help');

@@ -213,8 +213,11 @@ async function sendMessagesChunk(params) {
         }
 
         if (channel === 'whatsapp') {
-          messageParams.from = `whatsapp:${messageParams.from}`;
-          messageParams.to = `whatsapp:${messageParams.to}`;
+          // Idempotent: the From value may already carry the prefix, because
+          // the Channel Senders API returns senderId as `whatsapp:+65…`.
+          const wa = (v) => (String(v).startsWith('whatsapp:') ? String(v) : `whatsapp:${v}`);
+          messageParams.from = wa(messageParams.from);
+          messageParams.to = wa(messageParams.to);
         } else if (channel === 'messenger') {
           messageParams.messagingServiceSid = message.messagingServiceSid || context.MESSAGING_SERVICE_SID;
         } else if (channel === 'mms') {
