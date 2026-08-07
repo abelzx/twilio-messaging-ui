@@ -1,12 +1,15 @@
-const twilio = require('twilio');
-
 /**
- * Check campaign status
+ * POST /check-status — campaign status, with per-message status refreshed
+ * from Twilio.
  */
+
+const twilio = require('twilio');
+const oauth = require(Runtime.getAssets()['/twilio-oauth.js'].path);
+
 exports.handler = async function(context, event, callback) {
   const response = new Twilio.Response();
   response.appendHeader('Access-Control-Allow-Origin', '*');
-  response.appendHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  response.appendHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   response.appendHeader('Access-Control-Allow-Headers', 'Content-Type');
   response.appendHeader('Content-Type', 'application/json');
 
@@ -14,38 +17,50 @@ exports.handler = async function(context, event, callback) {
     return callback(null, response);
   }
 
-  try {
-    const { campaignId, sessionId } = event;
+  const campaignId = event.campaignId;
 
-    if (!campaignId || !sessionId) {
-      response.setStatusCode(400);
-      response.setBody({ error: 'campaignId and sessionId are required' });
+  if (!campaignId) {
+    response.setStatusCode(400);
+    response.setBody({ error: 'campaignId is required' });
+    return callback(null, response);
+  }
+
+  let creds;
+  let client;
+  try {
+    creds = oauth.credsFrom(event);
+    client = await oauth.authenticate(creds);
+  } catch (error) {
+    response.setStatusCode(error.statusCode || 401);
+    response.setBody({ error: error.message });
+    return callback(null, response);
+  }
+
+  try {
+    // The runtime client is used for Sync only, never for the user's account.
+    const runtimeClient = twilio(context.ACCOUNT_SID, context.AUTH_TOKEN);
+    const syncServiceSid = context.SYNC_SERVICE_SID || await oauth.getOrCreateSyncService(runtimeClient);
+    const syncClient = runtimeClient.sync.v1.services(syncServiceSid);
+
+    // Campaign IDs are `campaign_<timestamp>`, so they are guessable rather
+    // than secret. Answer 404 both when the document is absent and when it
+    // belongs to someone else — a 403 would confirm that a guessed ID exists.
+    let campaignData = null;
+    try {
+      const campaignDoc = await syncClient.documents(campaignId).fetch();
+      campaignData = campaignDoc.data;
+    } catch (error) {
+      // 20404 is "document not found"; anything else is a real failure.
+      if (error.status !== 404 && error.code !== 20404) {
+        throw error;
+      }
+    }
+
+    if (!campaignData || campaignData.ownerKey !== oauth.ownerKeyFor(creds)) {
+      response.setStatusCode(404);
+      response.setBody({ error: 'Campaign not found' });
       return callback(null, response);
     }
-
-    // Get credentials from Sync using runtime credentials
-    const runtimeClient = twilio(context.ACCOUNT_SID, context.AUTH_TOKEN);
-    const syncServiceSid = context.SYNC_SERVICE_SID || await getOrCreateSyncService(runtimeClient);
-    const syncClient = runtimeClient.sync.v1.services(syncServiceSid);
-    
-    const credentialsDoc = await syncClient.documents(`credentials_${sessionId}`).fetch();
-    const credentials = credentialsDoc.data;
-
-    // Initialize Twilio client with user credentials
-    let client;
-    if (credentials.authToken) {
-      client = twilio(credentials.accountSid, credentials.authToken);
-    } else if (credentials.apiKey && credentials.apiSecret) {
-      client = twilio(credentials.apiKey, credentials.apiSecret, { 
-        accountSid: credentials.accountSid 
-      });
-    } else {
-      throw new Error('Invalid credentials');
-    }
-
-    // Get campaign document
-    const campaignDoc = await syncClient.documents(campaignId).fetch();
-    const campaignData = campaignDoc.data;
 
     // Update message statuses from Twilio
     // Merge with existing webhook data to preserve delivered/read flags
@@ -128,33 +143,4 @@ exports.handler = async function(context, event, callback) {
     return callback(null, response);
   }
 };
-
-async function getOrCreateSyncService(client) {
-  try {
-    // Try to find existing service
-    const services = await client.sync.v1.services.list({ limit: 20 });
-    const existingService = services.find(s => s.friendlyName === 'Messaging UI Sync Service');
-    if (existingService) {
-      return existingService.sid;
-    }
-    
-    // Create new service if not found
-    const service = await client.sync.v1.services.create({
-      friendlyName: 'Messaging UI Sync Service'
-    });
-    return service.sid;
-  } catch (error) {
-    console.error('Error getting/creating Sync service:', error);
-    // If we can't create/get Sync service, try to continue with first available
-    try {
-      const services = await client.sync.v1.services.list({ limit: 1 });
-      if (services.length > 0) {
-        return services[0].sid;
-      }
-    } catch (e) {
-      console.error('Error getting any Sync service:', e);
-    }
-    throw error;
-  }
-}
 
