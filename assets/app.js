@@ -212,9 +212,9 @@ function showLoginScreen() {
 function showAppScreen() {
     document.getElementById('login-screen').classList.remove('active');
     document.getElementById('app-screen').classList.add('active');
-    // Load phone numbers when app screen is shown
-    loadPhoneNumbers();
-    // Load content templates for current channel
+    // handleChannelChange() loads the senders for the current channel, so there is
+    // no separate loadPhoneNumbers() call here. Calling both would fire two
+    // identical requests, each paying its own OAuth token exchange.
     handleChannelChange();
     // Load campaigns list
     loadCampaigns();
