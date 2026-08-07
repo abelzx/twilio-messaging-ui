@@ -2,7 +2,10 @@
 const FUNCTIONS_BASE_URL = window.location.origin.replace(/\/$/, '');
 
 // State
-let sessionId = null;
+const CREDS_KEY = 'twilio_messaging_oauth';
+
+/** { accountSid, clientId, clientSecret }, or null when signed out. */
+let creds = null;
 let currentCampaignId = null;
 let resumeInterval = null;
 let statusRefreshInterval = null;
@@ -15,9 +18,11 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 function initializeApp() {
-    // Check if already logged in
-    sessionId = localStorage.getItem('twilio_session_id');
-    if (sessionId) {
+    // Restore the session if this tab already holds credentials. They are not
+    // re-verified here, so a rotated secret surfaces on the first action rather
+    // than at page load.
+    creds = loadCreds();
+    if (creds) {
         showAppScreen();
     } else {
         showLoginScreen();
@@ -49,15 +54,50 @@ function setupPhoneNumberHandlers() {
     }
 }
 
-function setupEventListeners() {
-    // Auth method tabs
-    document.querySelectorAll('.tab-btn').forEach(btn => {
-        btn.addEventListener('click', (e) => {
-            const method = e.target.dataset.method;
-            switchAuthMethod(method);
-        });
-    });
+// --- Credentials -----------------------------------------------------------
+// sessionStorage rather than localStorage: an OAuth Client Secret should not
+// outlive the tab or persist to disk. It is still readable by JavaScript on
+// this origin — see docs/superpowers/specs/2026-08-07-oauth-login-design.md
+// § Security properties.
 
+function loadCreds() {
+    try {
+        const raw = sessionStorage.getItem(CREDS_KEY);
+        if (!raw) return null;
+        const parsed = JSON.parse(raw);
+        if (parsed && parsed.accountSid && parsed.clientId && parsed.clientSecret) {
+            return parsed;
+        }
+    } catch (error) {
+        console.warn('Discarding unreadable stored credentials:', error);
+    }
+    sessionStorage.removeItem(CREDS_KEY);
+    return null;
+}
+
+function saveCreds(next) {
+    creds = next;
+    sessionStorage.setItem(CREDS_KEY, JSON.stringify(next));
+}
+
+function clearCreds() {
+    creds = null;
+    sessionStorage.removeItem(CREDS_KEY);
+}
+
+/**
+ * Calls a Function with the credentials in the JSON body. Never a query string:
+ * a Client Secret there would be recorded in request logs and browser history.
+ */
+async function postToFunction(path, body = {}) {
+    return fetch(`${FUNCTIONS_BASE_URL}/${path}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...creds, ...body })
+    });
+}
+
+function setupEventListeners() {
     // Login form
     document.getElementById('login-form').addEventListener('submit', handleLogin);
 
@@ -91,89 +131,52 @@ function setupEventListeners() {
     }
 }
 
-function switchAuthMethod(method) {
-    document.querySelectorAll('.tab-btn').forEach(btn => {
-        btn.classList.remove('active');
-    });
-    document.querySelector(`[data-method="${method}"]`).classList.add('active');
-
-    if (method === 'account') {
-        document.getElementById('account-auth').style.display = 'block';
-        document.getElementById('api-auth').style.display = 'none';
-        
-        // Set required attributes for account auth fields
-        document.getElementById('account-sid').required = true;
-        document.getElementById('auth-token').required = true;
-        
-        // Remove required attributes from API auth fields
-        document.getElementById('api-account-sid').required = false;
-        document.getElementById('api-key').required = false;
-        document.getElementById('api-secret').required = false;
-    } else {
-        document.getElementById('account-auth').style.display = 'none';
-        document.getElementById('api-auth').style.display = 'block';
-        
-        // Remove required attributes from account auth fields
-        document.getElementById('account-sid').required = false;
-        document.getElementById('auth-token').required = false;
-        
-        // Set required attributes for API auth fields
-        document.getElementById('api-account-sid').required = true;
-        document.getElementById('api-key').required = true;
-        document.getElementById('api-secret').required = true;
-    }
-}
-
 async function handleLogin(e) {
     e.preventDefault();
     const errorDiv = document.getElementById('login-error');
+    const loginBtn = document.getElementById('login-btn');
     errorDiv.classList.remove('show');
     errorDiv.textContent = '';
 
-    const activeMethod = document.querySelector('.tab-btn.active').dataset.method;
-    let payload = {};
+    const candidate = {
+        accountSid: document.getElementById('account-sid').value.trim(),
+        clientId: document.getElementById('client-id').value.trim(),
+        clientSecret: document.getElementById('client-secret').value.trim()
+    };
 
-    if (activeMethod === 'account') {
-        payload = {
-            accountSid: document.getElementById('account-sid').value.trim(),
-            authToken: document.getElementById('auth-token').value.trim()
-        };
-    } else {
-        payload = {
-            accountSid: document.getElementById('api-account-sid').value.trim(),
-            apiKey: document.getElementById('api-key').value.trim(),
-            apiSecret: document.getElementById('api-secret').value.trim()
-        };
-    }
+    loginBtn.disabled = true;
+    loginBtn.textContent = 'Signing in…';
 
     try {
-        const response = await fetch(`${FUNCTIONS_BASE_URL}/auth`, {
+        const response = await fetch(`${FUNCTIONS_BASE_URL}/verify`, {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify(payload)
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(candidate)
         });
 
         const data = await response.json();
 
-        if (!response.ok) {
-            throw new Error(data.error || 'Authentication failed');
+        // /verify answers HTTP 200 with valid:false for a credential rejection,
+        // so "rejected" is told apart from "transport failed" by `valid`, not by
+        // status.
+        if (!data.valid) {
+            throw new Error(data.error || 'Verification failed.');
         }
 
-        sessionId = data.sessionId;
-        localStorage.setItem('twilio_session_id', sessionId);
+        saveCreds(candidate);
         showAppScreen();
     } catch (error) {
         errorDiv.textContent = error.message;
         errorDiv.classList.add('show');
+    } finally {
+        loginBtn.disabled = false;
+        loginBtn.textContent = 'Sign In';
     }
 }
 
 function handleLogout() {
-    sessionId = null;
+    clearCreds();
     currentCampaignId = null;
-    localStorage.removeItem('twilio_session_id');
     if (resumeInterval) {
         clearInterval(resumeInterval);
         resumeInterval = null;
@@ -188,10 +191,8 @@ function handleLogout() {
 function showLoginScreen() {
     document.getElementById('app-screen').classList.remove('active');
     document.getElementById('login-screen').classList.add('active');
-    // Clear form
+    // Clear the form so the Client Secret is not left sitting in a DOM node.
     document.getElementById('login-form').reset();
-    // Reset to account auth method and update required attributes
-    switchAuthMethod('account');
 }
 
 function showAppScreen() {
@@ -208,11 +209,10 @@ function showAppScreen() {
 }
 
 async function loadPhoneNumbers() {
-    if (!sessionId) return;
+    if (!creds) return;
 
     try {
-        const params = new URLSearchParams({ sessionId });
-        const response = await fetch(`${FUNCTIONS_BASE_URL}/get-phone-numbers?${params.toString()}`);
+        const response = await postToFunction('get-phone-numbers');
         const data = await response.json();
 
         if (response.ok && data.phoneNumbers) {
@@ -233,7 +233,7 @@ async function loadPhoneNumbers() {
 }
 
 async function handleChannelChange() {
-    if (!sessionId) return;
+    if (!creds) return;
 
     const channel = document.getElementById('channel').value;
     const contentTemplateGroup = document.getElementById('content-template-group');
@@ -263,8 +263,7 @@ async function handleChannelChange() {
 
     // Load content templates for this channel
     try {
-        const params = new URLSearchParams({ sessionId, channel });
-        const response = await fetch(`${FUNCTIONS_BASE_URL}/get-content-templates?${params.toString()}`);
+        const response = await postToFunction('get-content-templates', { channel });
         const data = await response.json();
 
         if (response.ok && data.success !== false) {
@@ -686,20 +685,13 @@ async function sendMessagesBatch(messages, channel, from, campaignName) {
 
     while (!isComplete) {
         try {
-            const response = await fetch(`${FUNCTIONS_BASE_URL}/send-messages`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({
-                    sessionId,
-                    messages,
-                    campaignId: currentCampaignId,
-                    channel,
-                    from,
-                    resumeFrom,
-                    campaignName: campaignName || null
-                })
+            const response = await postToFunction('send-messages', {
+                messages,
+                campaignId: currentCampaignId,
+                channel,
+                from,
+                resumeFrom,
+                campaignName: campaignName || null
             });
 
             const data = await response.json();
@@ -741,16 +733,12 @@ async function sendMessagesBatch(messages, channel, from, campaignName) {
 }
 
 async function checkCampaignStatus() {
-    if (!currentCampaignId || !sessionId) return;
+    if (!currentCampaignId || !creds) return;
 
     try {
-        const params = new URLSearchParams({
-            campaignId: currentCampaignId,
-            sessionId: sessionId
+        const response = await postToFunction('check-status', {
+            campaignId: currentCampaignId
         });
-        const response = await fetch(
-            `${FUNCTIONS_BASE_URL}/check-status?${params.toString()}`
-        );
 
         const data = await response.json();
 
@@ -816,8 +804,8 @@ async function resumeCampaign() {
 }
 
 async function resumeCampaignById(campaignId, event) {
-    if (!sessionId) {
-        alert('Please log in to resume campaigns');
+    if (!creds) {
+        alert('Please sign in to resume campaigns');
         return;
     }
 
@@ -830,11 +818,7 @@ async function resumeCampaignById(campaignId, event) {
 
     try {
         // Fetch campaign details including messages
-        const params = new URLSearchParams({
-            campaignId: campaignId,
-            sessionId: sessionId
-        });
-        const response = await fetch(`${FUNCTIONS_BASE_URL}/check-status?${params.toString()}`);
+        const response = await postToFunction('check-status', { campaignId });
         const data = await response.json();
 
         if (!response.ok) {
@@ -854,18 +838,11 @@ async function resumeCampaignById(campaignId, event) {
         // Continue resuming until complete
         let isComplete = false;
         while (!isComplete) {
-            const resumeResponse = await fetch(`${FUNCTIONS_BASE_URL}/resume-execution`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({
-                    sessionId: sessionId,
-                    campaignId: campaignId,
-                    messages: campaign.messages,
-                    channel: campaign.channel,
-                    from: campaign.from
-                })
+            const resumeResponse = await postToFunction('resume-execution', {
+                campaignId: campaignId,
+                messages: campaign.messages,
+                channel: campaign.channel,
+                from: campaign.from
             });
 
             const resumeData = await resumeResponse.json();
@@ -914,14 +891,13 @@ window.resumeCampaignById = resumeCampaignById;
 
 // Campaign listing functions
 async function loadCampaigns() {
-    if (!sessionId) return;
+    if (!creds) return;
 
     const campaignsContent = document.getElementById('campaigns-content');
     if (!campaignsContent) return;
 
     try {
-        const params = new URLSearchParams({ sessionId });
-        const response = await fetch(`${FUNCTIONS_BASE_URL}/list-campaigns?${params.toString()}`);
+        const response = await postToFunction('list-campaigns');
         const data = await response.json();
 
         if (response.ok && data.campaigns) {
@@ -1037,16 +1013,10 @@ async function viewCampaign(campaignId) {
 }
 
 async function fetchAndDisplayCampaignDetails(campaignId) {
-    if (!sessionId) return;
+    if (!creds) return;
 
     try {
-        const params = new URLSearchParams({
-            campaignId: campaignId,
-            sessionId: sessionId
-        });
-        const response = await fetch(
-            `${FUNCTIONS_BASE_URL}/check-status?${params.toString()}`
-        );
+        const response = await postToFunction('check-status', { campaignId });
 
         const data = await response.json();
 
@@ -1172,7 +1142,7 @@ function startStatusAutoRefresh() {
     }
 
     // Only start refresh if we have an active campaign
-    if (currentCampaignId && sessionId) {
+    if (currentCampaignId && creds) {
         // Refresh every 5 seconds
         statusRefreshInterval = setInterval(async () => {
             await checkCampaignStatus();
