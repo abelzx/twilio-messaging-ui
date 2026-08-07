@@ -1,12 +1,13 @@
-const twilio = require('twilio');
-
 /**
- * Get content templates for WhatsApp, RCS, and other supported channels
+ * POST /get-content-templates — content templates for WhatsApp and RCS.
  */
+
+const oauth = require(Runtime.getAssets()['/twilio-oauth.js'].path);
+
 exports.handler = async function(context, event, callback) {
   const response = new Twilio.Response();
   response.appendHeader('Access-Control-Allow-Origin', '*');
-  response.appendHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  response.appendHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   response.appendHeader('Access-Control-Allow-Headers', 'Content-Type');
   response.appendHeader('Content-Type', 'application/json');
 
@@ -14,49 +15,29 @@ exports.handler = async function(context, event, callback) {
     return callback(null, response);
   }
 
+  const channel = event.channel;
+
+  if (!channel) {
+    console.warn('No channel parameter provided');
+    response.setStatusCode(200);
+    response.setBody({
+      success: true,
+      templates: [],
+      message: 'No channel specified. Content templates require a channel parameter.'
+    });
+    return callback(null, response);
+  }
+
+  let client;
   try {
-    const { sessionId, channel } = event;
+    client = await oauth.authenticate(oauth.credsFrom(event));
+  } catch (error) {
+    response.setStatusCode(error.statusCode || 401);
+    response.setBody({ error: error.message });
+    return callback(null, response);
+  }
 
-    console.log('Received request - sessionId:', sessionId, 'channel:', channel);
-    console.log('Event keys:', Object.keys(event));
-
-    if (!sessionId) {
-      response.setStatusCode(400);
-      response.setBody({ error: 'sessionId is required' });
-      return callback(null, response);
-    }
-
-    if (!channel) {
-      console.warn('No channel parameter provided');
-      response.setStatusCode(200);
-      response.setBody({
-        success: true,
-        templates: [],
-        message: 'No channel specified. Content templates require a channel parameter.'
-      });
-      return callback(null, response);
-    }
-
-    // Get credentials from Sync using runtime credentials
-    const runtimeClient = twilio(context.ACCOUNT_SID, context.AUTH_TOKEN);
-    const syncServiceSid = context.SYNC_SERVICE_SID || await getOrCreateSyncService(runtimeClient);
-    const syncClient = runtimeClient.sync.v1.services(syncServiceSid);
-    
-    const credentialsDoc = await syncClient.documents(`credentials_${sessionId}`).fetch();
-    const credentials = credentialsDoc.data;
-
-    // Initialize Twilio client with user credentials
-    let client;
-    if (credentials.authToken) {
-      client = twilio(credentials.accountSid, credentials.authToken);
-    } else if (credentials.apiKey && credentials.apiSecret) {
-      client = twilio(credentials.apiKey, credentials.apiSecret, { 
-        accountSid: credentials.accountSid 
-      });
-    } else {
-      throw new Error('Invalid credentials');
-    }
-
+  try {
     const templates = [];
 
     // Fetch content templates based on channel
@@ -193,34 +174,5 @@ exports.handler = async function(context, event, callback) {
 function isNotVerifyAutoCreated(template) {
   const name = (template.friendlyName || template.name || '').toLowerCase();
   return !name.startsWith('verify_auto_created');
-}
-
-async function getOrCreateSyncService(client) {
-  try {
-    // Try to find existing service
-    const services = await client.sync.v1.services.list({ limit: 20 });
-    const existingService = services.find(s => s.friendlyName === 'Messaging UI Sync Service');
-    if (existingService) {
-      return existingService.sid;
-    }
-    
-    // Create new service if not found
-    const service = await client.sync.v1.services.create({
-      friendlyName: 'Messaging UI Sync Service'
-    });
-    return service.sid;
-  } catch (error) {
-    console.error('Error getting/creating Sync service:', error);
-    // If we can't create/get Sync service, try to continue with first available
-    try {
-      const services = await client.sync.v1.services.list({ limit: 1 });
-      if (services.length > 0) {
-        return services[0].sid;
-      }
-    } catch (e) {
-      console.error('Error getting any Sync service:', e);
-    }
-    throw error;
-  }
 }
 
