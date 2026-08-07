@@ -22,6 +22,8 @@
 
 **Do not run `twilio serverless:deploy` until Task 12.** A half-migrated deployment has functions expecting credentials in the body and a frontend still sending `sessionId`.
 
+Expect a specific broken window between Tasks 6 and 8: `check-status` starts requiring `ownerKey` in Task 6, but nothing *writes* `ownerKey` until Task 7 (`send-messages`) and Task 8 (`resume-execution`). In between, `check-status` correctly 404s even for a campaign's rightful owner, because no document carries the field yet. That is the task ordering working as intended, not a regression — and another reason not to deploy mid-sequence.
+
 ## File Structure
 
 | File | Action | Responsibility after this change |

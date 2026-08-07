@@ -265,6 +265,19 @@ The four GET → POST conversions are a security requirement, not tidying. A Cli
 Secret in a query string is recorded in request logs and browser history; an opaque
 `sessionId` was not.
 
+What this does and does not guarantee, stated precisely: it guarantees *this
+frontend* never places a secret in a URL. It does **not** make the endpoints refuse
+credentials supplied as query parameters. Twilio Functions merge query parameters and
+body into a single `event` object, and none of these Functions asserts
+`event.request.method === 'POST'` — the `Access-Control-Allow-Methods` header is
+advisory to browsers, not server-side enforcement. A caller who hand-crafts a GET
+with `?clientSecret=…` will still be served, and will have logged their own secret.
+
+That residual case is accepted rather than fixed. It harms only the caller who chooses
+it, the pattern predates this change in all six Functions, and adding a method check to
+each is outside this spec's scope. It is recorded here so the security property is not
+read as stronger than it is.
+
 ### Configuration
 
 `twilio.json` is deleted rather than updated, because nothing reads it. `twilio-run`
