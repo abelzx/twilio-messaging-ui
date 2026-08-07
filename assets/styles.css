@@ -1,0 +1,946 @@
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+:root {
+    --twilio-red: #F22F46;
+    --twilio-dark-blue: #0D122B;
+    --twilio-blue: #001489;
+    --twilio-light-blue: #E8F4F8;
+    --twilio-gray-50: #F7F9FA;
+    --twilio-gray-100: #E8EBED;
+    --twilio-gray-200: #D1D9DD;
+    --twilio-gray-300: #B8C5CC;
+    --twilio-gray-400: #9FAEB7;
+    --twilio-gray-500: #7C8B95;
+    --twilio-gray-600: #5E6E78;
+    --twilio-gray-700: #47525D;
+    --twilio-gray-800: #2F3941;
+    --twilio-gray-900: #1A1F26;
+    --twilio-white: #FFFFFF;
+    --twilio-success: #14B053;
+    --twilio-error: #F22F46;
+    --twilio-warning: #FFB020;
+}
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif;
+    background: var(--twilio-gray-50);
+    color: var(--twilio-gray-900);
+    min-height: 100vh;
+    line-height: 1.6;
+}
+
+.container {
+    width: 100%;
+    margin: 0;
+}
+
+.screen {
+    display: none;
+}
+
+.screen.active {
+    display: block;
+}
+
+/* Top Navigation Bar - Twilio Style */
+.top-nav {
+    background: var(--twilio-dark-blue);
+    color: var(--twilio-white);
+    padding: 0;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+}
+
+.top-nav .nav-content {
+    width: 100%;
+    margin: 0;
+    padding: 16px 24px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.top-nav .logo {
+    font-size: 20px;
+    font-weight: 600;
+    color: var(--twilio-white);
+    text-decoration: none;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.top-nav .logo::before {
+    content: "📱";
+    font-size: 24px;
+}
+
+.top-nav .nav-actions {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+}
+
+/* Login Screen */
+#login-screen.active {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    background: linear-gradient(135deg, var(--twilio-dark-blue) 0%, var(--twilio-blue) 100%);
+    padding: 40px 20px;
+}
+
+.login-container {
+    width: 100%;
+    max-width: 480px;
+}
+
+.login-header {
+    text-align: center;
+    margin-bottom: 32px;
+    color: var(--twilio-white);
+}
+
+.login-header h1 {
+    font-size: 32px;
+    font-weight: 600;
+    margin-bottom: 8px;
+    color: var(--twilio-white);
+}
+
+.login-header p {
+    font-size: 16px;
+    color: rgba(255, 255, 255, 0.8);
+}
+
+.login-form {
+    background: var(--twilio-white);
+    padding: 40px;
+    border-radius: 8px;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.15);
+}
+
+.login-form h2 {
+    margin-bottom: 24px;
+    color: var(--twilio-gray-900);
+    font-size: 24px;
+    font-weight: 600;
+}
+
+.auth-method-tabs {
+    display: flex;
+    gap: 0;
+    margin-bottom: 24px;
+    border-bottom: 2px solid var(--twilio-gray-100);
+    background: var(--twilio-gray-50);
+    border-radius: 6px 6px 0 0;
+    padding: 4px;
+}
+
+.tab-btn {
+    flex: 1;
+    padding: 12px 16px;
+    border: none;
+    background: transparent;
+    cursor: pointer;
+    font-size: 14px;
+    color: var(--twilio-gray-600);
+    border-radius: 4px;
+    transition: all 0.2s;
+    font-weight: 500;
+}
+
+.tab-btn:hover {
+    color: var(--twilio-gray-900);
+    background: rgba(0, 0, 0, 0.05);
+}
+
+.tab-btn.active {
+    color: var(--twilio-dark-blue);
+    background: var(--twilio-white);
+    font-weight: 600;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+}
+
+.auth-section {
+    margin-bottom: 24px;
+}
+
+/* Form Styles */
+.form-group {
+    margin-bottom: 20px;
+}
+
+.form-group label {
+    display: block;
+    margin-bottom: 8px;
+    color: var(--twilio-gray-900);
+    font-weight: 500;
+    font-size: 14px;
+}
+
+.form-group input,
+.form-group textarea,
+.form-group select {
+    width: 100%;
+    padding: 10px 12px;
+    border: 1px solid var(--twilio-gray-300);
+    border-radius: 4px;
+    font-size: 14px;
+    transition: all 0.2s;
+    font-family: inherit;
+    background: var(--twilio-white);
+    color: var(--twilio-gray-900);
+}
+
+.form-group input:focus,
+.form-group textarea:focus,
+.form-group select:focus {
+    outline: none;
+    border-color: var(--twilio-blue);
+    box-shadow: 0 0 0 3px rgba(0, 20, 137, 0.1);
+}
+
+.form-group input::placeholder,
+.form-group textarea::placeholder {
+    color: var(--twilio-gray-400);
+}
+
+.form-group small {
+    display: block;
+    margin-top: 6px;
+    color: var(--twilio-gray-500);
+    font-size: 12px;
+    line-height: 1.4;
+}
+
+/* Buttons */
+.btn {
+    padding: 10px 20px;
+    border: none;
+    border-radius: 4px;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    text-decoration: none;
+    line-height: 1.5;
+}
+
+.btn-primary {
+    background: var(--twilio-red);
+    color: var(--twilio-white);
+    width: 100%;
+}
+
+.btn-primary:hover {
+    background: #D91E35;
+    box-shadow: 0 2px 8px rgba(242, 47, 70, 0.3);
+}
+
+.btn-primary:active {
+    transform: translateY(1px);
+}
+
+.btn-primary:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+    background: var(--twilio-gray-400);
+}
+
+.btn-secondary {
+    background: var(--twilio-gray-200);
+    color: var(--twilio-gray-900);
+    border: 1px solid var(--twilio-gray-300);
+}
+
+.btn-secondary:hover {
+    background: var(--twilio-gray-300);
+    border-color: var(--twilio-gray-400);
+}
+
+.btn-success {
+    background: var(--twilio-success);
+    color: var(--twilio-white);
+}
+
+.btn-success:hover {
+    background: #12A049;
+    box-shadow: 0 2px 8px rgba(20, 176, 83, 0.3);
+}
+
+/* App Screen */
+#app-screen {
+    min-height: 100vh;
+    background: var(--twilio-gray-50);
+}
+
+header {
+    background: var(--twilio-white);
+    padding: 20px 0;
+    border-bottom: 1px solid var(--twilio-gray-200);
+    margin-bottom: 24px;
+}
+
+header .header-content {
+    width: 100%;
+    margin: 0;
+    padding: 0 24px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+header h1 {
+    color: var(--twilio-gray-900);
+    font-size: 24px;
+    font-weight: 600;
+    margin: 0;
+}
+
+.main-content {
+    padding: 0 24px;
+}
+
+.content-layout {
+    display: grid;
+    grid-template-columns: 400px 1fr;
+    gap: 24px;
+    align-items: start;
+}
+
+.left-column {
+    display: flex;
+    flex-direction: column;
+    gap: 24px;
+    position: sticky;
+    top: 24px;
+}
+
+.right-column {
+    display: flex;
+    flex-direction: column;
+    gap: 24px;
+}
+
+.phone-input-wrapper {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.phone-select {
+    width: 100%;
+    padding: 10px 12px;
+    border: 1px solid var(--twilio-gray-300);
+    border-radius: 4px;
+    font-size: 14px;
+    transition: all 0.2s;
+    font-family: inherit;
+    background: var(--twilio-white);
+    color: var(--twilio-gray-900);
+}
+
+.phone-select:focus {
+    outline: none;
+    border-color: var(--twilio-blue);
+    box-shadow: 0 0 0 3px rgba(0, 20, 137, 0.1);
+}
+
+.content-select {
+    width: 100%;
+    padding: 10px 12px;
+    border: 1px solid var(--twilio-gray-300);
+    border-radius: 4px;
+    font-size: 14px;
+    transition: all 0.2s;
+    font-family: inherit;
+    background: var(--twilio-white);
+    color: var(--twilio-gray-900);
+}
+
+.content-select:focus {
+    outline: none;
+    border-color: var(--twilio-blue);
+    box-shadow: 0 0 0 3px rgba(0, 20, 137, 0.1);
+}
+
+.card {
+    background: var(--twilio-white);
+    padding: 24px;
+    border-radius: 8px;
+    margin-bottom: 24px;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+    border: 1px solid var(--twilio-gray-200);
+}
+
+.card h2 {
+    color: var(--twilio-gray-900);
+    margin-bottom: 20px;
+    font-size: 20px;
+    font-weight: 600;
+    padding-bottom: 12px;
+    border-bottom: 2px solid var(--twilio-gray-100);
+}
+
+/* Status Display */
+.status-stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
+    gap: 16px;
+    margin-bottom: 24px;
+}
+
+.stat-box {
+    background: var(--twilio-gray-50);
+    padding: 20px;
+    border-radius: 6px;
+    text-align: center;
+    border: 1px solid var(--twilio-gray-200);
+}
+
+.stat-box .stat-value {
+    font-size: 32px;
+    font-weight: 700;
+    color: var(--twilio-blue);
+    margin-bottom: 4px;
+    line-height: 1;
+}
+
+.stat-box .stat-label {
+    color: var(--twilio-gray-600);
+    font-size: 13px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.progress-bar {
+    width: 100%;
+    height: 32px;
+    background: var(--twilio-gray-200);
+    border-radius: 4px;
+    overflow: hidden;
+    margin: 24px 0;
+    border: 1px solid var(--twilio-gray-300);
+}
+
+.progress-fill {
+    height: 100%;
+    background: var(--twilio-blue);
+    transition: width 0.3s ease;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--twilio-white);
+    font-weight: 600;
+    font-size: 13px;
+}
+
+/* Results Table */
+.results-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 16px;
+    font-size: 14px;
+}
+
+.results-table th,
+.results-table td {
+    padding: 12px;
+    text-align: left;
+    border-bottom: 1px solid var(--twilio-gray-200);
+}
+
+.results-table th {
+    background: var(--twilio-gray-50);
+    font-weight: 600;
+    color: var(--twilio-gray-900);
+    text-transform: uppercase;
+    font-size: 12px;
+    letter-spacing: 0.5px;
+    border-bottom: 2px solid var(--twilio-gray-300);
+}
+
+.results-table tr:hover {
+    background: var(--twilio-gray-50);
+}
+
+.results-table td {
+    color: var(--twilio-gray-700);
+}
+
+.status-badge {
+    display: inline-block;
+    padding: 4px 10px;
+    border-radius: 4px;
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+}
+
+.status-badge.success {
+    background: #D4F4DD;
+    color: #0F5132;
+}
+
+.status-badge.failed {
+    background: #FFE5E8;
+    color: #842029;
+}
+
+.status-badge.pending {
+    background: #FFF3CD;
+    color: #664D03;
+}
+
+/* Error Message */
+.error-message {
+    background: #FFE5E8;
+    color: #842029;
+    padding: 12px 16px;
+    border-radius: 4px;
+    margin-top: 16px;
+    display: none;
+    border: 1px solid #FFB3BA;
+    font-size: 14px;
+}
+
+.error-message.show {
+    display: block;
+}
+
+.success-message {
+    background: #D4F4DD;
+    color: #0F5132;
+    padding: 12px 16px;
+    border-radius: 4px;
+    margin-top: 16px;
+    display: none;
+    border: 1px solid #A3D9B1;
+    font-size: 14px;
+}
+
+.success-message.show {
+    display: block;
+}
+
+/* Loading Spinner */
+.spinner {
+    border: 2px solid var(--twilio-gray-200);
+    border-top: 2px solid var(--twilio-blue);
+    border-radius: 50%;
+    width: 20px;
+    height: 20px;
+    animation: spin 0.8s linear infinite;
+    display: inline-block;
+    margin-right: 8px;
+}
+
+@keyframes spin {
+    0% { transform: rotate(0deg); }
+    100% { transform: rotate(360deg); }
+}
+
+/* Responsive */
+@media (max-width: 1024px) {
+    .content-layout {
+        grid-template-columns: 1fr;
+    }
+
+    .right-column {
+        position: static;
+    }
+}
+
+@media (max-width: 768px) {
+    .container {
+        padding: 0 16px;
+    }
+
+    .login-form {
+        padding: 24px;
+    }
+
+    .top-nav .nav-content {
+        padding: 12px 16px;
+    }
+
+    header .header-content {
+        flex-direction: column;
+        gap: 16px;
+        align-items: flex-start;
+    }
+
+    .status-stats {
+        grid-template-columns: 1fr 1fr;
+    }
+
+    .card {
+        padding: 20px;
+    }
+}
+
+/* Campaign List Styles */
+.campaigns-list {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    max-height: 600px;
+    overflow-y: auto;
+}
+
+.campaign-item {
+    background: var(--twilio-gray-50);
+    border: 2px solid var(--twilio-gray-200);
+    border-radius: 8px;
+    padding: 16px;
+    cursor: pointer;
+    transition: all 0.2s ease;
+}
+
+.campaign-item:hover {
+    border-color: var(--twilio-blue);
+    background: var(--twilio-light-blue);
+    transform: translateY(-2px);
+    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+}
+
+.campaign-item.active {
+    border-color: var(--twilio-blue);
+    background: var(--twilio-light-blue);
+    box-shadow: 0 2px 8px rgba(0, 20, 137, 0.15);
+}
+
+.campaign-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 12px;
+}
+
+.campaign-id {
+    font-weight: 600;
+    color: var(--twilio-gray-900);
+    font-size: 14px;
+}
+
+.campaign-status-badge {
+    padding: 4px 12px;
+    border-radius: 12px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+}
+
+.campaign-status-badge.complete {
+    background: #E8F5E9;
+    color: #2E7D32;
+}
+
+.campaign-status-badge.in-progress {
+    background: #FFF3E0;
+    color: #E65100;
+}
+
+.btn-resume-campaign {
+    padding: 4px 12px;
+    border: none;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s;
+    background: var(--twilio-success);
+    color: var(--twilio-white);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.btn-resume-campaign:hover {
+    background: #12A049;
+    box-shadow: 0 2px 4px rgba(20, 176, 83, 0.3);
+    transform: translateY(-1px);
+}
+
+.btn-resume-campaign:active {
+    transform: translateY(0);
+}
+
+.btn-resume-campaign:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+    transform: none;
+}
+
+.campaign-stats {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    margin-bottom: 10px;
+}
+
+.campaign-stats .stat-item {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 13px;
+}
+
+.campaign-stats .stat-label {
+    color: var(--twilio-gray-600);
+}
+
+.campaign-stats .stat-value {
+    font-weight: 600;
+    color: var(--twilio-gray-900);
+}
+
+.campaign-stats .stat-value.success {
+    color: var(--twilio-success);
+}
+
+.campaign-stats .stat-value.failed {
+    color: var(--twilio-error);
+}
+
+.campaign-progress {
+    margin-top: 8px;
+}
+
+.campaign-meta {
+    margin-top: 8px;
+    font-size: 11px;
+    color: var(--twilio-gray-500);
+}
+
+@media (max-width: 768px) {
+    .campaign-stats {
+        gap: 8px;
+    }
+    
+    .campaign-item {
+        padding: 12px;
+    }
+
+    .results-table {
+        font-size: 12px;
+    }
+
+    .results-table th,
+    .results-table td {
+        padding: 8px;
+    }
+}
+
+@media (max-width: 480px) {
+    .status-stats {
+        grid-template-columns: 1fr;
+    }
+
+    .login-header h1 {
+        font-size: 24px;
+    }
+}
+
+/* Message Status Table Styles */
+.message-status-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 16px;
+    font-size: 13px;
+    background: var(--twilio-white);
+}
+
+.message-status-table th,
+.message-status-table td {
+    padding: 10px 12px;
+    text-align: left;
+    border-bottom: 1px solid var(--twilio-gray-200);
+}
+
+.message-status-table th {
+    background: var(--twilio-gray-50);
+    font-weight: 600;
+    color: var(--twilio-gray-900);
+    text-transform: uppercase;
+    font-size: 11px;
+    letter-spacing: 0.5px;
+    border-bottom: 2px solid var(--twilio-gray-300);
+    position: sticky;
+    top: 0;
+    z-index: 10;
+}
+
+.message-status-table tr:hover {
+    background: var(--twilio-gray-50);
+}
+
+.message-status-table td {
+    color: var(--twilio-gray-700);
+    vertical-align: top;
+}
+
+.message-status-table tbody {
+    max-height: 500px;
+    overflow-y: auto;
+}
+
+@media (max-width: 768px) {
+    .message-status-table {
+        font-size: 11px;
+    }
+    
+    .message-status-table th,
+    .message-status-table td {
+        padding: 8px 6px;
+    }
+}
+
+/* ---- Content template: status filter, preview & variable inputs ---- */
+.template-filter-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+}
+
+.template-filter-row .filter-label {
+    margin: 0;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--twilio-gray-600);
+    white-space: nowrap;
+}
+
+.status-filter {
+    flex: 0 0 auto;
+    min-width: 140px;
+    padding: 6px 10px;
+    border: 1px solid var(--twilio-gray-300);
+    border-radius: 6px;
+    background: var(--twilio-white);
+    color: var(--twilio-gray-900);
+    font-size: 13px;
+}
+
+.template-preview {
+    margin-top: 12px;
+    padding: 12px;
+    background: var(--twilio-gray-50);
+    border: 1px solid var(--twilio-gray-200);
+    border-radius: 8px;
+}
+
+.template-preview .preview-heading {
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--twilio-gray-500);
+    margin-bottom: 8px;
+}
+
+.preview-block {
+    margin-bottom: 10px;
+}
+
+.preview-block:last-child {
+    margin-bottom: 0;
+}
+
+.preview-type {
+    display: inline-block;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--twilio-blue);
+    background: var(--twilio-light-blue);
+    padding: 2px 8px;
+    border-radius: 10px;
+    margin-bottom: 4px;
+}
+
+.preview-body {
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-size: 14px;
+    color: var(--twilio-gray-800);
+    line-height: 1.5;
+}
+
+.template-variables {
+    margin-top: 12px;
+    padding: 12px;
+    background: var(--twilio-white);
+    border: 1px solid var(--twilio-gray-200);
+    border-radius: 8px;
+}
+
+.template-variables-label {
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--twilio-gray-500);
+    margin-bottom: 10px;
+}
+
+.variable-field {
+    margin-bottom: 10px;
+}
+
+.variable-field:last-child {
+    margin-bottom: 0;
+}
+
+.variable-field label {
+    display: block;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--twilio-gray-700);
+    margin-bottom: 4px;
+}
+
+.var-tag {
+    display: inline-block;
+    margin-left: 6px;
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: var(--twilio-warning);
+    background: rgba(255, 176, 32, 0.15);
+    padding: 1px 6px;
+    border-radius: 8px;
+    vertical-align: middle;
+}
+
+.variable-hint {
+    display: block;
+    margin-top: 4px;
+    font-size: 12px;
+    color: var(--twilio-gray-500);
+}
+
+.template-variable-input {
+    width: 100%;
+    padding: 8px 10px;
+    border: 1px solid var(--twilio-gray-300);
+    border-radius: 6px;
+    background: var(--twilio-white);
+    color: var(--twilio-gray-900);
+    font-size: 14px;
+}
+
+.template-variable-input:focus {
+    outline: none;
+    border-color: var(--twilio-blue);
+}

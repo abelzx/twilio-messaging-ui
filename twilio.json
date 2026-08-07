@@ -1,0 +1,57 @@
+{
+  "functions": [
+    {
+      "name": "auth",
+      "path": "functions/auth.js",
+      "visibility": "public"
+    },
+    {
+      "name": "send-messages",
+      "path": "functions/send-messages.js",
+      "visibility": "public"
+    },
+    {
+      "name": "check-status",
+      "path": "functions/check-status.js",
+      "visibility": "public"
+    },
+    {
+      "name": "resume-execution",
+      "path": "functions/resume-execution.js",
+      "visibility": "public"
+    },
+    {
+      "name": "get-phone-numbers",
+      "path": "functions/get-phone-numbers.js",
+      "visibility": "public"
+    },
+    {
+      "name": "webhook",
+      "path": "functions/webhook.js",
+      "visibility": "public"
+    },
+    {
+      "name": "get-content-templates",
+      "path": "functions/get-content-templates.js",
+      "visibility": "public"
+    }
+  ],
+  "assets": [
+    {
+      "name": "index",
+      "path": "assets/index.html",
+      "visibility": "public"
+    },
+    {
+      "name": "app",
+      "path": "assets/app.js",
+      "visibility": "public"
+    },
+    {
+      "name": "styles",
+      "path": "assets/styles.css",
+      "visibility": "public"
+    }
+  ]
+}
+

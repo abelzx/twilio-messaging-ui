@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Twilio Messaging UI</title>
+    <link rel="icon" href="https://console.twilio.com/favicon.ico" type="image/x-icon">
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div id="app">
+        <!-- Login Screen -->
+        <div id="login-screen" class="screen active">
+            <div class="login-container">
+                <div class="login-header">
+                    <h1>Twilio Messaging</h1>
+                    <p>Send messages across SMS, WhatsApp, and Messenger</p>
+                </div>
+                <div class="login-form">
+                    <h2>Sign In</h2>
+                    <div class="auth-method-tabs">
+                        <button class="tab-btn active" data-method="account">Account Credentials</button>
+                        <button class="tab-btn" data-method="api">API Key</button>
+                    </div>
+                    
+                    <form id="login-form">
+                        <div id="account-auth" class="auth-section">
+                            <div class="form-group">
+                                <label for="account-sid">Account SID</label>
+                                <input type="text" id="account-sid" required placeholder="ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx">
+                            </div>
+                            <div class="form-group">
+                                <label for="auth-token">Auth Token</label>
+                                <input type="password" id="auth-token" required placeholder="Your Auth Token">
+                            </div>
+                        </div>
+                        
+                        <div id="api-auth" class="auth-section" style="display: none;">
+                            <div class="form-group">
+                                <label for="api-account-sid">Account SID</label>
+                                <input type="text" id="api-account-sid" placeholder="ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx">
+                            </div>
+                            <div class="form-group">
+                                <label for="api-key">API Key SID</label>
+                                <input type="text" id="api-key" placeholder="SKxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx">
+                            </div>
+                            <div class="form-group">
+                                <label for="api-secret">API Secret</label>
+                                <input type="password" id="api-secret" placeholder="Your API Secret">
+                            </div>
+                        </div>
+                        
+                        <button type="submit" class="btn btn-primary">Sign In</button>
+                    </form>
+                    <div id="login-error" class="error-message"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Main App Screen -->
+        <div id="app-screen" class="screen">
+            <!-- Top Navigation -->
+            <nav class="top-nav">
+                <div class="nav-content">
+                    <div class="logo">Twilio Messaging</div>
+                    <div class="nav-actions">
+                        <button id="logout-btn" class="btn btn-secondary">Sign Out</button>
+                    </div>
+                </div>
+            </nav>
+
+            <div class="container">
+                <header>
+                    <div class="header-content">
+                        <h1>Send Messages</h1>
+                    </div>
+                </header>
+
+                <div class="main-content">
+                    <div class="content-layout">
+                        <!-- Left Column: Send Messages -->
+                        <div class="left-column">
+                            <!-- Campaign Form -->
+                            <div class="card">
+                                <h2>Message Details</h2>
+                                <form id="message-form">
+                                    <div class="form-group">
+                                        <label for="channel">Messaging Channel</label>
+                                        <select id="channel" required>
+                                            <option value="sms">SMS</option>
+                                            <option value="mms">MMS</option>
+                                            <option value="rcs">RCS</option>
+                                            <option value="whatsapp">WhatsApp</option>
+                                            <option value="messenger">Facebook Messenger</option>
+                                        </select>
+                                    </div>
+
+                                    <div class="form-group">
+                                        <label for="campaign-name">Campaign Name</label>
+                                        <input type="text" id="campaign-name" 
+                                               placeholder="Enter a name for this campaign">
+                                        <small>Optional: Give your campaign a descriptive name</small>
+                                    </div>
+
+                                    <div class="form-group">
+                                        <label for="from-number">From Number or ID</label>
+                                        <div class="phone-input-wrapper">
+                                            <select id="from-number-select" class="phone-select">
+                                                <option value="">Select a number...</option>
+                                            </select>
+                                            <input type="text" id="from-number" 
+                                                   placeholder="Or type Sender ID / Phone Number">
+                                        </div>
+                                        <small>Select an SMS-enabled number or type a Sender ID</small>
+                                    </div>
+
+                                    <div class="form-group" id="content-template-group">
+                                        <label for="content-template">Content Template</label>
+                                        <div class="template-filter-row" id="template-filter-row" style="display: none;">
+                                            <label for="template-status-filter" class="filter-label">Filter by status:</label>
+                                            <select id="template-status-filter" class="status-filter">
+                                                <option value="all">All</option>
+                                            </select>
+                                        </div>
+                                        <select id="content-template" class="content-select">
+                                            <option value="">None (Use custom message)</option>
+                                        </select>
+                                        <small id="content-template-help" style="display: none;">Select a pre-approved content template</small>
+
+                                        <!-- Template preview + dynamic variable inputs -->
+                                        <div id="template-preview" class="template-preview" style="display: none;"></div>
+                                        <div id="template-variables" class="template-variables" style="display: none;">
+                                            <div class="template-variables-label">Template variables</div>
+                                            <div id="template-variables-fields"></div>
+                                        </div>
+                                    </div>
+
+                                    <div class="form-group">
+                                        <label for="message-body">Message Body</label>
+                                        <textarea id="message-body" rows="4" 
+                                                  placeholder="Enter your message here..."></textarea>
+                                        <small id="message-body-help">Required if no content template is selected</small>
+                                    </div>
+
+                                    <div class="form-group">
+                                        <label for="recipients">Recipients</label>
+                                        <textarea id="recipients" rows="6" required 
+                                                  placeholder="+1234567890&#10;+0987654321&#10;+1122334455"></textarea>
+                                        <small>Enter phone numbers, one per line or comma-separated</small>
+                                    </div>
+
+                                    <button type="submit" class="btn btn-primary" id="send-btn">Send Messages</button>
+                                </form>
+                            </div>
+                        </div>
+
+                        <!-- Right Column: Campaign Status & Results -->
+                        <div class="right-column">
+                            <!-- Campaign List -->
+                            <div id="campaign-list" class="card">
+                                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                                    <h2>Campaigns</h2>
+                                    <button id="refresh-campaigns-btn" class="btn btn-secondary" style="padding: 5px 15px; font-size: 14px;">Refresh</button>
+                                </div>
+                                <div id="campaigns-content">
+                                    <p style="color: #666; text-align: center; padding: 20px;">Loading campaigns...</p>
+                                </div>
+                            </div>
+                            
+                            <!-- Message Details Section -->
+                            <div id="message-details-section" class="card" style="display: none; margin-top: 20px;">
+                                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                                    <h2>Message Delivery Status</h2>
+                                    <button id="close-message-details-btn" class="btn btn-secondary" style="padding: 5px 15px; font-size: 14px;">Close</button>
+                                </div>
+                                <div id="message-details-content">
+                                    <p style="color: #666; text-align: center; padding: 20px;">Loading message details...</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>

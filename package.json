@@ -1,0 +1,21 @@
+{
+  "name": "twilio-messaging-ui",
+  "version": "1.0.0",
+  "description": "Twilio Messaging UI with resumable execution",
+  "scripts": {
+    "deploy": "twilio serverless:deploy",
+    "start": "twilio serverless:start"
+  },
+  "dependencies": {
+    "twilio": "^5.10.6",
+    "@twilio/runtime-handler": "2.0.3"
+  },
+  "devDependencies": {
+    "twilio-cli": "^6.2.1"
+  },
+  "overrides": {
+    "glob": "^10.5.0",
+    "tmp": "^0.2.4"
+  }
+}
+
