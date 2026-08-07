@@ -25,6 +25,8 @@ exports.handler = async function(context, event, callback) {
     // ID they sent, and only a successful token exchange establishes that.
     // Skipping this would let anyone list another app's campaigns by sending
     // its Client ID with any secret.
+    // The returned client is intentionally unused — this call exists solely as
+    // the authorization step.
     await oauth.authenticate(creds);
   } catch (error) {
     response.setStatusCode(error.statusCode || 401);
@@ -50,9 +52,10 @@ exports.handler = async function(context, event, callback) {
 
       const campaignData = doc.data;
 
-      // Campaigns are owned by the OAuth app that created them. Documents
-      // written before this migration carry no ownerKey and are never listed.
-      if (campaignData.ownerKey !== ownerKey) {
+      // `!campaignData` guard so one malformed document skips itself rather than
+      // throwing and turning the caller's whole campaign list into a 500. Same
+      // shape as the checks in check-status.js and resume-execution.js.
+      if (!campaignData || campaignData.ownerKey !== ownerKey) {
         continue;
       }
 
