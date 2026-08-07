@@ -346,17 +346,23 @@ plainly:
   30–50 requests rather than once. All over HTTPS, but it is more transit surface
   than the reference project has.
 
-## Known risk: Content API scope
+## Resolved: the Content API *is* reachable with an OAuth app
 
-Twilio documents scope categories for account-level OAuth apps including Messaging and
-Phone Numbers. No documentation was found confirming whether the Content API
-(`content.v1.contentAndApprovals.list`, `get-content-templates.js:68`) is reachable
-with an OAuth app at all.
+This was an open risk at design time. No documentation could be found confirming
+whether the Content API (`content.v1.contentAndApprovals.list`,
+`get-content-templates.js:68`) was reachable with an account-level OAuth app, so the
+content path was built to fail soft rather than guess.
 
-This is unresolved by design and handled defensively rather than guessed at: the
-content path fails soft with a visible warning, so if the scope does not exist the
-WhatsApp and RCS channels still send with a literal body, losing only the template
-picker. Live verification will settle it.
+**Settled by live verification on 2026-08-07.** Against a real OAuth app, `POST
+/get-content-templates` returned `success: true` with the full template list for both
+`whatsapp` and `rcs` — including templates with variables and `approved` status. The
+Content API needs no Account SID in its path (`https://content.twilio.com/v1/Content`),
+and the OAuth token was accepted.
+
+The fail-soft handling is kept anyway. It is not dead weight: it still covers an OAuth
+app that was created *without* Content scope granted, which is a configuration the
+deployer controls and can easily get wrong. What is no longer in doubt is that granting
+the scope works.
 
 ## Verification
 
