@@ -2202,21 +2202,27 @@ Replace with:
 
 Run:
 
+Match on **API usage**, not on bare words. Edit 3 deliberately adds a comment containing both "sessionStorage" and "localStorage" to explain the choice between them, so a grep for the bare words reports itself and never prints the clean message:
+
 ```bash
 node --check assets/app.js && echo "syntax OK"
-grep -n "sessionId\|localStorage\|switchAuthMethod\|URLSearchParams" assets/app.js || echo "fully migrated: OK"
+grep -n "sessionId\|switchAuthMethod\|URLSearchParams" assets/app.js || echo "fully migrated: OK"
+grep -c "localStorage\." assets/app.js
 grep -c "postToFunction(" assets/app.js
-grep -c "sessionStorage" assets/app.js
+grep -c "sessionStorage\." assets/app.js
 ```
 
-Expected — `9` lines using `postToFunction` (one declaration plus eight call sites) and `4` using `sessionStorage` (`getItem` and `removeItem` in `loadCreds`, `setItem` in `saveCreds`, `removeItem` in `clearCreds`):
+Expected — no `localStorage` API call survives; `9` lines use `postToFunction` (one declaration plus eight call sites); `4` use a `sessionStorage` method (`getItem` and `removeItem` in `loadCreds`, `setItem` in `saveCreds`, `removeItem` in `clearCreds`):
 
 ```
 syntax OK
 fully migrated: OK
+0
 9
 4
 ```
+
+`grep -c` returning `0` also exits non-zero, so `localStorage\.` printing `0` is the pass condition here — not an error.
 
 If `grep` prints any `sessionId` or `URLSearchParams` line, an edit was missed. Every remaining `fetch(` in the file should be inside `postToFunction` or `handleLogin`:
 
