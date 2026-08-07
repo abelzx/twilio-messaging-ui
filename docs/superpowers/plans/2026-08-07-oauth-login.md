@@ -1545,9 +1545,19 @@ clean: OK
 
 ```bash
 cat > ./probe-tmp.js <<'EOF'
+const path = require('path');
+
 // Stub the two globals Twilio Functions inject before requiring a Function.
+// The asset path MUST be absolute. `require()` resolves a relative path against
+// the *requiring module's* directory, so a './assets/...' path here would be
+// looked up as `functions/assets/...` from inside the Function and throw
+// MODULE_NOT_FOUND. The real Twilio Runtime hands over an absolute path too.
 global.Runtime = {
-  getAssets: () => ({ '/twilio-oauth.js': { path: './assets/twilio-oauth.private.js' } }),
+  getAssets: () => ({
+    '/twilio-oauth.js': {
+      path: path.resolve(__dirname, 'assets/twilio-oauth.private.js'),
+    },
+  }),
 };
 global.Twilio = { Response: class {} };
 
