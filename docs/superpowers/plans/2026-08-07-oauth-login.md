@@ -695,9 +695,16 @@ clean: OK
 
 - [ ] **Step 4: Confirm the missing-scope path stays soft**
 
-If the OAuth app lacks Content read scope, `oauth.authenticate()` still *succeeds* — a token fetch does not depend on scopes. The failure surfaces from `contentAndApprovals.list` and lands in the pre-existing `catch` at the bottom of the handler, which answers HTTP 500 with `{ error: 'Failed to fetch content templates', message }`.
+If the OAuth app lacks Content read scope, `oauth.authenticate()` still *succeeds* — a token fetch does not depend on scopes. The failure surfaces from `contentAndApprovals.list`.
 
-`assets/app.js` handles that in its non-OK branch (around line 288): the template dropdown falls back to `"None (Use custom message)"`, a disabled option shows the error text, and `#content-template-help` turns red. The channel stays usable with a literal message body. That is the fail-soft behaviour the spec requires — **do not add error handling here**. It already works, and it works because this branch exists.
+Trace it precisely, because there are two catches and the outer one is **not** the one that fires:
+
+- Each channel branch has its own **inner** `catch` (lines ~80-84 for WhatsApp, ~132-136 for RCS). These answer **HTTP 200** with `{ success: false, templates: [], error: 'Failed to fetch WhatsApp templates: …' }`.
+- The outer `catch` at the bottom answers HTTP 500, but only for a failure the inner catches do not cover — a bug in the mapping code, say.
+
+So a scope gap produces a **200, not a 500**. `assets/app.js:269` gates on `response.ok && data.success !== false`, and `success: false` fails that test, so it takes the **else** branch (lines ~287-298): the dropdown falls back to `"None (Use custom message)"`, a disabled option shows the error text, and `#content-template-help` turns red. The channel stays usable with a literal message body.
+
+That is the fail-soft behaviour the spec requires — **do not add error handling here, and do not "fix" the inner catches to return 500**. It already works, and it works because these branches exist. Note that a `curl` against this endpoint with a scope gap returns 200; do not read that as success.
 
 Read that branch before Task 10 so you do not accidentally simplify it away when converting the fetch to a POST.
 
@@ -2451,7 +2458,7 @@ Switch the channel to WhatsApp, then to RCS.
 Expected one of two outcomes:
 
 - **Scope present** — the dropdown lists templates and `#content-template-help` reads "Select a content template".
-- **Scope absent** — the dropdown falls back to "None (Use custom message)" with a disabled `Error: Failed to fetch content templates` option, and `#content-template-help` shows that text in red. Typing a literal message body and sending must still work.
+- **Scope absent** — the dropdown falls back to "None (Use custom message)" with a disabled option reading `Error: Failed to fetch WhatsApp templates: …` (or `RCS`), and `#content-template-help` shows that text in red. Typing a literal message body and sending must still work. Note the endpoint answers **HTTP 200** here, not 500 — the per-channel inner `catch` handles it and sets `success: false`. Do not treat a 200 in the Network tab as proof the scope is present; read the response body.
 
 Either is a pass. A failure is a channel that cannot send at all, an unhandled exception in the console, or a silently empty picker with no explanation.
 

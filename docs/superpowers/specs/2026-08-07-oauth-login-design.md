@@ -288,7 +288,7 @@ No dependency changes: `twilio@5.10.6` is already installed and already exports
 | Account SID mismatch | Caught at login by the phone-number probe; Twilio error 70051 mapped to "these OAuth credentials do not belong to that Account SID" |
 | Secret rotated mid-campaign | The client loop's non-OK branch calls `showResumeOption()` (`app.js:726`); the campaign pauses and is resumable after re-login |
 | Campaign requested by a non-owner | HTTP 404, so a guessed campaign ID is not confirmed to exist |
-| Missing scope | Twilio error 70051. A Content scope miss fails soft on the existing non-OK branch (`app.js:288-297`): the picker falls back to "None (Use custom message)" and `#content-template-help` shows the error in red, rather than breaking the WhatsApp or RCS channel |
+| Missing scope | Twilio error 70051. A Content scope miss is caught by the per-channel inner `catch` in `get-content-templates.js`, which answers **HTTP 200** with `{success: false, error}`. `app.js:269` gates on `response.ok && data.success !== false`, so that takes the else branch (`app.js:287-298`): the picker falls back to "None (Use custom message)" and `#content-template-help` shows the error in red, rather than breaking the WhatsApp or RCS channel |
 | Token endpoint hangs | 8-second abort inside `/verify`; readable message instead of a platform timeout |
 | Rate limiting | `retryWithExponentialBackoff` is untouched |
 
