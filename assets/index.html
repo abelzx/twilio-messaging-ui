@@ -5,6 +5,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Twilio Messaging UI</title>
     <link rel="icon" href="https://console.twilio.com/favicon.ico" type="image/x-icon">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -104,14 +107,14 @@
                                             <input type="text" id="from-number" 
                                                    placeholder="Or type Sender ID / Phone Number">
                                         </div>
-                                        <small>Select an SMS-enabled number or type a Sender ID</small>
+                                        <small id="from-number-help" class="field-help">Select a sender for the chosen channel</small>
                                     </div>
 
                                     <div class="form-group" id="content-template-group">
                                         <label for="content-template">Content Template</label>
                                         <div class="template-filter-row" id="template-filter-row" style="display: none;">
                                             <label for="template-status-filter" class="filter-label">Filter by status:</label>
-                                            <select id="template-status-filter" class="status-filter">
+                                            <select id="template-status-filter" class="filter-select">
                                                 <option value="all">All</option>
                                             </select>
                                         </div>

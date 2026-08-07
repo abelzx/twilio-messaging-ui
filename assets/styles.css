@@ -5,24 +5,61 @@
 }
 
 :root {
+    /* Adopted from twilio-lookup-api-ui so the two apps read as one family. */
     --twilio-red: #F22F46;
-    --twilio-dark-blue: #0D122B;
-    --twilio-blue: #001489;
-    --twilio-light-blue: #E8F4F8;
-    --twilio-gray-50: #F7F9FA;
-    --twilio-gray-100: #E8EBED;
-    --twilio-gray-200: #D1D9DD;
-    --twilio-gray-300: #B8C5CC;
-    --twilio-gray-400: #9FAEB7;
-    --twilio-gray-500: #7C8B95;
-    --twilio-gray-600: #5E6E78;
-    --twilio-gray-700: #47525D;
-    --twilio-gray-800: #2F3941;
-    --twilio-gray-900: #1A1F26;
-    --twilio-white: #FFFFFF;
-    --twilio-success: #14B053;
-    --twilio-error: #F22F46;
-    --twilio-warning: #FFB020;
+    --twilio-red-hover: #D91F36;
+    --twilio-navy: #121C2D;
+    --twilio-navy-light: #1F2D3D;
+
+    --bg: #F4F4F6;
+    --surface: #FFFFFF;
+    --surface-hover: #F9FAFB;
+    --border: #E1E3EA;
+    --border-strong: #CACDD8;
+
+    --text: #121C2D;
+    --text-secondary: #606B85;
+    --text-muted: #8891AA;
+
+    --accent: #0263E0;
+    --accent-hover: #014FB6;
+    --accent-light: #E8F1FC;
+
+    --success: #14B053;
+    --success-light: #E3F9ED;
+    --danger: #D91F36;
+    --danger-light: #FEE2E6;
+    --warning: #E46216;
+
+    --shadow-sm: 0 1px 3px rgba(18, 28, 45, 0.08);
+    --shadow-md: 0 4px 12px rgba(18, 28, 45, 0.08), 0 1px 3px rgba(18, 28, 45, 0.05);
+    --shadow-lg: 0 8px 24px rgba(18, 28, 45, 0.1), 0 2px 6px rgba(18, 28, 45, 0.06);
+
+    --radius: 8px;
+    --radius-lg: 12px;
+
+    --font: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    --mono: "Fira Code", "JetBrains Mono", ui-monospace, monospace;
+
+    /* Aliases: existing rules reference these names. Kept so this change is a
+       re-skin rather than a rewrite of every selector. */
+    --twilio-white: var(--surface);
+    --twilio-dark-blue: var(--twilio-navy);
+    --twilio-blue: var(--accent);
+    --twilio-light-blue: var(--accent-light);
+    --twilio-gray-50: var(--surface-hover);
+    --twilio-gray-100: #F1F2F5;
+    --twilio-gray-200: var(--border);
+    --twilio-gray-300: var(--border-strong);
+    --twilio-gray-400: var(--text-muted);
+    --twilio-gray-500: var(--text-muted);
+    --twilio-gray-600: var(--text-secondary);
+    --twilio-gray-700: var(--text-secondary);
+    --twilio-gray-800: var(--text);
+    --twilio-gray-900: var(--text);
+    --twilio-success: var(--success);
+    --twilio-error: var(--danger);
+    --twilio-warning: var(--warning);
 }
 
 body {
@@ -821,7 +858,7 @@ header h1 {
     white-space: nowrap;
 }
 
-.status-filter {
+.filter-select {
     flex: 0 0 auto;
     min-width: 140px;
     padding: 6px 10px;
@@ -954,4 +991,264 @@ header h1 {
 
 .login-help a {
     color: var(--twilio-blue);
+}
+
+/* ---- Adopted from twilio-lookup-api-ui: dropdown chevron (bug 1) ---- */
+/* One rule for every select in the app, so they cannot drift apart.
+   .filter-select is the template-status-filter select's class (renamed from
+   .status-filter so it lines up with this list instead of silently missing it). */
+select,
+.form-group select,
+.phone-select,
+.content-select,
+.filter-select {
+    appearance: none;
+    -webkit-appearance: none;
+    /* Right padding must clear the chevron: 16px inset + 12px glyph + 12px gap. */
+    padding: 10px 40px 10px 12px;
+    background-color: var(--surface);
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8' fill='none'%3E%3Cpath d='M1 1.5L6 6.5L11 1.5' stroke='%23606B85' stroke-width='1.75' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 14px center;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text);
+    font-family: var(--font);
+    font-size: 14px;
+    line-height: 1.4;
+    cursor: pointer;
+    transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+select:hover { border-color: var(--border-strong); }
+
+select:focus-visible,
+select:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-light);
+}
+
+select:disabled {
+    background-color: var(--surface-hover);
+    color: var(--text-muted);
+    cursor: not-allowed;
+}
+
+/* Cascade correction: `.form-group input:focus, .form-group textarea:focus,
+   .form-group select:focus` (further up this file) and `.phone-select:focus`
+   / `.content-select:focus` match or exceed the specificity of the bare
+   `select:focus` rule above, so without this they would keep winning with
+   their old rgba(0, 20, 137, 0.1) ring instead of the sibling project's
+   `--accent-light` focus ring. Re-declared here at equal specificity, later
+   in the file, so the intended ring actually renders. */
+.form-group input:focus,
+.form-group textarea:focus,
+.form-group select:focus,
+.form-group select:focus-visible,
+.phone-select:focus,
+.phone-select:focus-visible,
+.content-select:focus,
+.content-select:focus-visible,
+.filter-select:focus,
+.filter-select:focus-visible {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-light);
+}
+
+/* ---- Bug 2: the template filter row overflows its card ---- */
+.template-filter-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin: 0 0 10px;
+    /* Without min-width:0 a flex item refuses to shrink below its content. */
+    min-width: 0;
+}
+
+.template-filter-row .filter-label {
+    margin: 0;
+    flex: 0 0 auto;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-secondary);
+    white-space: nowrap;
+}
+
+.template-filter-row .filter-select,
+.template-filter-row select {
+    flex: 1 1 auto;
+    min-width: 0;
+    width: auto;
+}
+
+/* ---- Bug 3: the campaign card's top border is clipped ---- */
+.campaigns-list {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    max-height: 600px;
+    overflow-y: auto;
+    /* Inset so a child's border and focus ring are never on the clip boundary. */
+    padding: 3px;
+    margin: -3px;
+    scroll-padding-block: 3px;
+}
+
+.campaign-item {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--border-strong);
+    border-radius: var(--radius);
+    padding: 16px;
+    cursor: pointer;
+    transition: border-color 0.15s, box-shadow 0.15s, background 0.15s;
+}
+
+.campaign-item:hover {
+    border-color: var(--border-strong);
+    border-left-color: var(--accent);
+    background: var(--surface-hover);
+    box-shadow: var(--shadow-sm);
+    /* No translate: a transform inside a scroll container is what clipped the
+       top edge in the first place. */
+}
+
+.campaign-item.active {
+    border-color: var(--accent);
+    border-left-color: var(--accent);
+    background: var(--accent-light);
+    box-shadow: var(--shadow-sm);
+}
+
+/* ---- Buttons ---- */
+.btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 10px 18px;
+    border: 1px solid transparent;
+    border-radius: var(--radius);
+    font-family: var(--font);
+    font-size: 14px;
+    font-weight: 600;
+    line-height: 1.2;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s, box-shadow 0.15s, color 0.15s;
+}
+
+.btn:focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 3px var(--accent-light);
+}
+
+.btn:disabled { opacity: 0.55; cursor: not-allowed; }
+
+.btn-primary {
+    background: var(--twilio-red);
+    border-color: var(--twilio-red);
+    color: #fff;
+    box-shadow: var(--shadow-sm);
+}
+.btn-primary:hover:not(:disabled) {
+    background: var(--twilio-red-hover);
+    border-color: var(--twilio-red-hover);
+    box-shadow: var(--shadow-md);
+}
+.btn-primary:active:not(:disabled) { box-shadow: none; }
+
+.btn-secondary {
+    background: var(--surface);
+    border-color: var(--border-strong);
+    color: var(--text);
+}
+.btn-secondary:hover:not(:disabled) {
+    background: var(--surface-hover);
+    border-color: var(--text-muted);
+}
+
+.btn-danger {
+    background: var(--danger);
+    border-color: var(--danger);
+    color: #fff;
+}
+.btn-danger:hover:not(:disabled) { background: #C01B30; border-color: #C01B30; }
+
+/* ---- Surfaces, type and inputs ---- */
+body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font);
+    font-size: 14px;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+}
+
+.card {
+    background: var(--surface);
+    padding: 24px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-sm);
+    margin-bottom: 24px;
+}
+
+h1, h2, h3 {
+    color: var(--text);
+    letter-spacing: -0.01em;
+    line-height: 1.25;
+}
+h2 { font-size: 18px; font-weight: 650; }
+
+label,
+.form-group > label {
+    display: block;
+    margin-bottom: 6px;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text);
+}
+
+input[type="text"],
+input[type="password"],
+input[type="tel"],
+textarea {
+    width: 100%;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface);
+    color: var(--text);
+    font-family: var(--font);
+    font-size: 14px;
+    transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+input:focus, textarea:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-light);
+}
+
+input::placeholder, textarea::placeholder { color: var(--text-muted); }
+
+.field-help,
+.form-group small {
+    display: block;
+    margin-top: 6px;
+    font-size: 12px;
+    color: var(--text-secondary);
+}
+
+.field-help--problem { color: var(--danger); }
+
+/* Message SIDs are data, not prose — set them in the mono face so they can be
+   compared column-wise. */
+.results-table td:first-child,
+.message-sid { font-family: var(--mono); font-size: 12px; }
+
+@media (prefers-reduced-motion: reduce) {
+    * { transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; }
 }
