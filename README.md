@@ -5,20 +5,23 @@ A modern web application for sending messages through Twilio's Programmable Mess
 ## Features
 
 - **Multi-Channel Support**: Send messages via SMS, WhatsApp, and Facebook Messenger
-- **Flexible Authentication**: Login with Account SID + Auth Token OR API Key + API Secret
+- **OAuth Authentication**: Sign in with an account-level [OAuth app](https://www.twilio.com/docs/iam/oauth-apps/account-oauth-apps) using the Client Credentials grant — scoped, independently revocable, and never stored server-side
 - **Resumable Execution**: Automatically handles 10-second function timeout by chunking messages and resuming from checkpoints
 - **Progress Tracking**: Real-time campaign status updates using Twilio Sync
 - **Modern UI**: Clean, responsive interface built with vanilla JavaScript
-- **State Management**: Uses Twilio Sync to store campaign progress and credentials securely
+- **State Management**: Uses Twilio Sync to store campaign progress. No user credential is stored server-side.
 
 ## Architecture
 
 ### Serverless Functions
 
-1. **auth.js**: Handles user authentication with Account SID/Auth Token or API Key/Secret
+1. **verify.js**: Validates OAuth credentials at sign-in — a token fetch plus a phone-number read, persisting nothing
 2. **send-messages.js**: Sends messages in chunks, tracking progress in Twilio Sync
 3. **check-status.js**: Retrieves campaign status and updates message statuses from Twilio
 4. **resume-execution.js**: Resumes interrupted campaigns from the last checkpoint
+5. **get-phone-numbers.js** / **get-content-templates.js** / **list-campaigns.js**: Populate the From dropdown, the template picker, and the campaign list
+
+Every Function receives `accountSid`, `clientId` and `clientSecret` in its POST body and builds a per-request Twilio client through `assets/twilio-oauth.private.js`. The injected runtime credentials (`context.ACCOUNT_SID` / `context.AUTH_TOKEN`) are used for Twilio Sync only.
 
 ### Frontend
 
@@ -28,7 +31,7 @@ A modern web application for sending messages through Twilio's Programmable Mess
 
 ### Timeout Handling
 
-The application processes messages in chunks of 10 messages at a time. If execution approaches the 10-second limit, it:
+The application processes messages in chunks of 100 at a time. If execution approaches the 10-second limit, it:
 1. Saves progress to Twilio Sync
 2. Returns the current state to the frontend
 3. Automatically resumes from the last checkpoint
@@ -91,13 +94,18 @@ Then visit `http://localhost:3000/index.html`
 
 ## Usage
 
-### 1. Login
+### 1. Sign In
+
+First, create an account-level OAuth app: **Twilio Console → Account → API keys & tokens → OAuth apps → Create**. Grant it Messaging (read and write), Phone Numbers (read), and Content (read). Copy the **Client ID** and **Client Secret** — the secret is shown only once.
 
 1. Open the application URL
-2. Choose authentication method:
-   - **Account SID + Auth Token**: Use your main Twilio credentials
-   - **API Key + Secret**: Use a Twilio API Key (recommended for production)
-3. Enter your credentials and click "Login"
+2. Enter three values:
+   - **Account SID** (`AC…`) — an identifier, not a credential. It is required because Twilio's Messaging and Phone Numbers endpoints embed it in the request path.
+   - **OAuth Client ID**
+   - **OAuth Client Secret**
+3. Click "Sign In"
+
+Credentials are held in the browser's `sessionStorage` for the life of the tab and sent with each request. Nothing is written to disk and nothing is stored server-side.
 
 ### 2. Send Messages
 
@@ -137,7 +145,7 @@ Then visit `http://localhost:3000/index.html`
 
 ## How Resumable Execution Works
 
-1. **Chunking**: Messages are processed in batches of 10
+1. **Chunking**: Messages are processed in batches of 100
 2. **Progress Tracking**: Each chunk's progress is saved to Twilio Sync
 3. **Timeout Detection**: Function monitors execution time (9-second limit)
 4. **Checkpointing**: Before timeout, saves current index to Sync
@@ -146,26 +154,36 @@ Then visit `http://localhost:3000/index.html`
 
 ## Security Considerations
 
-- Credentials are stored in Twilio Sync with 1-hour TTL
-- Use API Keys instead of Auth Tokens for better security
-- Sync documents are scoped to the session
-- Consider implementing additional security measures for production
+- **No user credential is stored server-side** — not in Twilio Sync, not in environment variables, not in logs. Earlier versions of this app wrote the user's Auth Token into a Sync Document; that store is gone.
+- Credentials travel over HTTPS in POST request bodies only, never in query strings. Twilio Functions do not log request bodies and Twilio Serverless does not serve plaintext HTTP.
+- A fresh Twilio client is built per request, so nothing leaks between callers.
+- Campaigns are owned by the OAuth Client ID that created them. Requesting another app's campaign returns 404 rather than 403, so a guessed campaign ID is not confirmed to exist.
+- The deployment holds no credentials of its own beyond the runtime credentials used for Sync, so the public Function URLs cannot be used to spend the owner's balance.
+
+Two limits are worth stating plainly:
+
+- **`sessionStorage` is readable by JavaScript on the page.** Any XSS on the deployed origin can exfiltrate it. OAuth does not remove that exposure — the Client Secret sits where the Auth Token used to. What changes is blast radius and revocability: the app is scoped to Messaging and Phone Numbers, and its secret rotates independently of the account's master credential. Access tokens are never stored.
+- **The Function URLs are public.** Anyone with the URL can use the tool, but only with OAuth credentials they already hold.
 
 ## Project Structure
 
 ```
 messaging-ui/
 ├── functions/
-│   ├── auth.js              # Authentication endpoint
-│   ├── send-messages.js     # Message sending with chunking
-│   ├── check-status.js      # Campaign status checker
-│   └── resume-execution.js  # Resume interrupted campaigns
+│   ├── verify.js                # Validates OAuth credentials at sign-in
+│   ├── send-messages.js         # Message sending with chunking
+│   ├── check-status.js          # Campaign status checker
+│   ├── resume-execution.js      # Resume interrupted campaigns
+│   ├── get-phone-numbers.js     # From dropdown
+│   ├── get-content-templates.js # WhatsApp/RCS template picker
+│   ├── list-campaigns.js        # Campaign history
+│   └── webhook.js               # Delivery status callbacks
 ├── assets/
-│   ├── index.html          # Main HTML file
-│   ├── app.js              # Frontend JavaScript
-│   └── styles.css          # Styling
+│   ├── index.html               # Main HTML file
+│   ├── app.js                   # Frontend JavaScript
+│   ├── styles.css               # Styling
+│   └── twilio-oauth.private.js  # Shared OAuth client helper (private asset)
 ├── package.json
-├── twilio.json             # Twilio Serverless configuration
 ├── .env.example
 └── README.md
 ```
@@ -182,10 +200,15 @@ messaging-ui/
 
 ## Troubleshooting
 
-### Authentication Fails
-- Verify your Account SID and Auth Token/API Key are correct
-- Ensure your Twilio account is active
-- Check that API Keys have proper permissions
+### Sign-In Fails
+
+- *"Invalid OAuth credentials"* — check the Client ID and Client Secret, and that the secret has not been rotated. The secret is shown only once at creation; if it was lost, create a new one.
+- *"These OAuth credentials do not belong to that Account SID"* (Twilio error 70051) — either the Account SID is mistyped, or the OAuth app was created under a different account or subaccount.
+- Sign-in deliberately reads one phone number to prove the credentials match the Account SID. If the app lacks the Phone Numbers read scope, sign-in fails even with a valid Client ID and Secret.
+
+### Template Picker Is Empty
+
+If the OAuth app lacks Content read scope, the picker falls back to "None (Use custom message)" and shows the error in red. Both channels still send with a literal message body; only the template picker is lost.
 
 ### Messages Not Sending
 - Verify your "From" number is correct for the selected channel
@@ -205,7 +228,7 @@ messaging-ui/
 ## Limitations
 
 - Function execution time limit: 10 seconds (handled via chunking)
-- Sync document TTL: 1 hour for credentials
+- A session lasts as long as the browser tab. Closing it requires signing in again.
 - Rate limits: Subject to Twilio's messaging rate limits
 - Large campaigns: May take multiple function invocations to complete
 
