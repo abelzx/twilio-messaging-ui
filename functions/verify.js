@@ -112,6 +112,11 @@ exports.handler = async function (context, event, callback) {
   }
 
   response.setStatusCode(200);
-  response.setBody({ valid: true, accountSid: creds.accountSid });
+  // Just `valid` — deliberately not echoing accountSid back. The caller typed it,
+  // so returning it tells them nothing, and nothing in app.js reads it. (The
+  // sibling project returns accountSid because it *derives* it from the access
+  // token's JWT payload, which this app does not do; see spec § The Account SID
+  // is still required.)
+  response.setBody({ valid: true });
   return callback(null, response);
 };
