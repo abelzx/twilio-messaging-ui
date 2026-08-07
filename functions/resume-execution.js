@@ -60,6 +60,7 @@ async function retryWithExponentialBackoff(fn, options = {}) {
 }
 
 exports.handler = async function(context, event, callback) {
+  const startTime = Date.now();
   const response = new Twilio.Response();
   response.appendHeader('Access-Control-Allow-Origin', '*');
   response.appendHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
@@ -124,7 +125,13 @@ exports.handler = async function(context, event, callback) {
       messages,
       channel,
       from,
-      resumeFrom: campaignData.startIndex || 0
+      resumeFrom: campaignData.startIndex || 0,
+      // Pass the handler's own start time down. Measuring from inside
+      // sendMessagesChunk would exclude the token exchange and the ownership
+      // fetch above it, so the 9s ceiling would no longer bound total elapsed
+      // time — the exact accounting send-messages.js gets right by capturing
+      // startTime at the top of its handler.
+      startTime
     });
 
     response.setStatusCode(200);
@@ -152,10 +159,10 @@ async function sendMessagesChunk(params) {
     messages,
     channel,
     from,
-    resumeFrom
+    resumeFrom,
+    startTime
   } = params;
 
-  const startTime = Date.now();
   const MAX_EXECUTION_TIME = 9000;
   const CHUNK_SIZE = 100; // Process 100 messages at a time for full-speed sending
 
@@ -191,6 +198,18 @@ async function sendMessagesChunk(params) {
         // Add content template if provided (for WhatsApp/RCS)
         if (message.contentSid) {
           messageParams.contentSid = message.contentSid;
+
+          // contentVariables MUST travel with contentSid. send-messages.js does
+          // this (lines 207-210); the pre-migration version of this file did not,
+          // so a resumed chunk of a personalised template campaign sent the
+          // template with its placeholders unfilled. app.js puts the variables on
+          // every message object, so the data was there — it was simply dropped.
+          if (message.contentVariables) {
+            messageParams.contentVariables =
+              typeof message.contentVariables === 'string'
+                ? message.contentVariables
+                : JSON.stringify(message.contentVariables);
+          }
         }
 
         if (channel === 'whatsapp') {
@@ -213,6 +232,12 @@ async function sendMessagesChunk(params) {
           // RCS can also use content templates
           if (message.contentSid) {
             messageParams.contentSid = message.contentSid;
+            if (message.contentVariables) {
+              messageParams.contentVariables =
+                typeof message.contentVariables === 'string'
+                  ? message.contentVariables
+                  : JSON.stringify(message.contentVariables);
+            }
           }
         }
 
