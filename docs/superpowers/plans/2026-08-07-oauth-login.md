@@ -960,11 +960,11 @@ grep -c "404" functions/check-status.js
 grep -n "sessionId\|credentials_\|function getOrCreateSyncService" functions/check-status.js || echo "clean: OK"
 ```
 
-Expected — `syntax OK`, at least `3` occurrences of `404` (the two guards plus the `setStatusCode(404)`), and a clean grep:
+Expected — `syntax OK`, `4` lines mentioning `404`, and a clean grep. `grep -c` counts *lines*: the `error.status !== 404 && error.code !== 20404` guard, the `setStatusCode(404)`, and the two explanatory comments that also happen to contain "404":
 
 ```
 syntax OK
-3
+4
 clean: OK
 ```
 
