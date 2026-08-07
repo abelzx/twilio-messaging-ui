@@ -2320,8 +2320,9 @@ Replace with:
 3. **check-status.js**: Retrieves campaign status and updates message statuses from Twilio
 4. **resume-execution.js**: Resumes interrupted campaigns from the last checkpoint
 5. **get-phone-numbers.js** / **get-content-templates.js** / **list-campaigns.js**: Populate the From dropdown, the template picker, and the campaign list
+6. **webhook.js**: Receives delivery-status callbacks from Twilio
 
-Every Function receives `accountSid`, `clientId` and `clientSecret` in its POST body and builds a per-request Twilio client through `assets/twilio-oauth.private.js`. The injected runtime credentials (`context.ACCOUNT_SID` / `context.AUTH_TOKEN`) are used for Twilio Sync only.
+The first five receive `accountSid`, `clientId` and `clientSecret` in their POST body and build a per-request Twilio client through `assets/twilio-oauth.private.js`. `webhook.js` is the exception: Twilio calls it, not the browser, so it carries no user credentials and uses only the injected runtime credentials. Those runtime credentials (`context.ACCOUNT_SID` / `context.AUTH_TOKEN`) are used for Twilio Sync access throughout, never for the user's own account.
 ```
 
 - [ ] **Step 4: Correct the chunk size (lines 31 and 140)**
@@ -2481,9 +2482,11 @@ grep -n "Auth Token\|API Key\|auth\.js\|sessionId\|twilio\.json\|1-hour TTL" REA
 
 Expected output — three surviving mentions, all legitimate:
 
-- the `.env` local-development block (lines 61-68), which uses `AUTH_TOKEN` for the *deployment's* runtime credentials, not the user's
-- the Environment Variables section's `AUTH_TOKEN` entry, same reason
-- the Security Considerations sentence that names the Auth Token historically
+- the Environment Variables section's `AUTH_TOKEN` entry, which is the *deployment's* runtime credential for Sync, not the user's
+- the Security Considerations bullet naming the Auth Token historically ("wrote the user's Auth Token into a Sync Document; that store is gone")
+- the `sessionStorage`/XSS bullet's comparison ("the Client Secret sits where the Auth Token used to")
+
+Note the `.env` block at lines 61-68 does **not** match, despite containing `AUTH_TOKEN`: the grep pattern `Auth Token` has a space and this is the underscored env-var name. Do not go hunting for a match there.
 
 Any other match is a missed edit. `auth.js`, `sessionId`, `twilio.json` and `1-hour TTL` must return nothing.
 

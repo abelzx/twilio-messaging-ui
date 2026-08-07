@@ -20,8 +20,9 @@ A modern web application for sending messages through Twilio's Programmable Mess
 3. **check-status.js**: Retrieves campaign status and updates message statuses from Twilio
 4. **resume-execution.js**: Resumes interrupted campaigns from the last checkpoint
 5. **get-phone-numbers.js** / **get-content-templates.js** / **list-campaigns.js**: Populate the From dropdown, the template picker, and the campaign list
+6. **webhook.js**: Receives delivery-status callbacks from Twilio
 
-Every Function receives `accountSid`, `clientId` and `clientSecret` in its POST body and builds a per-request Twilio client through `assets/twilio-oauth.private.js`. The injected runtime credentials (`context.ACCOUNT_SID` / `context.AUTH_TOKEN`) are used for Twilio Sync only.
+The first five receive `accountSid`, `clientId` and `clientSecret` in their POST body and build a per-request Twilio client through `assets/twilio-oauth.private.js`. `webhook.js` is the exception: Twilio calls it, not the browser, so it carries no user credentials and uses only the injected runtime credentials. Those runtime credentials (`context.ACCOUNT_SID` / `context.AUTH_TOKEN`) are used for Twilio Sync access throughout, never for the user's own account.
 
 ### Frontend
 
