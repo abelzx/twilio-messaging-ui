@@ -944,3 +944,14 @@ header h1 {
     outline: none;
     border-color: var(--twilio-blue);
 }
+
+.login-help {
+    margin: 0 0 20px;
+    font-size: 14px;
+    line-height: 1.5;
+    color: var(--twilio-gray-600);
+}
+
+.login-help a {
+    color: var(--twilio-blue);
+}
