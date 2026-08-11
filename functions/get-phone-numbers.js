@@ -54,14 +54,33 @@ exports.handler = async function(context, event, callback) {
             : s.senderId.replace(/^[a-z]+:/, ''),
           status: s.status,
         }));
+    } else if (channel === 'messenger') {
+      // Facebook Pages are not exposed by the Channel Senders API (it answers
+      // 63105 "Channel does not support this action"). Pages attach to a
+      // Messaging Service, and the send path already consumes
+      // messagingServiceSid for this channel, so list the services.
+      const services = await client.messaging.v1.services.list({ limit: 50 });
+      totalRegistered = services.length;
+      senders = services.map((s) => ({
+        value: s.sid,
+        label: `${s.friendlyName} · ${s.sid.slice(0, 10)}…`,
+        status: 'ONLINE',
+      }));
     } else {
       const numbers = await client.incomingPhoneNumbers.list({ limit: 100 });
-      const smsCapable = numbers.filter((n) => {
+
+      // MMS carries media, and a number that can send SMS cannot necessarily
+      // send MMS — on the test account 5 of 13 sms-capable numbers are not
+      // mms-capable. Filtering both on `sms` offers senders that will fail.
+      const needsMms = channel === 'mms';
+      const capable = numbers.filter((n) => {
         const c = n.capabilities || {};
-        return c.sms === true || c.sms === 'true';
+        const flag = needsMms ? c.mms : c.sms;
+        return flag === true || flag === 'true';
       });
-      totalRegistered = smsCapable.length;
-      senders = smsCapable.map((n) => ({
+
+      totalRegistered = capable.length;
+      senders = capable.map((n) => ({
         value: n.phoneNumber,
         label: n.friendlyName && n.friendlyName !== n.phoneNumber
           ? `${n.phoneNumber} · ${n.friendlyName}`

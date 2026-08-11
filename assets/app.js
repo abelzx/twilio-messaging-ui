@@ -251,7 +251,7 @@ const CHANNEL_SENDER_NOUN = {
     mms: 'SMS-capable number',
     whatsapp: 'WhatsApp sender',
     rcs: 'RCS agent',
-    messenger: 'Facebook Page',
+    messenger: 'Messaging Service',
 };
 
 function setSenderHelp(text, isProblem) {

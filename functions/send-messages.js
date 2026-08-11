@@ -219,7 +219,24 @@ exports.handler = async function(context, event, callback) {
             messageParams.from = wa(messageParams.from);
             messageParams.to = wa(messageParams.to);
           } else if (channel === 'messenger') {
-            messageParams.messagingServiceSid = message.messagingServiceSid || context.MESSAGING_SERVICE_SID;
+            // Two valid shapes, and only one may be used at a time: a Messaging
+            // Service that owns the Page, or a Page ID in From. The sender
+            // dropdown supplies an MG SID, so detect that and drop From.
+            const fromValue = String(messageParams.from || '');
+            const mg = (v) => /^MG[0-9a-f]{32}$/i.test(v);
+
+            if (mg(fromValue)) {
+              messageParams.messagingServiceSid = fromValue;
+              delete messageParams.from;
+            } else {
+              const svc = message.messagingServiceSid || context.MESSAGING_SERVICE_SID;
+              if (svc) messageParams.messagingServiceSid = svc;
+              // Idempotent, like the whatsapp prefix: a caller may already have
+              // supplied `messenger:<id>`.
+              const ms = (v) => (String(v).startsWith('messenger:') ? String(v) : `messenger:${v}`);
+              if (fromValue) messageParams.from = ms(fromValue);
+              messageParams.to = ms(messageParams.to);
+            }
           } else if (channel === 'mms') {
             // MMS uses the same API as SMS but can include media
             // Media URLs can be added via message.mediaUrl if provided
