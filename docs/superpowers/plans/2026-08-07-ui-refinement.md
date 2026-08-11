@@ -798,7 +798,7 @@ grep -c "messaging.v1.services.list" functions/get-phone-numbers.js
 grep -c "MG\[0-9a-f\]{32}" functions/send-messages.js functions/resume-execution.js
 ```
 
-Expected: four `OK` lines, `1` for `needsMms`, `1` for the services call, and `1` for the MG pattern in **each** send file.
+Expected: four `OK` lines, `2` for `needsMms` (it appears on both its declaration and its use inside the filter — `grep -c` counts lines), `1` for the services call, and `1` for the MG pattern in **each** send file.
 
 Then probe the deployed endpoint per channel (credentials from the gitignored `.env.oauthtest`; never echo it). Expected after redeploy: `sms` 13, `mms` **8** (not 13), `whatsapp` 3 of 4, `rcs` 0 of 2, `messenger` 5 Messaging Services.
 
