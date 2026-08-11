@@ -248,10 +248,20 @@ async function loadPhoneNumbers(channel) {
 
 const CHANNEL_SENDER_NOUN = {
     sms: 'SMS-capable number',
-    mms: 'SMS-capable number',
+    mms: 'MMS-capable number',
     whatsapp: 'WhatsApp sender',
     rcs: 'RCS agent',
     messenger: 'Messaging Service',
+};
+
+// "an SMS", "an MMS", "an RCS" — the article follows how the acronym is spoken,
+// which can't be derived from its first letter.
+const CHANNEL_SENDER_ARTICLE = {
+    sms: 'an',
+    mms: 'an',
+    rcs: 'an',
+    whatsapp: 'a',
+    messenger: 'a',
 };
 
 function setSenderHelp(text, isProblem) {
@@ -264,6 +274,7 @@ function setSenderHelp(text, isProblem) {
 function renderSenderOptions(data) {
     const select = document.getElementById('from-number-select');
     const noun = CHANNEL_SENDER_NOUN[data.channel] || 'sender';
+    const article = CHANNEL_SENDER_ARTICLE[data.channel] || 'a';
     const senders = Array.isArray(data.senders) ? data.senders : [];
 
     select.innerHTML = '';
@@ -284,7 +295,7 @@ function renderSenderOptions(data) {
 
     const placeholder = document.createElement('option');
     placeholder.value = '';
-    placeholder.textContent = `Select a ${noun}…`;
+    placeholder.textContent = `Select ${article} ${noun}…`;
     select.appendChild(placeholder);
 
     for (const sender of senders) {
