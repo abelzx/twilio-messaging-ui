@@ -682,6 +682,135 @@ Screenshots cannot be taken from here. Report to the user exactly what to look a
 
 ---
 
+---
+
+### Task D: Correct the MMS and Messenger sender sources
+
+Task A made the sender list channel-aware but left two channels wrong. Both were reported by the user after testing.
+
+**Established by live probing — do not re-derive:**
+
+- `incomingPhoneNumbers` on the test account: 24 total, **13 sms-capable, 8 mms-capable, 5 sms-but-not-mms**. Filtering MMS on `capabilities.sms` therefore offers 5 numbers that cannot send media.
+- The Channel Senders API **rejects** messenger: `client.messaging.v2.channelsSenders.list({ channel: 'messenger' })` fails with `400 / 63105 Channel does not support this action`. It is not a source for Messenger senders.
+- `client.messaging.v1.services.list()` works with OAuth and returns 5 Messaging Services. Facebook Pages attach to a Messaging Service, and `send-messages.js` already consumes `messagingServiceSid` for the messenger channel — so Messaging Services are the correct dropdown source.
+
+**Files:**
+- Modify: `functions/get-phone-numbers.js`
+- Modify: `functions/send-messages.js`
+- Modify: `functions/resume-execution.js`
+- Modify: `assets/app.js` (one label)
+
+- [ ] **Step 1: Split the capability filter and add a Messenger branch**
+
+In `functions/get-phone-numbers.js`, replace the `else` branch from Task A with three branches:
+
+```js
+    } else if (channel === 'messenger') {
+      // Facebook Pages are not exposed by the Channel Senders API (it answers
+      // 63105 "Channel does not support this action"). Pages attach to a
+      // Messaging Service, and the send path already consumes
+      // messagingServiceSid for this channel, so list the services.
+      const services = await client.messaging.v1.services.list({ limit: 50 });
+      totalRegistered = services.length;
+      senders = services.map((s) => ({
+        value: s.sid,
+        label: `${s.friendlyName} · ${s.sid.slice(0, 10)}…`,
+        status: 'ONLINE',
+      }));
+    } else {
+      const numbers = await client.incomingPhoneNumbers.list({ limit: 100 });
+
+      // MMS carries media, and a number that can send SMS cannot necessarily
+      // send MMS — on the test account 5 of 13 sms-capable numbers are not
+      // mms-capable. Filtering both on `sms` offers senders that will fail.
+      const needsMms = channel === 'mms';
+      const capable = numbers.filter((n) => {
+        const c = n.capabilities || {};
+        const flag = needsMms ? c.mms : c.sms;
+        return flag === true || flag === 'true';
+      });
+
+      totalRegistered = capable.length;
+      senders = capable.map((n) => ({
+        value: n.phoneNumber,
+        label: n.friendlyName && n.friendlyName !== n.phoneNumber
+          ? `${n.phoneNumber} · ${n.friendlyName}`
+          : n.phoneNumber,
+        status: 'ONLINE',
+      }));
+    }
+```
+
+- [ ] **Step 2: Make the messenger send path coherent, in BOTH send files**
+
+The current branch sets `messagingServiceSid` *and* leaves `from` as-is, so both can be sent at once, and the `messenger:` channel prefix is never applied. In **both** `functions/send-messages.js` and `functions/resume-execution.js`, find:
+
+```js
+          } else if (channel === 'messenger') {
+            messageParams.messagingServiceSid = message.messagingServiceSid || context.MESSAGING_SERVICE_SID;
+```
+
+Replace with:
+
+```js
+          } else if (channel === 'messenger') {
+            // Two valid shapes, and only one may be used at a time: a Messaging
+            // Service that owns the Page, or a Page ID in From. The sender
+            // dropdown supplies an MG SID, so detect that and drop From.
+            const fromValue = String(messageParams.from || '');
+            const mg = (v) => /^MG[0-9a-f]{32}$/i.test(v);
+
+            if (mg(fromValue)) {
+              messageParams.messagingServiceSid = fromValue;
+              delete messageParams.from;
+            } else {
+              const svc = message.messagingServiceSid || context.MESSAGING_SERVICE_SID;
+              if (svc) messageParams.messagingServiceSid = svc;
+              // Idempotent, like the whatsapp prefix: a caller may already have
+              // supplied `messenger:<id>`.
+              const ms = (v) => (String(v).startsWith('messenger:') ? String(v) : `messenger:${v}`);
+              if (fromValue) messageParams.from = ms(fromValue);
+              messageParams.to = ms(messageParams.to);
+            }
+```
+
+Both files. One without the other reproduces the divergence that caused the `contentVariables` bug.
+
+Note the `if (svc)` guard: the previous code assigned `undefined` when neither a per-message value nor the environment variable was set, which sends an empty parameter.
+
+- [ ] **Step 3: Correct the Messenger label**
+
+In `assets/app.js`, `CHANNEL_SENDER_NOUN` says `messenger: 'Facebook Page'`, but the dropdown now lists Messaging Services. Change it to:
+
+```js
+    messenger: 'Messaging Service',
+```
+
+- [ ] **Step 4: Verify**
+
+```bash
+node --check functions/get-phone-numbers.js && echo "fn OK"
+node --check functions/send-messages.js && echo "send OK"
+node --check functions/resume-execution.js && echo "resume OK"
+node --check assets/app.js && echo "app OK"
+grep -c "needsMms" functions/get-phone-numbers.js
+grep -c "messaging.v1.services.list" functions/get-phone-numbers.js
+grep -c "MG\[0-9a-f\]{32}" functions/send-messages.js functions/resume-execution.js
+```
+
+Expected: four `OK` lines, `1` for `needsMms`, `1` for the services call, and `1` for the MG pattern in **each** send file.
+
+Then probe the deployed endpoint per channel (credentials from the gitignored `.env.oauthtest`; never echo it). Expected after redeploy: `sms` 13, `mms` **8** (not 13), `whatsapp` 3 of 4, `rcs` 0 of 2, `messenger` 5 Messaging Services.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add functions/get-phone-numbers.js functions/send-messages.js functions/resume-execution.js assets/app.js
+git commit -m "fix: use MMS-capable numbers for MMS and Messaging Services for Messenger"
+```
+
+---
+
 ## Done When
 
 - [ ] Selecting WhatsApp lists WhatsApp senders, not SMS numbers
