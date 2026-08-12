@@ -25,16 +25,11 @@
                         Sign in with an account-level
                         <a href="https://www.twilio.com/docs/iam/oauth-apps/account-oauth-apps"
                            target="_blank" rel="noopener">OAuth app</a>.
-                        It needs the Messaging and Phone Numbers scopes.
+                        It needs the Messaging and Phone Numbers scopes. The account is
+                        detected automatically from your credentials.
                     </p>
 
                     <form id="login-form">
-                        <div class="form-group">
-                            <label for="account-sid">Account SID</label>
-                            <input type="text" id="account-sid" required
-                                   placeholder="ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx">
-                            <small>Public identifier, shown on your Console dashboard.</small>
-                        </div>
                         <div class="form-group">
                             <label for="client-id">OAuth Client ID</label>
                             <input type="text" id="client-id" required
@@ -60,6 +55,7 @@
                 <div class="nav-content">
                     <div class="logo">Twilio Messaging</div>
                     <div class="nav-actions">
+                        <span id="account-indicator" style="opacity: 0.8; font-size: 13px;"></span>
                         <button id="logout-btn" class="btn btn-secondary">Sign Out</button>
                     </div>
                 </div>

@@ -96,11 +96,15 @@ Then visit `http://localhost:3000/index.html`
 First, create an account-level OAuth app: **Twilio Console → Account → API keys & tokens → OAuth apps → Create**. Grant it Messaging (read and write), Phone Numbers (read), and Content (read). Copy the **Client ID** and **Client Secret** — the secret is shown only once.
 
 1. Open the application URL
-2. Enter three values:
-   - **Account SID** (`AC…`) — an identifier, not a credential. It is required because Twilio's Messaging and Phone Numbers endpoints embed it in the request path.
+2. Enter two values:
    - **OAuth Client ID**
    - **OAuth Client Secret**
 3. Click "Sign In"
+
+The Account SID is not entered — it is derived from the access token issued for your
+credentials and shown next to Sign Out once you are in. It is still required
+internally, because Twilio's Messaging and Phone Numbers endpoints embed it in the
+request path.
 
 Credentials are held in the browser's `sessionStorage` for the life of the tab and sent with each request. Nothing is written to disk and nothing is stored server-side.
 
@@ -199,12 +203,13 @@ messaging-ui/
 ### Sign-In Fails
 
 - *"Invalid OAuth credentials"* — check the Client ID and Client Secret, and that the secret has not been rotated. The secret is shown only once at creation; if it was lost, create a new one.
-- *"Those OAuth credentials are valid, but they do not grant access to that Account SID"* (Twilio error 70051) — the credentials work, but not against this account. Either the Account SID is mistyped, or the OAuth app lacks the Phone Numbers read scope.
-- *"Those OAuth credentials do not belong to that Account SID"* — the same underlying mistake reported via a plain HTTP 401 rather than error 70051, usually an OAuth app created under a different account or subaccount.
-- *"That Account SID was not found"* (Twilio error 20404) — check the SID against the Console dashboard.
+- *"Those OAuth credentials are valid, but the OAuth app is missing the Phone Numbers read scope"* (Twilio error 70051) — grant the OAuth app the Phone Numbers read scope.
 - *"Twilio's token endpoint did not respond in time"* — a transient upstream problem, not a credential problem. Try again.
 
-Sign-in deliberately reads one phone number to prove the credentials match the Account SID. That is why a missing Phone Numbers read scope fails sign-in even with a valid Client ID and Secret.
+Sign-in deliberately reads one phone number to prove the OAuth app's scopes are
+sufficient. That is why a missing Phone Numbers read scope fails sign-in even with a
+valid Client ID and Secret. The Account SID is no longer typed, so it cannot mismatch
+what was entered — it is derived from the same token that proves the credentials.
 
 ### Template Picker Is Empty
 

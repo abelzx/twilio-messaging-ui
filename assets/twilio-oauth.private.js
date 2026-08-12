@@ -22,27 +22,54 @@ function httpError(statusCode, message) {
 }
 
 /**
- * Pulls the three credential fields out of a Function's event, trimmed.
+ * Pulls the two credential fields out of a Function's event, trimmed.
  * Throws a 400-flagged Error naming whichever fields are missing.
  */
 function credsFrom(event) {
-  const accountSid = String(event.accountSid || '').trim();
   const clientId = String(event.clientId || '').trim();
   const clientSecret = String(event.clientSecret || '').trim();
 
   const missing = [];
-  if (!accountSid) missing.push('Account SID');
   if (!clientId) missing.push('OAuth Client ID');
   if (!clientSecret) missing.push('OAuth Client Secret');
-
-  if (missing.length > 0) {
-    throw httpError(
-      400,
-      `${missing.join(', ')} ${missing.length === 1 ? 'is' : 'are'} required.`
-    );
+  if (missing.length) {
+    throw httpError(400, `${missing.join(', ')} ${missing.length === 1 ? 'is' : 'are'} required.`);
   }
 
-  return { accountSid, clientId, clientSecret };
+  // No accountSid: it is derived from the access token in `authenticate`.
+  return { clientId, clientSecret };
+}
+
+/**
+ * Pulls the Account SID out of an access token's `act.sub` claim.
+ *
+ * `getAuthString()` returns "Bearer <jwt>". The JWT payload carries the acting
+ * account as a Twilio Resource Name:
+ *
+ *   act.sub = "trn:us1:iam:account:AC0123…"
+ *
+ * `act` is the RFC 8693 actor claim, preferred over Twilio's private
+ * `urn:tw:iam_ctx` (which holds the same value) because it is a standard claim.
+ * `urn:tw:iam_ctx` is read only as a fallback.
+ *
+ * Returns null if no SID can be found — callers must treat that as fatal rather
+ * than proceeding with an empty SID, which would build /Accounts//Messages.json.
+ */
+function accountSidFromAuthString(authString) {
+  try {
+    const jwt = String(authString || '').split(' ').pop();
+    const segment = jwt.split('.')[1];
+    if (!segment) return null;
+    const payload = JSON.parse(Buffer.from(segment, 'base64url').toString('utf8'));
+    const candidates = [payload && payload.act && payload.act.sub, payload && payload['urn:tw:iam_ctx']];
+    for (const candidate of candidates) {
+      const match = String(candidate || '').match(/AC[0-9a-f]{32}/i);
+      if (match) return match[0];
+    }
+  } catch {
+    // Malformed token: fall through to null and let the caller fail loudly.
+  }
+  return null;
 }
 
 /** Token failures surface as a wrapped, multi-line Error with no code or status. */
@@ -79,9 +106,9 @@ function createOAuthClient(creds) {
   });
   client.setCredentialProvider(provider);
 
-  // MUST come after setCredentialProvider(), which sets accountSid to "".
-  // Without this, v2010 URIs come out as /2010-04-01/Accounts//Messages.json.
-  client.setAccountSid(creds.accountSid);
+  // accountSid is deliberately NOT set here: it comes from the access token, which
+  // does not exist until `authenticate` fetches one. Anything using this client
+  // directly must set it, or v2010 URIs come out as /Accounts//Messages.json.
 
   return { client, authStrategy };
 }
@@ -130,8 +157,9 @@ function withDeadline(promise, ms, message) {
  */
 async function authenticate(creds, timeoutMs = TOKEN_DEADLINE_MS) {
   const { client, authStrategy } = createOAuthClient(creds);
+  let authString;
   try {
-    await withDeadline(
+    authString = await withDeadline(
       authStrategy.getAuthString(),
       timeoutMs,
       "Twilio's token endpoint did not respond in time. Try again."
@@ -144,6 +172,18 @@ async function authenticate(creds, timeoutMs = TOKEN_DEADLINE_MS) {
     }
     throw httpError(401, tokenErrorMessage(err));
   }
+
+  const accountSid = accountSidFromAuthString(authString);
+  if (!accountSid) {
+    // Fail loudly. An unset accountSid silently produces /Accounts//Messages.json,
+    // which fails later with a far less obvious message.
+    throw httpError(
+      502,
+      'Signed in, but could not read the Account SID from the access token. This is unexpected — the token may have changed shape.'
+    );
+  }
+  client.setAccountSid(accountSid);
+
   return client;
 }
 
@@ -204,6 +244,7 @@ module.exports = {
   credsFrom,
   createOAuthClient,
   authenticate,
+  accountSidFromAuthString,
   ownerKeyFor,
   getOrCreateSyncService,
   withDeadline,

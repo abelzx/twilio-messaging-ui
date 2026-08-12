@@ -4,7 +4,11 @@ const FUNCTIONS_BASE_URL = window.location.origin.replace(/\/$/, '');
 // State
 const CREDS_KEY = 'twilio_messaging_oauth';
 
-/** { accountSid, clientId, clientSecret }, or null when signed out. */
+/**
+ * { clientId, clientSecret, accountSid }, or null when signed out.
+ * accountSid is derived server-side by /verify from the access token — it is
+ * stored here for display only, never sent as an authorization input.
+ */
 let creds = null;
 let currentCampaignId = null;
 let resumeInterval = null;
@@ -65,7 +69,10 @@ function loadCreds() {
         const raw = sessionStorage.getItem(CREDS_KEY);
         if (!raw) return null;
         const parsed = JSON.parse(raw);
-        if (parsed && parsed.accountSid && parsed.clientId && parsed.clientSecret) {
+        // Validated on clientId/clientSecret only. A blob stored before this
+        // change also carries accountSid (then typed, now derived) and stays
+        // valid — it is not rejected for having an extra field.
+        if (parsed && parsed.clientId && parsed.clientSecret) {
             return parsed;
         }
     } catch (error) {
@@ -88,6 +95,10 @@ function clearCreds() {
 /**
  * Calls a Function with the credentials in the JSON body. Never a query string:
  * a Client Secret there would be recorded in request logs and browser history.
+ *
+ * `creds` includes `accountSid` (stored for display — see the `creds` comment
+ * above). Spreading it here is harmless: the Functions derive their own SID
+ * from the token and ignore any accountSid in the body. Not an input.
  */
 async function postToFunction(path, body = {}) {
     return fetch(`${FUNCTIONS_BASE_URL}/${path}`, {
@@ -139,7 +150,6 @@ async function handleLogin(e) {
     errorDiv.textContent = '';
 
     const candidate = {
-        accountSid: document.getElementById('account-sid').value.trim(),
         clientId: document.getElementById('client-id').value.trim(),
         clientSecret: document.getElementById('client-secret').value.trim()
     };
@@ -174,7 +184,10 @@ async function handleLogin(e) {
             throw new Error(data.error || 'Verification failed.');
         }
 
-        saveCreds(candidate);
+        // /verify derives the Account SID from the access token and returns it.
+        // Store it alongside the credentials for display, but it is never sent
+        // as an authorization input — see the `creds` comment above.
+        saveCreds({ ...candidate, accountSid: data.accountSid });
         // Blank the form now rather than waiting for sign-out, so the Client Secret
         // does not sit in a DOM input for the life of the tab.
         document.getElementById('login-form').reset();
@@ -207,11 +220,18 @@ function showLoginScreen() {
     document.getElementById('login-screen').classList.add('active');
     // Clear the form so the Client Secret is not left sitting in a DOM node.
     document.getElementById('login-form').reset();
+    const indicator = document.getElementById('account-indicator');
+    if (indicator) indicator.textContent = '';
 }
 
 function showAppScreen() {
     document.getElementById('login-screen').classList.remove('active');
     document.getElementById('app-screen').classList.add('active');
+    // Show which account is signed in, only when known (derived by /verify).
+    const indicator = document.getElementById('account-indicator');
+    if (indicator) {
+        indicator.textContent = creds && creds.accountSid ? `Account ${creds.accountSid}` : '';
+    }
     // handleChannelChange() loads the senders for the current channel, so there is
     // no separate loadPhoneNumbers() call here. Calling both would fire two
     // identical requests, each paying its own OAuth token exchange.

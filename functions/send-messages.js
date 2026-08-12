@@ -133,7 +133,7 @@ exports.handler = async function(context, event, callback) {
         uniqueName: campaignDocName,
         data: {
           ownerKey,
-          accountSid: creds.accountSid, // display only; never an authorization key
+          accountSid: client.accountSid, // display only; never an authorization key
           totalMessages: messages.length,
           sent: 0,
           failed: 0,

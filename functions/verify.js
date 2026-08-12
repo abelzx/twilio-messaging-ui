@@ -1,9 +1,12 @@
 /**
- * POST /verify — validates a Twilio OAuth app against a typed Account SID.
+ * POST /verify — validates a Twilio OAuth app and derives its Account SID.
  *
  * Persists nothing. Two things need proving here rather than one: that the
- * OAuth credentials work, and that they belong to the Account SID the user
- * typed. See https://www.twilio.com/docs/iam/oauth-apps/account-oauth-apps
+ * OAuth credentials work, and that they carry the Phone Numbers read scope the
+ * From dropdown depends on. The Account SID is no longer typed — it is decoded
+ * from the access token's `act.sub` claim (see accountSidFromAuthString in
+ * twilio-oauth.private.js). See
+ * https://www.twilio.com/docs/iam/oauth-apps/account-oauth-apps
  */
 
 const oauth = require(Runtime.getAssets()['/twilio-oauth.js'].path);
@@ -43,10 +46,13 @@ function describeTokenError(status, rawBody) {
 
 /**
  * Maps a step-2 failure to a message. Step 1 proved the credentials, but that
- * does NOT make every failure here the SID's fault: the client built in step 2
+ * does NOT make every failure here a scope problem: the client built in step 2
  * runs its own token exchange, so a transient token failure can surface at this
- * step too. Those arrive as a plain Error carrying neither `status` nor `code`,
- * and must not be blamed on the Account SID.
+ * step too. Those arrive as a plain Error carrying neither `status` nor `code`.
+ *
+ * There is no typed Account SID any more to mismatch, so the two messages about
+ * credentials not belonging to a given SID are gone — that case cannot arise
+ * when the SID is derived from the token itself.
  */
 function describeAccountError(err) {
   const code = err.code ?? err.status;
@@ -55,18 +61,12 @@ function describeAccountError(err) {
     return err.message;
   }
   if (code === undefined && /access token/i.test(err.message || '')) {
-    return 'Could not obtain a Twilio access token while checking the Account SID. This is usually transient — try again.';
+    return 'Could not obtain a Twilio access token while checking phone number access. This is usually transient — try again.';
   }
   if (code === 70051 || err.status === 403) {
-    return 'Those OAuth credentials are valid, but they do not grant access to that Account SID. Check the Account SID, and that the OAuth app has the Phone Numbers read scope. (Twilio error 70051)';
+    return 'Those OAuth credentials are valid, but the OAuth app is missing the Phone Numbers read scope. (Twilio error 70051)';
   }
-  if (err.status === 401) {
-    return 'Those OAuth credentials do not belong to that Account SID.';
-  }
-  if (code === 20404) {
-    return 'That Account SID was not found. Check it against the Twilio Console dashboard.';
-  }
-  return `Could not read phone numbers for that Account SID — ${err.message || String(err)}`;
+  return `Could not read phone numbers for that account — ${err.message || String(err)}`;
 }
 
 exports.handler = async function (context, event, callback) {
@@ -89,7 +89,10 @@ exports.handler = async function (context, event, callback) {
     return callback(null, response);
   }
 
-  // 1. Prove the OAuth credentials themselves. A direct token request is used
+  let accountSid;
+
+  // 1. Prove the OAuth credentials themselves, and derive the Account SID from
+  //    the token this exchange already produces. A direct token request is used
   //    rather than the SDK, because it yields a precise HTTP status to map;
   //    the SDK wraps token failures in a multi-line Error with no status.
   try {
@@ -113,6 +116,16 @@ exports.handler = async function (context, event, callback) {
       response.setBody({ valid: false, error: describeTokenError(res.status, text) });
       return callback(null, response);
     }
+
+    const token = JSON.parse(text);
+    accountSid = oauth.accountSidFromAuthString(token.access_token);
+    if (!accountSid) {
+      response.setBody({
+        valid: false,
+        error: 'Signed in, but could not read the Account SID from the access token.',
+      });
+      return callback(null, response);
+    }
   } catch (err) {
     const msg =
       err.name === 'TimeoutError' || err.name === 'AbortError'
@@ -122,16 +135,17 @@ exports.handler = async function (context, event, callback) {
     return callback(null, response);
   }
 
-  // 2. Prove the credentials belong to the Account SID that was typed, and that
-  //    the Phone Numbers read scope the From dropdown depends on is granted.
-  //    Not billable. Without this, a mistyped SID passes login and then fails
-  //    confusingly on first send.
+  // 2. Prove the Phone Numbers read scope the From dropdown depends on is
+  //    granted. Not billable. This now proves scope only, not account
+  //    ownership — there is no typed SID left to disagree with, so the client
+  //    is pointed at the SID just derived above.
   try {
     const { client } = oauth.createOAuthClient(creds);
+    client.setAccountSid(accountSid);
     await oauth.withDeadline(
       client.incomingPhoneNumbers.list({ limit: 1 }),
       PROBE_TIMEOUT_MS,
-      'Timed out reading phone numbers for that Account SID. Try again.'
+      'Timed out reading phone numbers. Try again.'
     );
   } catch (err) {
     console.error('Verify account probe failed:', err);
@@ -140,11 +154,8 @@ exports.handler = async function (context, event, callback) {
   }
 
   response.setStatusCode(200);
-  // Just `valid` — deliberately not echoing accountSid back. The caller typed it,
-  // so returning it tells them nothing, and nothing in app.js reads it. (The
-  // sibling project returns accountSid because it *derives* it from the access
-  // token's JWT payload, which this app does not do; see spec § The Account SID
-  // is still required.)
-  response.setBody({ valid: true });
+  // Echo the derived SID: the caller does not know it (it was never typed), so
+  // this is the only way the UI can show which account is in use.
+  response.setBody({ valid: true, accountSid });
   return callback(null, response);
 };

@@ -72,18 +72,40 @@ produce correct URIs for all three, and the Content API needs no SID at all:
 [content]               https://content.twilio.com/v1/Content
 ```
 
-So the login form keeps an Account SID field. The Auth Token and API Key/Secret
-fields both go away; the Account SID remains as a plain identifier, not a credential —
-it is public, it is displayed on the Console dashboard, and holding it grants nothing.
+**Correction (2026-08-12):** the paragraphs below originally concluded from this that
+the SID had to stay a typed form field, because it could not be reliably derived from
+the access token. That conclusion was wrong. It is corrected here, rather than edited
+away, so the reasoning that led to it stays visible.
 
-The rejected alternative was reading an `AC…`-shaped claim out of the access-token
-JWT, as `twilio-lookup-api-ui/functions/verify.js:18-30` does. That claim is
-undocumented; the reference project's own comment notes that a miss is normal. There
-it degrades a display label, so best-effort is fine. Here a miss would break message
-sending, which is not an acceptable failure mode to build on an undocumented claim.
+The earlier reasoning rejected deriving the SID by pointing at
+`twilio-lookup-api-ui/functions/verify.js:18-30`, which scans the JWT for a bare
+`AC[0-9a-f]{32}`-shaped claim. That scan genuinely finds nothing on this app's
+tokens — but it was never looking in the right place. Decoding a real access token on
+2026-08-12 found the SID present, in Twilio Resource Name form, in two places:
 
-Login therefore takes three fields — **Account SID**, **OAuth Client ID**, **OAuth
-Client Secret** — of which only the last is secret.
+```
+act.sub          = trn:us1:iam:account:AC41b8…533     <- the account
+urn:tw:iam_ctx   = trn:us1:iam:account:AC41b8…533     <- same value
+sub              = trn:us1:iam:oauthapp:OQdd2247…     <- the OAuth app
+```
+
+`act.sub` is the RFC 8693 actor claim — a standard claim, rather than Twilio's private
+`urn:tw:iam_ctx` namespace — so it is the value this app extracts
+(`accountSidFromAuthString` in `assets/twilio-oauth.private.js`; `urn:tw:iam_ctx` is
+read only as a fallback). The SID extracted from it matched the typed Account SID
+exactly on the test account, verified live.
+
+The Account SID is therefore still required *by the API* — `setAccountSid()` still has
+to run after `setCredentialProvider()`, and the three call sites above are unchanged —
+but it is now **derived** from the token inside `authenticate()` (and re-derived, from
+the token it already fetches, inside `verify.js`) rather than typed into a form field.
+A derivation failure is fatal and throws a 502 rather than falling through to an empty
+SID, which would silently build `/Accounts//Messages.json`.
+
+Login therefore takes **two fields** — **OAuth Client ID** and **OAuth Client
+Secret** — both of which the caller must prove by successfully exchanging a token. The
+Account SID is no longer a form field; `/verify` returns the derived value so the UI
+can display which account is in use.
 
 ## Campaign ownership
 
