@@ -16,6 +16,32 @@ let statusRefreshInterval = null;
 // Content templates loaded for the current channel (full objects from the API)
 let loadedTemplates = [];
 
+// The campaign currently rendered in the delivery panel, so Export CSV can use it.
+let displayedCampaign = null;
+
+// The 5s poll rebuilds whole panels with innerHTML, which destroys the scroll
+// container and snaps the user back to the top. Two defences: skip the write
+// entirely when nothing changed, and restore scrollTop when it did.
+const renderSignatures = {};
+
+/** True when this panel's data is unchanged since the last render. */
+function renderUnchanged(key, signature, stillPresent) {
+    if (renderSignatures[key] === signature && stillPresent) return true;
+    renderSignatures[key] = signature;
+    return false;
+}
+
+/** Runs `write`, keeping the scroll position of `selector` inside `container`. */
+function withPreservedScroll(container, selector, write) {
+    const before = container.querySelector(selector);
+    const top = before ? before.scrollTop : 0;
+    write();
+    if (top) {
+        const after = container.querySelector(selector);
+        if (after) after.scrollTop = top;
+    }
+}
+
 // Initialize
 document.addEventListener('DOMContentLoaded', () => {
     initializeApp();
@@ -139,6 +165,12 @@ function setupEventListeners() {
         closeMessageDetailsBtn.addEventListener('click', () => {
             document.getElementById('message-details-section').style.display = 'none';
         });
+    }
+
+    // Export the delivery status table to CSV
+    const exportCsvBtn = document.getElementById('export-csv-btn');
+    if (exportCsvBtn) {
+        exportCsvBtn.addEventListener('click', exportMessageStatusCsv);
     }
 }
 
@@ -1039,6 +1071,18 @@ function displayCampaigns(campaigns) {
         return;
     }
 
+    const signature = JSON.stringify([
+        currentCampaignId,
+        campaigns.map((c) => [
+            c.campaignId, c.campaignName, c.totalMessages, c.sent, c.failed,
+            c.delivered, c.read, c.startIndex, c.isComplete, c.lastUpdated,
+        ]),
+    ]);
+    // Nothing to redraw: leave the DOM alone so the user's scroll survives.
+    if (renderUnchanged('campaigns', signature, Boolean(campaignsContent.querySelector('.campaigns-list')))) {
+        return;
+    }
+
     let html = '<div class="campaigns-list">';
     campaigns.forEach(campaign => {
         const isActive = campaign.campaignId === currentCampaignId;
@@ -1123,7 +1167,9 @@ function displayCampaigns(campaigns) {
         `;
     });
     html += '</div>';
-    campaignsContent.innerHTML = html;
+    withPreservedScroll(campaignsContent, '.campaigns-list', () => {
+        campaignsContent.innerHTML = html;
+    });
 }
 
 async function viewCampaign(campaignId) {
@@ -1167,6 +1213,10 @@ function displayMessageDetails(campaign) {
     const messageDetailsContent = document.getElementById('message-details-content');
     if (!messageDetailsContent) return;
 
+    // Set before any early return: the export must work even on a poll tick
+    // that correctly skips redrawing because nothing changed.
+    displayedCampaign = campaign;
+
     const statuses = campaign.statuses || {};
     const statusEntries = Object.entries(statuses);
 
@@ -1185,6 +1235,15 @@ function displayMessageDetails(campaign) {
         return new Date(dateB) - new Date(dateA);
     });
 
+    const signature = JSON.stringify([
+        campaign.campaignId, campaign.sent, campaign.failed, campaign.delivered,
+        campaign.read, campaign.totalMessages,
+        statusEntries.map(([sid, s]) => [sid, s.status, s.delivered, s.read, s.errorCode, s.dateUpdated]),
+    ]);
+    if (renderUnchanged('details', signature, Boolean(messageDetailsContent.querySelector('.message-status-scroll')))) {
+        return;
+    }
+
     let html = `
         <div style="margin-bottom: 15px; padding: 12px; background: var(--twilio-gray-50); border-radius: 6px;">
             <div style="display: flex; gap: 20px; flex-wrap: wrap;">
@@ -1195,7 +1254,7 @@ function displayMessageDetails(campaign) {
                 <div><strong>Read:</strong> ${campaign.read || 0}</div>
             </div>
         </div>
-        <div style="overflow-x: auto; max-height: 600px; overflow-y: auto;">
+        <div class="message-status-scroll">
             <table class="message-status-table">
                 <thead>
                     <tr>
@@ -1261,7 +1320,78 @@ function displayMessageDetails(campaign) {
         </div>
     `;
 
-    messageDetailsContent.innerHTML = html;
+    withPreservedScroll(messageDetailsContent, '.message-status-scroll', () => {
+        messageDetailsContent.innerHTML = html;
+    });
+}
+
+/** RFC-style CSV: quote fields containing a quote, comma, CR or LF; double quotes. */
+function toCsv(rows) {
+    if (!rows.length) return '';
+    const headers = Array.from(rows.reduce((keys, row) => {
+        Object.keys(row).forEach((k) => keys.add(k));
+        return keys;
+    }, new Set()));
+    const escape = (val) => {
+        const s = val == null ? '' : String(val);
+        return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+    };
+    return [
+        headers.map(escape).join(','),
+        ...rows.map((row) => headers.map((h) => escape(row[h] ?? '')).join(',')),
+    ].join('\r\n');
+}
+
+function downloadCsv(text, filename) {
+    // BOM so Excel reads it as UTF-8 rather than mangling non-ASCII.
+    const blob = new Blob(['﻿' + text], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+}
+
+function exportMessageStatusCsv() {
+    const campaign = displayedCampaign;
+    const statuses = (campaign && campaign.statuses) || {};
+    const entries = Object.entries(statuses);
+
+    if (!entries.length) {
+        alert('No messages to export yet.');
+        return;
+    }
+
+    // Same order as the table: most recently sent first.
+    entries.sort((a, b) => {
+        const dateA = a[1].sentAt || a[1].dateSent || '';
+        const dateB = b[1].sentAt || b[1].dateSent || '';
+        if (!dateA && !dateB) return 0;
+        if (!dateA) return 1;
+        if (!dateB) return -1;
+        return new Date(dateB) - new Date(dateA);
+    });
+
+    const rows = entries.map(([sid, s]) => ({
+        'Message SID': sid,
+        'To': s.to || '',
+        'Status': s.status || '',
+        'Delivered': s.delivered ? 'Yes' : 'No',
+        'Read': s.read ? 'Yes' : 'No',
+        'Error Code': s.errorCode == null ? '' : s.errorCode,
+        'Error Message': s.errorMessage || '',
+        'Sent At': s.sentAt || s.dateSent || '',
+        'Updated At': s.dateUpdated || '',
+        'Webhook Received': s.webhookReceivedAt || '',
+    }));
+
+    const label = (campaign.campaignName || campaign.campaignId || 'campaign')
+        .replace(/[^a-z0-9._-]+/gi, '-')
+        .replace(/^-+|-+$/g, '')
+        .slice(0, 60);
+    const stamp = new Date().toISOString().slice(0, 10);
+    downloadCsv(toCsv(rows), `${label}-messages-${stamp}.csv`);
 }
 
 function startStatusAutoRefresh() {

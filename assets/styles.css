@@ -881,6 +881,12 @@ header h1 {
 }
 
 /* Message Status Table Styles */
+.message-status-scroll {
+    overflow-x: auto;
+    overflow-y: auto;
+    max-height: 600px;
+}
+
 .message-status-table {
     width: 100%;
     border-collapse: collapse;
