@@ -1956,7 +1956,7 @@ comm -23 <(grep -oE 'var\(--[a-z0-9-]+' assets/styles.css | sed 's/var(//' | sor
          <(grep -oE '^\s*--[a-z0-9-]+' assets/styles.css | tr -d ' ' | sed 's/:$//' | sort -u)
 ```
 
-Expected: `app OK`; `3` for `withPreservedScroll` (declaration + two uses); `3` for `renderUnchanged`; `1` in each file for `message-status-scroll`; the inline style gone; `1` in each file for the button; empty variable audit.
+Expected: `app OK`; `3` for `withPreservedScroll` (declaration + two uses); `3` for `renderUnchanged`; `3` in `app.js` for `message-status-scroll` (the markup plus the two `querySelector` calls) and `1` in `styles.css`; the inline style gone; `1` in each file for the button; empty variable audit.
 
 - [ ] **Step 9: Prove the behaviour**
 
