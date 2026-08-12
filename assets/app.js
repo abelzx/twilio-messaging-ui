@@ -304,10 +304,12 @@ function renderSenderOptions(data) {
         opt.value = '';
         opt.disabled = true;
         // Distinguish "none exist" from "some exist but none usable" — the
-        // second is a fixable configuration problem and should say so.
+        // second is a fixable configuration problem and should say so. Now that
+        // Messaging Services are offered on every channel, "none" also means no
+        // services exist on the account.
         opt.textContent = data.totalRegistered
             ? `No usable ${noun}s — ${data.totalRegistered} registered but not online`
-            : `No ${noun}s registered on this account`;
+            : `No ${noun}s or Messaging Services registered on this account`;
         select.appendChild(opt);
         setSenderHelp(opt.textContent, true);
         return;
@@ -318,18 +320,31 @@ function renderSenderOptions(data) {
     placeholder.textContent = `Select ${article} ${noun}…`;
     select.appendChild(placeholder);
 
-    for (const sender of senders) {
-        const opt = document.createElement('option');
-        opt.value = sender.value;
-        opt.textContent = sender.label;
-        select.appendChild(opt);
-    }
+    const direct = senders.filter((s) => s.kind !== 'service');
+    const services = senders.filter((s) => s.kind === 'service');
 
-    const hidden = data.totalRegistered - senders.length;
+    const addGroup = (labelText, items) => {
+        if (!items.length) return;
+        const group = document.createElement('optgroup');
+        group.label = labelText;
+        for (const sender of items) {
+            const opt = document.createElement('option');
+            opt.value = sender.value;
+            opt.textContent = sender.label;
+            group.appendChild(opt);
+        }
+        select.appendChild(group);
+    };
+
+    addGroup(`${noun.replace(/^./, (c) => c.toUpperCase())}s`, direct);
+    addGroup('Messaging Services', services);
+
+    const parts = [];
+    if (data.directCount) parts.push(`${data.directCount} ${noun}${data.directCount === 1 ? '' : 's'}`);
+    if (data.serviceCount) parts.push(`${data.serviceCount} Messaging Service${data.serviceCount === 1 ? '' : 's'}`);
+    const hidden = (data.totalRegistered || 0) - (data.directCount || 0);
     setSenderHelp(
-        hidden > 0
-            ? `${senders.length} ${noun}${senders.length === 1 ? '' : 's'} available · ${hidden} not online`
-            : `${senders.length} ${noun}${senders.length === 1 ? '' : 's'} available`,
+        parts.join(' · ') + (hidden > 0 ? ` · ${hidden} not online` : ''),
         false
     );
 }

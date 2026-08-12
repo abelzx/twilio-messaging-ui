@@ -212,52 +212,35 @@ async function sendMessagesChunk(params) {
           }
         }
 
-        if (channel === 'whatsapp') {
-          // Idempotent: the From value may already carry the prefix, because
-          // the Channel Senders API returns senderId as `whatsapp:+65…`.
-          const wa = (v) => (String(v).startsWith('whatsapp:') ? String(v) : `whatsapp:${v}`);
-          messageParams.from = wa(messageParams.from);
-          messageParams.to = wa(messageParams.to);
-        } else if (channel === 'messenger') {
-          // Two valid shapes, and only one may be used at a time: a Messaging
-          // Service that owns the Page, or a Page ID in From. The sender
-          // dropdown supplies an MG SID, so detect that and drop From.
-          const fromValue = String(messageParams.from || '');
-          const mg = (v) => /^MG[0-9a-f]{32}$/i.test(v);
+        // Resolve the sender BEFORE any channel prefixing. A Messaging Service is
+        // chosen by SID and must travel as messagingServiceSid — never as From, and
+        // never with a channel prefix glued to it. This was inside the messenger
+        // branch until a service became selectable on every channel; left there,
+        // picking one for WhatsApp produced from: "whatsapp:MG7f6b…".
+        const MESSAGING_SERVICE_SID = /^MG[0-9a-f]{32}$/i;
+        const usingService = MESSAGING_SERVICE_SID.test(String(messageParams.from || ''));
+        if (usingService) {
+          messageParams.messagingServiceSid = String(messageParams.from);
+          delete messageParams.from;
+        }
 
-          if (mg(fromValue)) {
-            messageParams.messagingServiceSid = fromValue;
-            delete messageParams.from;
-          } else {
+        // The recipient always takes the channel prefix. From only takes it when a
+        // concrete sender was chosen — a service SID must stay bare.
+        if (channel === 'whatsapp') {
+          const wa = (v) => (String(v).startsWith('whatsapp:') ? String(v) : `whatsapp:${v}`);
+          messageParams.to = wa(messageParams.to);
+          if (messageParams.from) messageParams.from = wa(messageParams.from);
+        } else if (channel === 'messenger') {
+          const ms = (v) => (String(v).startsWith('messenger:') ? String(v) : `messenger:${v}`);
+          messageParams.to = ms(messageParams.to);
+          if (messageParams.from) messageParams.from = ms(messageParams.from);
+          if (!usingService) {
             const svc = message.messagingServiceSid || context.MESSAGING_SERVICE_SID;
             if (svc) messageParams.messagingServiceSid = svc;
-            // Idempotent, like the whatsapp prefix: a caller may already have
-            // supplied `messenger:<id>`.
-            const ms = (v) => (String(v).startsWith('messenger:') ? String(v) : `messenger:${v}`);
-            if (fromValue) messageParams.from = ms(fromValue);
-            messageParams.to = ms(messageParams.to);
           }
-        } else if (channel === 'mms') {
-          // MMS uses the same API as SMS but can include media
-          // Media URLs can be added via message.mediaUrl if provided
+        } else if (channel === 'mms' || channel === 'rcs') {
           if (message.mediaUrl) {
             messageParams.mediaUrl = Array.isArray(message.mediaUrl) ? message.mediaUrl : [message.mediaUrl];
-          }
-        } else if (channel === 'rcs') {
-          // RCS uses the same API as SMS/MMS
-          // RCS-specific features can be added here if needed
-          if (message.mediaUrl) {
-            messageParams.mediaUrl = Array.isArray(message.mediaUrl) ? message.mediaUrl : [message.mediaUrl];
-          }
-          // RCS can also use content templates
-          if (message.contentSid) {
-            messageParams.contentSid = message.contentSid;
-            if (message.contentVariables) {
-              messageParams.contentVariables =
-                typeof message.contentVariables === 'string'
-                  ? message.contentVariables
-                  : JSON.stringify(message.contentVariables);
-            }
           }
         }
 
