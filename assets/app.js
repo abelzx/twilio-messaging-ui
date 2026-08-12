@@ -1021,9 +1021,6 @@ function displayCampaigns(campaigns) {
         // progress bar above deliberately keeps dividing by totalMessages, or a
         // finished campaign with a resend would read 60% instead of 100%.
         const messageCount = Math.max(campaign.totalMessages || 0, campaign.sent || 0);
-        const duplicateNote = (campaign.sent || 0) > campaign.totalMessages
-            ? `<p class="campaign-warning">${campaign.sent} messages for ${campaign.totalMessages} recipients — this campaign was sent more than once.</p>`
-            : '';
         
         const createdDate = campaign.createdAt 
             ? new Date(campaign.createdAt).toLocaleString() 
@@ -1076,7 +1073,6 @@ function displayCampaigns(campaigns) {
                         <span class="stat-value">${campaign.read}</span>
                     </div>
                 </div>
-                ${duplicateNote}
                 <div class="campaign-progress">
                     <div class="progress-bar" style="width: 100%; height: 6px; background: #e0e0e0; border-radius: 3px; margin-top: 10px;">
                         <div class="progress-fill" style="width: ${progress}%; height: 100%; background: #4caf50; border-radius: 3px;"></div>
