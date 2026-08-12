@@ -1151,10 +1151,6 @@ function displayMessageDetails(campaign) {
     let html = `
         <div style="margin-bottom: 15px; padding: 12px; background: var(--twilio-gray-50); border-radius: 6px;">
             <div style="display: flex; gap: 20px; flex-wrap: wrap;">
-                <!-- "Recipients", not "Total Messages": this sits above a table of
-                     message records, and a resent chunk means more records than
-                     recipients. Labelling 3 as "Total Messages" above 5 rows made
-                     the panel contradict itself. `Sent` accounts for the rows. -->
                 <div><strong>Recipients:</strong> ${campaign.totalMessages || 0}</div>
                 <div><strong>Sent:</strong> <span style="color: var(--twilio-success);">${campaign.sent || 0}</span></div>
                 <div><strong>Failed:</strong> <span style="color: var(--twilio-error);">${campaign.failed || 0}</span></div>
