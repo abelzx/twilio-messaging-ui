@@ -228,6 +228,40 @@ body {
     line-height: 1.5;
 }
 
+/* Client ID / Client Secret fields, matched to twilio-lookup-api-ui's `.field`
+   and `.form-grid`. Scoped to #login-form so the app's other `.form-group`
+   rules keep their 14px / 4px-radius treatment. */
+#login-form .form-group {
+    margin-bottom: 0.75rem;
+}
+
+/* The submit button is inline-flex, so its 20px margin-top does not collapse
+   with a margin-bottom here — zero this one out to land on the 20px gap. */
+#login-form .form-group:last-of-type {
+    margin-bottom: 0;
+}
+
+#login-form .form-group label {
+    font-size: 0.72rem;
+    color: var(--text-secondary);
+    font-weight: 500;
+    margin-bottom: 0.3rem;
+}
+
+#login-form .form-group input {
+    padding: 0.5rem 0.6rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    font-size: 0.82rem;
+    color: var(--text);
+    transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+#login-form .form-group input:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-light);
+}
+
 .login-card__submit {
     width: 100%;
     padding: 11px;
