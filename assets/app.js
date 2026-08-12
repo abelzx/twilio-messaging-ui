@@ -1015,8 +1015,14 @@ function displayCampaigns(campaigns) {
         const progress = campaign.totalMessages > 0
             ? Math.min(100, (processed / campaign.totalMessages) * 100).toFixed(1)
             : 0;
+        // Total is the campaign's message count. That normally equals the number of
+        // recipients, but a resent chunk creates more messages than recipients, and
+        // the delivery table lists every one — so show the larger of the two. The
+        // progress bar above deliberately keeps dividing by totalMessages, or a
+        // finished campaign with a resend would read 60% instead of 100%.
+        const messageCount = Math.max(campaign.totalMessages || 0, campaign.sent || 0);
         const duplicateNote = (campaign.sent || 0) > campaign.totalMessages
-            ? `<p class="campaign-warning">${campaign.sent} messages sent for ${campaign.totalMessages} recipients — this campaign was sent more than once.</p>`
+            ? `<p class="campaign-warning">${campaign.sent} messages for ${campaign.totalMessages} recipients — this campaign was sent more than once.</p>`
             : '';
         
         const createdDate = campaign.createdAt 
@@ -1050,8 +1056,8 @@ function displayCampaigns(campaigns) {
                 </div>
                 <div class="campaign-stats">
                     <div class="stat-item">
-                        <span class="stat-label">Recipients:</span>
-                        <span class="stat-value">${campaign.totalMessages}</span>
+                        <span class="stat-label">Total:</span>
+                        <span class="stat-value">${messageCount}</span>
                     </div>
                     <div class="stat-item">
                         <span class="stat-label">Sent:</span>
@@ -1151,7 +1157,7 @@ function displayMessageDetails(campaign) {
     let html = `
         <div style="margin-bottom: 15px; padding: 12px; background: var(--twilio-gray-50); border-radius: 6px;">
             <div style="display: flex; gap: 20px; flex-wrap: wrap;">
-                <div><strong>Recipients:</strong> ${campaign.totalMessages || 0}</div>
+                <div><strong>Total Messages:</strong> ${Math.max(campaign.totalMessages || 0, campaign.sent || 0)}</div>
                 <div><strong>Sent:</strong> <span style="color: var(--twilio-success);">${campaign.sent || 0}</span></div>
                 <div><strong>Failed:</strong> <span style="color: var(--twilio-error);">${campaign.failed || 0}</span></div>
                 <div><strong>Delivered:</strong> <span style="color: var(--twilio-success);">${campaign.delivered || 0}</span></div>
