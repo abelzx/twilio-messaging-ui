@@ -1587,7 +1587,7 @@ Replace the `.login-container` / `.login-header` / `.login-form` markup inside `
                     <p class="login-card__error" id="login-error"></p>
                     <p class="login-card__hint">
                         Create an OAuth app in the Twilio Console under
-                        <strong>Account &rsaquo; API keys &amp; tokens &rsaquo; OAuth apps</strong>,
+                        <strong>Settings &rsaquo; Account settings &rsaquo; OAuth applications</strong>,
                         granting the <strong>Messaging</strong>, <strong>Phone Numbers</strong> and
                         <strong>Content</strong> scopes.
                     </p>

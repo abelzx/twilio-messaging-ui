@@ -2372,7 +2372,7 @@ Replace with:
 ```markdown
 ### 1. Sign In
 
-First, create an account-level OAuth app: **Twilio Console → Account → API keys & tokens → OAuth apps → Create**. Grant it Messaging (read and write), Phone Numbers (read), and Content (read). Copy the **Client ID** and **Client Secret** — the secret is shown only once.
+First, create an account-level OAuth app: **Twilio Console → Settings → Account settings → OAuth applications**. Grant it Messaging (read and write), Phone Numbers (read), and Content (read). Copy the **Client ID** and **Client Secret** — the secret is shown only once.
 
 1. Open the application URL
 2. Enter three values:
