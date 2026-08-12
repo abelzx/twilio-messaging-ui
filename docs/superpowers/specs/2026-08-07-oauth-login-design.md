@@ -72,18 +72,40 @@ produce correct URIs for all three, and the Content API needs no SID at all:
 [content]               https://content.twilio.com/v1/Content
 ```
 
-So the login form keeps an Account SID field. The Auth Token and API Key/Secret
-fields both go away; the Account SID remains as a plain identifier, not a credential —
-it is public, it is displayed on the Console dashboard, and holding it grants nothing.
+**Correction (2026-08-12):** the paragraphs below originally concluded from this that
+the SID had to stay a typed form field, because it could not be reliably derived from
+the access token. That conclusion was wrong. It is corrected here, rather than edited
+away, so the reasoning that led to it stays visible.
 
-The rejected alternative was reading an `AC…`-shaped claim out of the access-token
-JWT, as `twilio-lookup-api-ui/functions/verify.js:18-30` does. That claim is
-undocumented; the reference project's own comment notes that a miss is normal. There
-it degrades a display label, so best-effort is fine. Here a miss would break message
-sending, which is not an acceptable failure mode to build on an undocumented claim.
+The earlier reasoning rejected deriving the SID by pointing at
+`twilio-lookup-api-ui/functions/verify.js:18-30`, which scans the JWT for a bare
+`AC[0-9a-f]{32}`-shaped claim. That scan genuinely finds nothing on this app's
+tokens — but it was never looking in the right place. Decoding a real access token on
+2026-08-12 found the SID present, in Twilio Resource Name form, in two places:
 
-Login therefore takes three fields — **Account SID**, **OAuth Client ID**, **OAuth
-Client Secret** — of which only the last is secret.
+```
+act.sub          = trn:us1:iam:account:AC41b8…533     <- the account
+urn:tw:iam_ctx   = trn:us1:iam:account:AC41b8…533     <- same value
+sub              = trn:us1:iam:oauthapp:OQdd2247…     <- the OAuth app
+```
+
+`act.sub` is the RFC 8693 actor claim — a standard claim, rather than Twilio's private
+`urn:tw:iam_ctx` namespace — so it is the value this app extracts
+(`accountSidFromAuthString` in `assets/twilio-oauth.private.js`; `urn:tw:iam_ctx` is
+read only as a fallback). The SID extracted from it matched the typed Account SID
+exactly on the test account, verified live.
+
+The Account SID is therefore still required *by the API* — `setAccountSid()` still has
+to run after `setCredentialProvider()`, and the three call sites above are unchanged —
+but it is now **derived** from the token inside `authenticate()` (and re-derived, from
+the token it already fetches, inside `verify.js`) rather than typed into a form field.
+A derivation failure is fatal and throws a 502 rather than falling through to an empty
+SID, which would silently build `/Accounts//Messages.json`.
+
+Login therefore takes **two fields** — **OAuth Client ID** and **OAuth Client
+Secret** — both of which the caller must prove by successfully exchanging a token. The
+Account SID is no longer a form field; `/verify` returns the derived value so the UI
+can display which account is in use.
 
 ## Campaign ownership
 
@@ -265,6 +287,19 @@ The four GET → POST conversions are a security requirement, not tidying. A Cli
 Secret in a query string is recorded in request logs and browser history; an opaque
 `sessionId` was not.
 
+What this does and does not guarantee, stated precisely: it guarantees *this
+frontend* never places a secret in a URL. It does **not** make the endpoints refuse
+credentials supplied as query parameters. Twilio Functions merge query parameters and
+body into a single `event` object, and none of these Functions asserts
+`event.request.method === 'POST'` — the `Access-Control-Allow-Methods` header is
+advisory to browsers, not server-side enforcement. A caller who hand-crafts a GET
+with `?clientSecret=…` will still be served, and will have logged their own secret.
+
+That residual case is accepted rather than fixed. It harms only the caller who chooses
+it, the pattern predates this change in all six Functions, and adding a method check to
+each is outside this spec's scope. It is recorded here so the security property is not
+read as stronger than it is.
+
 ### Configuration
 
 `twilio.json` is deleted rather than updated, because nothing reads it. `twilio-run`
@@ -288,9 +323,27 @@ No dependency changes: `twilio@5.10.6` is already installed and already exports
 | Account SID mismatch | Caught at login by the phone-number probe; Twilio error 70051 mapped to "these OAuth credentials do not belong to that Account SID" |
 | Secret rotated mid-campaign | The client loop's non-OK branch calls `showResumeOption()` (`app.js:726`); the campaign pauses and is resumable after re-login |
 | Campaign requested by a non-owner | HTTP 404, so a guessed campaign ID is not confirmed to exist |
-| Missing scope | Twilio error 70051. A Content scope miss fails soft on the existing non-OK branch (`app.js:288-297`): the picker falls back to "None (Use custom message)" and `#content-template-help` shows the error in red, rather than breaking the WhatsApp or RCS channel |
+| Missing scope | Twilio error 70051. A Content scope miss is caught by the per-channel inner `catch` in `get-content-templates.js`, which answers **HTTP 200** with `{success: false, error}`. `app.js:269` gates on `response.ok && data.success !== false`, so that takes the else branch (`app.js:287-298`): the picker falls back to "None (Use custom message)" and `#content-template-help` shows the error in red, rather than breaking the WhatsApp or RCS channel |
 | Token endpoint hangs | 8-second abort inside `/verify`; readable message instead of a platform timeout |
 | Rate limiting | `retryWithExponentialBackoff` is untouched |
+
+### Settled: raw upstream text in error responses
+
+`tokenErrorMessage`'s fallback branch returns `Could not obtain a Twilio access token
+— <raw>`, forwarding the SDK's own error text into the HTTP response body. Every
+migrated Function echoes `error.message` this way. This was raised independently by
+two reviewers, so the decision is recorded here rather than re-litigated per Function.
+
+**It stays.** The raw text originates from Twilio's OAuth endpoint or the SDK, never
+from this deployment, and it carries no credential — `ApiTokenManager.fetchToken()`
+discards the original error and throws a fresh `Error` holding only a status and
+message, so the submitted secret cannot ride along. `tokenErrorMessage` already
+collapses whitespace to a single line. Suppressing the text would make a genuine
+transient outage undiagnosable from the UI, which is a worse failure than an
+occasionally ugly message.
+
+Bad credentials — the common case — never reach this branch; they are matched by
+`/\b401\b|invalid credentials|invalid_client/i` and get a clean message instead.
 
 ## Security properties
 
@@ -315,17 +368,23 @@ plainly:
   30–50 requests rather than once. All over HTTPS, but it is more transit surface
   than the reference project has.
 
-## Known risk: Content API scope
+## Resolved: the Content API *is* reachable with an OAuth app
 
-Twilio documents scope categories for account-level OAuth apps including Messaging and
-Phone Numbers. No documentation was found confirming whether the Content API
-(`content.v1.contentAndApprovals.list`, `get-content-templates.js:68`) is reachable
-with an OAuth app at all.
+This was an open risk at design time. No documentation could be found confirming
+whether the Content API (`content.v1.contentAndApprovals.list`,
+`get-content-templates.js:68`) was reachable with an account-level OAuth app, so the
+content path was built to fail soft rather than guess.
 
-This is unresolved by design and handled defensively rather than guessed at: the
-content path fails soft with a visible warning, so if the scope does not exist the
-WhatsApp and RCS channels still send with a literal body, losing only the template
-picker. Live verification will settle it.
+**Settled by live verification on 2026-08-07.** Against a real OAuth app, `POST
+/get-content-templates` returned `success: true` with the full template list for both
+`whatsapp` and `rcs` — including templates with variables and `approved` status. The
+Content API needs no Account SID in its path (`https://content.twilio.com/v1/Content`),
+and the OAuth token was accepted.
+
+The fail-soft handling is kept anyway. It is not dead weight: it still covers an OAuth
+app that was created *without* Content scope granted, which is a configuration the
+deployer controls and can easily get wrong. What is no longer in doubt is that granting
+the scope works.
 
 ## Verification
 
@@ -349,6 +408,42 @@ added.
 Required from the deployer: the OAuth app's Client ID and Secret, and the list of
 scopes granted. Minimum for full function is Messaging read and write, Phone Numbers
 read, and whatever scope governs Content read.
+
+## Known limitation: duplicate sends on a lost Sync write
+
+Not introduced by this change, not fixed by it, and recorded because a code review
+surfaced it and the next reader deserves to know.
+
+`send-messages.js` and `resume-execution.js` both fetch the campaign document, send a
+chunk with `Promise.all`, then write `startIndex` back. There is no optimistic
+concurrency check — no `If-Match` on the document revision — between the read and the
+write. Two consequences, both reachable:
+
+- **Concurrent invocations.** Two tabs, or a double-clicked Resume button, both read the
+  same `startIndex`, compute the same chunk, and send to the same recipients. Real
+  duplicate messages; the losing write's statistics are silently discarded.
+- **A write that fails after the sends succeed.** If `Promise.all` resolves but the
+  follow-up `documents().update()` throws (rate limit, transient error), the request
+  500s with `startIndex` unadvanced. The browser retries, re-reads the stale
+  `startIndex`, and sends the same chunk again. No process kill is required — an
+  ordinary Sync API error is enough.
+
+It is left alone deliberately. The flaw is symmetric across both Functions, so fixing
+only the one under review would create exactly the silent divergence between the two
+copies that is the real cost of keeping them separate. A correct fix means a revision
+check in both, plus verifying Twilio Sync's `If-Match` semantics, which is its own piece
+of work rather than a footnote to an auth migration.
+
+Bounding the token exchange (§ Components) reduces the *odds* of the second case by
+keeping the invocation inside its budget. It does not close either case.
+
+**How to detect it in the field.** The `sent` / `failed` / `delivered` counters are
+incremented cumulatively rather than derived from the messages array, so a chunk sent
+twice inflates `sent` past `totalMessages` and drives `pending` **negative**. A campaign
+reporting `pending < 0` has double-sent, which is otherwise invisible. Observed
+deliberately during verification on 2026-08-12 by rewinding `startIndex` without
+rewinding `sent`: the response returned `{sent: 5, pending: -2}` for a 3-message
+campaign. Worth checking before concluding a campaign completed cleanly.
 
 ## Out of scope
 

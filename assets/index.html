@@ -5,54 +5,49 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Twilio Messaging UI</title>
     <link rel="icon" href="https://console.twilio.com/favicon.ico" type="image/x-icon">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
     <div id="app">
         <!-- Login Screen -->
         <div id="login-screen" class="screen active">
-            <div class="login-container">
-                <div class="login-header">
-                    <h1>Twilio Messaging</h1>
-                    <p>Send messages across SMS, WhatsApp, and Messenger</p>
-                </div>
-                <div class="login-form">
-                    <h2>Sign In</h2>
-                    <div class="auth-method-tabs">
-                        <button class="tab-btn active" data-method="account">Account Credentials</button>
-                        <button class="tab-btn" data-method="api">API Key</button>
+            <div class="login-view">
+                <div class="login-card">
+                    <div class="login-card__logo">
+                        <img src="twilio_logo.png" alt="Twilio" width="36" height="36">
+                        <span>Twilio</span>
                     </div>
-                    
+                    <h1 class="login-card__title">Messaging — Bulk Sender</h1>
+                    <p class="login-card__subtitle">
+                        Sign in with a Twilio OAuth app. Your credentials are stored only in this browser.
+                    </p>
+
                     <form id="login-form">
-                        <div id="account-auth" class="auth-section">
-                            <div class="form-group">
-                                <label for="account-sid">Account SID</label>
-                                <input type="text" id="account-sid" required placeholder="ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx">
-                            </div>
-                            <div class="form-group">
-                                <label for="auth-token">Auth Token</label>
-                                <input type="password" id="auth-token" required placeholder="Your Auth Token">
-                            </div>
+                        <div class="form-group">
+                            <label for="client-id">Client ID</label>
+                            <input type="text" id="client-id" required spellcheck="false"
+                                   autocomplete="username"
+                                   placeholder="Your OAuth app's Client ID">
                         </div>
-                        
-                        <div id="api-auth" class="auth-section" style="display: none;">
-                            <div class="form-group">
-                                <label for="api-account-sid">Account SID</label>
-                                <input type="text" id="api-account-sid" placeholder="ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx">
-                            </div>
-                            <div class="form-group">
-                                <label for="api-key">API Key SID</label>
-                                <input type="text" id="api-key" placeholder="SKxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx">
-                            </div>
-                            <div class="form-group">
-                                <label for="api-secret">API Secret</label>
-                                <input type="password" id="api-secret" placeholder="Your API Secret">
-                            </div>
+                        <div class="form-group">
+                            <label for="client-secret">Client Secret</label>
+                            <input type="password" id="client-secret" required spellcheck="false"
+                                   autocomplete="current-password"
+                                   placeholder="••••••••••••••••••••••••••••••••">
                         </div>
-                        
-                        <button type="submit" class="btn btn-primary">Sign In</button>
+                        <button type="submit" id="login-btn" class="btn btn-primary login-card__submit">Sign in</button>
                     </form>
-                    <div id="login-error" class="error-message"></div>
+
+                    <p class="login-card__error" id="login-error"></p>
+                    <p class="login-card__hint">
+                        Create an OAuth app in the Twilio Console under
+                        <strong>Account &rsaquo; API keys &amp; tokens &rsaquo; OAuth apps</strong>,
+                        granting the <strong>Messaging</strong>, <strong>Phone Numbers</strong> and
+                        <strong>Content</strong> scopes.
+                    </p>
                 </div>
             </div>
         </div>
@@ -60,13 +55,16 @@
         <!-- Main App Screen -->
         <div id="app-screen" class="screen">
             <!-- Top Navigation -->
-            <nav class="top-nav">
-                <div class="nav-content">
-                    <div class="logo">Twilio Messaging</div>
-                    <div class="nav-actions">
-                        <button id="logout-btn" class="btn btn-secondary">Sign Out</button>
-                    </div>
+            <nav class="topbar">
+                <div class="topbar__logo">
+                    <img src="twilio_logo.png" alt="Twilio" width="30" height="30">
+                    <span>Twilio</span>
                 </div>
+                <div class="topbar__sep"></div>
+                <span class="topbar__title">Messaging — Bulk Sender</span>
+                <div class="topbar__spacer"></div>
+                <span class="topbar__account" id="account-indicator"></span>
+                <button type="button" class="topbar__signout" id="logout-btn">Sign out</button>
             </nav>
 
             <div class="container">
@@ -111,14 +109,14 @@
                                             <input type="text" id="from-number" 
                                                    placeholder="Or type Sender ID / Phone Number">
                                         </div>
-                                        <small>Select an SMS-enabled number or type a Sender ID</small>
+                                        <small id="from-number-help" class="field-help">Select a sender for the chosen channel</small>
                                     </div>
 
                                     <div class="form-group" id="content-template-group">
                                         <label for="content-template">Content Template</label>
                                         <div class="template-filter-row" id="template-filter-row" style="display: none;">
                                             <label for="template-status-filter" class="filter-label">Filter by status:</label>
-                                            <select id="template-status-filter" class="status-filter">
+                                            <select id="template-status-filter" class="filter-select">
                                                 <option value="all">All</option>
                                             </select>
                                         </div>
@@ -171,7 +169,10 @@
                             <div id="message-details-section" class="card" style="display: none; margin-top: 20px;">
                                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
                                     <h2>Message Delivery Status</h2>
-                                    <button id="close-message-details-btn" class="btn btn-secondary" style="padding: 5px 15px; font-size: 14px;">Close</button>
+                                    <div style="display: flex; gap: 8px; align-items: center;">
+                                        <button id="export-csv-btn" class="btn btn-secondary" style="padding: 5px 15px; font-size: 14px;">Export CSV</button>
+                                        <button id="close-message-details-btn" class="btn btn-secondary" style="padding: 5px 15px; font-size: 14px;">Close</button>
+                                    </div>
                                 </div>
                                 <div id="message-details-content">
                                     <p style="color: #666; text-align: center; padding: 20px;">Loading message details...</p>

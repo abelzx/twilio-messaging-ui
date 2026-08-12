@@ -22,6 +22,8 @@
 
 **Do not run `twilio serverless:deploy` until Task 12.** A half-migrated deployment has functions expecting credentials in the body and a frontend still sending `sessionId`.
 
+Expect a specific broken window between Tasks 6 and 8: `check-status` starts requiring `ownerKey` in Task 6, but nothing *writes* `ownerKey` until Task 7 (`send-messages`) and Task 8 (`resume-execution`). In between, `check-status` correctly 404s even for a campaign's rightful owner, because no document carries the field yet. That is the task ordering working as intended, not a regression — and another reason not to deploy mid-sequence.
+
 ## File Structure
 
 | File | Action | Responsibility after this change |
@@ -145,16 +147,62 @@ function createOAuthClient(creds) {
   return { client, authStrategy };
 }
 
+/** Default ceiling on a token exchange. See `authenticate`. */
+const TOKEN_DEADLINE_MS = 4000;
+
+/**
+ * Rejects if `promise` outlives `ms`, with an Error named `DeadlineError`.
+ *
+ * `clearTimeout` runs in `.finally()` so a fast success does not leave a dangling
+ * timer holding the Function invocation open for the full duration.
+ */
+function withDeadline(promise, ms, message) {
+  let timer;
+  const deadline = new Promise((_, reject) => {
+    timer = setTimeout(
+      () => reject(Object.assign(new Error(message), { name: 'DeadlineError' })),
+      ms
+    );
+  });
+  return Promise.race([promise, deadline]).finally(() => clearTimeout(timer));
+}
+
 /**
  * Builds a client and proves the credentials work before returning it, so bad
  * credentials cost one clear failure instead of the same error repeated once per
  * message in a chunk. Throws a 401-flagged Error with a readable message.
+ *
+ * The token exchange is deadline-bounded, and that is load-bearing rather than
+ * defensive. `createOAuthClient` builds a fresh provider with an empty token
+ * cache, so this is a real network round trip on every call, and the SDK's
+ * `RequestClient` applies no deadline of its own — it defaults to 30s and retries
+ * a 429 up to three times. Left unbounded inside a 10s Function budget, a slow
+ * token endpoint strands the whole invocation: the platform kills it and the
+ * caller gets no response at all rather than a readable error.
+ *
+ * That matters most in `send-messages.js` and `resume-execution.js`, which call
+ * this once per 100-message chunk — roughly 50 times for a 5,000-message
+ * campaign, each one a fresh chance to lose an invocation. Worse, a kill
+ * mid-chunk can leave messages sent but not yet recorded in Sync, so the
+ * browser's retry re-sends them and a recipient gets the message twice.
+ *
+ * Bounding it here rather than in each Function is deliberate: all six callers
+ * inherit the protection, including any added later.
  */
-async function authenticate(creds) {
+async function authenticate(creds, timeoutMs = TOKEN_DEADLINE_MS) {
   const { client, authStrategy } = createOAuthClient(creds);
   try {
-    await authStrategy.getAuthString();
+    await withDeadline(
+      authStrategy.getAuthString(),
+      timeoutMs,
+      "Twilio's token endpoint did not respond in time. Try again."
+    );
   } catch (err) {
+    // A deadline is not a credential problem, so it must not be reported as a
+    // 401 — that would tell the user to check a Client Secret that is fine.
+    if (err.name === 'DeadlineError') {
+      throw httpError(504, err.message);
+    }
     throw httpError(401, tokenErrorMessage(err));
   }
   return client;
@@ -210,12 +258,16 @@ async function getOrCreateSyncService(client) {
 // module-interface sketch listed `tokenErrorMessage`, but no Function calls either
 // one: callers read `error.statusCode` off the thrown Error (see Task 3 onward) and
 // never need to construct one. Exporting them would advertise surface nobody uses.
+//
+// `withDeadline` IS exported, because verify.js needs it for its phone-number probe
+// — a second unbounded SDK call that `authenticate` does not cover.
 module.exports = {
   credsFrom,
   createOAuthClient,
   authenticate,
   ownerKeyFor,
   getOrCreateSyncService,
+  withDeadline,
 };
 ```
 
@@ -315,8 +367,19 @@ const oauth = require(Runtime.getAssets()['/twilio-oauth.js'].path);
 
 const TOKEN_URL = 'https://oauth.twilio.com/v2/token';
 
-/** Leaves headroom inside the 10s Function timeout for a readable error. */
-const TOKEN_TIMEOUT_MS = 8000;
+// This handler makes TWO token exchanges, not one: the raw fetch below, and a
+// second one inside the SDK when `createOAuthClient` builds a fresh provider for
+// step 2. The raw fetch is still worth its cost — it is the only way to get a
+// precise HTTP status to map to a message — but it means the 10s Function budget
+// has to cover two round trips, so each step gets roughly half and its own
+// deadline. Neither step may be left unbounded.
+const TOKEN_TIMEOUT_MS = 4000;
+const PROBE_TIMEOUT_MS = 4000;
+
+// `withDeadline` comes from the shared helper rather than being redefined here.
+// The SDK client has no request deadline of its own (30s default, plus up to three
+// retries on a 429), so without it the platform can kill the invocation mid-probe
+// and the user sees an opaque timeout instead of the message below.
 
 function describeTokenError(status, rawBody) {
   let parsed;
@@ -335,9 +398,22 @@ function describeTokenError(status, rawBody) {
   return detail || `Token request failed (HTTP ${status}).`;
 }
 
-/** The credentials are known good by this point, so the fault is the SID or a scope. */
+/**
+ * Maps a step-2 failure to a message. Step 1 proved the credentials, but that
+ * does NOT make every failure here the SID's fault: the client built in step 2
+ * runs its own token exchange, so a transient token failure can surface at this
+ * step too. Those arrive as a plain Error carrying neither `status` nor `code`,
+ * and must not be blamed on the Account SID.
+ */
 function describeAccountError(err) {
   const code = err.code ?? err.status;
+
+  if (err.name === 'DeadlineError') {
+    return err.message;
+  }
+  if (code === undefined && /access token/i.test(err.message || '')) {
+    return 'Could not obtain a Twilio access token while checking the Account SID. This is usually transient — try again.';
+  }
   if (code === 70051 || err.status === 403) {
     return 'Those OAuth credentials are valid, but they do not grant access to that Account SID. Check the Account SID, and that the OAuth app has the Phone Numbers read scope. (Twilio error 70051)';
   }
@@ -409,7 +485,11 @@ exports.handler = async function (context, event, callback) {
   //    confusingly on first send.
   try {
     const { client } = oauth.createOAuthClient(creds);
-    await client.incomingPhoneNumbers.list({ limit: 1 });
+    await oauth.withDeadline(
+      client.incomingPhoneNumbers.list({ limit: 1 }),
+      PROBE_TIMEOUT_MS,
+      'Timed out reading phone numbers for that Account SID. Try again.'
+    );
   } catch (err) {
     console.error('Verify account probe failed:', err);
     response.setBody({ valid: false, error: describeAccountError(err) });
@@ -417,7 +497,12 @@ exports.handler = async function (context, event, callback) {
   }
 
   response.setStatusCode(200);
-  response.setBody({ valid: true, accountSid: creds.accountSid });
+  // Just `valid` — deliberately not echoing accountSid back. The caller typed it,
+  // so returning it tells them nothing, and nothing in app.js reads it. (The
+  // sibling project returns accountSid because it *derives* it from the access
+  // token's JWT payload, which this app does not do; see spec § The Account SID
+  // is still required.)
+  response.setBody({ valid: true });
   return callback(null, response);
 };
 ```
@@ -650,9 +735,16 @@ clean: OK
 
 - [ ] **Step 4: Confirm the missing-scope path stays soft**
 
-If the OAuth app lacks Content read scope, `oauth.authenticate()` still *succeeds* — a token fetch does not depend on scopes. The failure surfaces from `contentAndApprovals.list` and lands in the pre-existing `catch` at the bottom of the handler, which answers HTTP 500 with `{ error: 'Failed to fetch content templates', message }`.
+If the OAuth app lacks Content read scope, `oauth.authenticate()` still *succeeds* — a token fetch does not depend on scopes. The failure surfaces from `contentAndApprovals.list`.
 
-`assets/app.js` handles that in its non-OK branch (around line 288): the template dropdown falls back to `"None (Use custom message)"`, a disabled option shows the error text, and `#content-template-help` turns red. The channel stays usable with a literal message body. That is the fail-soft behaviour the spec requires — **do not add error handling here**. It already works, and it works because this branch exists.
+Trace it precisely, because there are two catches and the outer one is **not** the one that fires:
+
+- Each channel branch has its own **inner** `catch` (lines ~80-84 for WhatsApp, ~132-136 for RCS). These answer **HTTP 200** with `{ success: false, templates: [], error: 'Failed to fetch WhatsApp templates: …' }`.
+- The outer `catch` at the bottom answers HTTP 500, but only for a failure the inner catches do not cover — a bug in the mapping code, say.
+
+So a scope gap produces a **200, not a 500**. `assets/app.js:269` gates on `response.ok && data.success !== false`, and `success: false` fails that test, so it takes the **else** branch (lines ~287-298): the dropdown falls back to `"None (Use custom message)"`, a disabled option shows the error text, and `#content-template-help` turns red. The channel stays usable with a literal message body.
+
+That is the fail-soft behaviour the spec requires — **do not add error handling here, and do not "fix" the inner catches to return 500**. It already works, and it works because these branches exist. Note that a `curl` against this endpoint with a scope gap returns 200; do not read that as success.
 
 Read that branch before Task 10 so you do not accidentally simplify it away when converting the fetch to a POST.
 
@@ -727,7 +819,10 @@ exports.handler = async function(context, event, callback) {
 
       // Campaigns are owned by the OAuth app that created them. Documents
       // written before this migration carry no ownerKey and are never listed.
-      if (campaignData.ownerKey !== ownerKey) {
+      // `!campaignData` guard so one malformed document skips itself rather than
+      // throwing and turning the caller's whole campaign list into a 500. Same
+      // shape as the checks in check-status.js and resume-execution.js.
+      if (!campaignData || campaignData.ownerKey !== ownerKey) {
         continue;
       }
 
@@ -905,11 +1000,11 @@ grep -c "404" functions/check-status.js
 grep -n "sessionId\|credentials_\|function getOrCreateSyncService" functions/check-status.js || echo "clean: OK"
 ```
 
-Expected — `syntax OK`, at least `3` occurrences of `404` (the two guards plus the `setStatusCode(404)`), and a clean grep:
+Expected — `syntax OK`, `4` lines mentioning `404`, and a clean grep. `grep -c` counts *lines*: the `error.status !== 404 && error.code !== 20404` guard, the `setStatusCode(404)`, and the two explanatory comments that also happen to contain "404":
 
 ```
 syntax OK
-3
+4
 clean: OK
 ```
 
@@ -1013,7 +1108,9 @@ Replace everything from `    // Get or create campaign document in Sync` through
       // it. 404 rather than 403, so a guessed campaign ID is not confirmed to
       // exist. Documents predating this migration have no ownerKey and so fail
       // this check, consistent with their absence from the campaign list.
-      if (campaignDoc.data.ownerKey !== ownerKey) {
+      // Same `!data` guard as list-campaigns.js and check-status.js — a document
+      // with no data must fail the ownership check, not throw.
+      if (!campaignDoc.data || campaignDoc.data.ownerKey !== ownerKey) {
         response.setStatusCode(404);
         response.setBody({ error: 'Campaign not found' });
         return callback(null, response);
@@ -1246,7 +1343,13 @@ exports.handler = async function(context, event, callback) {
       messages,
       channel,
       from,
-      resumeFrom: campaignData.startIndex || 0
+      resumeFrom: campaignData.startIndex || 0,
+      // Pass the handler's own start time down. Measuring from inside
+      // sendMessagesChunk would exclude the token exchange and the ownership
+      // fetch above it, so the 9s ceiling would no longer bound total elapsed
+      // time — the exact accounting send-messages.js gets right by capturing
+      // startTime at the top of its handler.
+      startTime
     });
 
     response.setStatusCode(200);
@@ -1274,10 +1377,10 @@ async function sendMessagesChunk(params) {
     messages,
     channel,
     from,
-    resumeFrom
+    resumeFrom,
+    startTime
   } = params;
 
-  const startTime = Date.now();
   const MAX_EXECUTION_TIME = 9000;
   const CHUNK_SIZE = 100; // Process 100 messages at a time for full-speed sending
 
@@ -1313,6 +1416,18 @@ async function sendMessagesChunk(params) {
         // Add content template if provided (for WhatsApp/RCS)
         if (message.contentSid) {
           messageParams.contentSid = message.contentSid;
+
+          // contentVariables MUST travel with contentSid. send-messages.js does
+          // this (lines 207-210); the pre-migration version of this file did not,
+          // so a resumed chunk of a personalised template campaign sent the
+          // template with its placeholders unfilled. app.js puts the variables on
+          // every message object, so the data was there — it was simply dropped.
+          if (message.contentVariables) {
+            messageParams.contentVariables =
+              typeof message.contentVariables === 'string'
+                ? message.contentVariables
+                : JSON.stringify(message.contentVariables);
+          }
         }
 
         if (channel === 'whatsapp') {
@@ -1335,6 +1450,12 @@ async function sendMessagesChunk(params) {
           // RCS can also use content templates
           if (message.contentSid) {
             messageParams.contentSid = message.contentSid;
+            if (message.contentVariables) {
+              messageParams.contentVariables =
+                typeof message.contentVariables === 'string'
+                  ? message.contentVariables
+                  : JSON.stringify(message.contentVariables);
+            }
           }
         }
 
@@ -1448,9 +1569,19 @@ clean: OK
 
 ```bash
 cat > ./probe-tmp.js <<'EOF'
+const path = require('path');
+
 // Stub the two globals Twilio Functions inject before requiring a Function.
+// The asset path MUST be absolute. `require()` resolves a relative path against
+// the *requiring module's* directory, so a './assets/...' path here would be
+// looked up as `functions/assets/...` from inside the Function and throw
+// MODULE_NOT_FOUND. The real Twilio Runtime hands over an absolute path too.
 global.Runtime = {
-  getAssets: () => ({ '/twilio-oauth.js': { path: './assets/twilio-oauth.private.js' } }),
+  getAssets: () => ({
+    '/twilio-oauth.js': {
+      path: path.resolve(__dirname, 'assets/twilio-oauth.private.js'),
+    },
+  }),
 };
 global.Twilio = { Response: class {} };
 
@@ -1734,16 +1865,30 @@ async function handleLogin(e) {
             body: JSON.stringify(candidate)
         });
 
-        const data = await response.json();
+        // /verify answers HTTP 200 with valid:false for a credential rejection, so
+        // "rejected" is told apart from "transport failed" by `valid`, not by status.
+        //
+        // Parse defensively though: a platform-level failure returns an HTML error
+        // page, and calling .json() on that throws a SyntaxError whose message
+        // ("Unexpected token '<'…") is useless on a login screen. Substitute
+        // something a user can act on.
+        let data;
+        try {
+            data = await response.json();
+        } catch {
+            throw new Error(
+                `Sign-in failed unexpectedly (HTTP ${response.status}). Try again.`
+            );
+        }
 
-        // /verify answers HTTP 200 with valid:false for a credential rejection,
-        // so "rejected" is told apart from "transport failed" by `valid`, not by
-        // status.
         if (!data.valid) {
             throw new Error(data.error || 'Verification failed.');
         }
 
         saveCreds(candidate);
+        // Blank the form now rather than waiting for sign-out, so the Client Secret
+        // does not sit in a DOM input for the life of the tab.
+        document.getElementById('login-form').reset();
         showAppScreen();
     } catch (error) {
         errorDiv.textContent = error.message;
@@ -2071,21 +2216,27 @@ Replace with:
 
 Run:
 
+Match on **API usage**, not on bare words. Edit 3 deliberately adds a comment containing both "sessionStorage" and "localStorage" to explain the choice between them, so a grep for the bare words reports itself and never prints the clean message:
+
 ```bash
 node --check assets/app.js && echo "syntax OK"
-grep -n "sessionId\|localStorage\|switchAuthMethod\|URLSearchParams" assets/app.js || echo "fully migrated: OK"
+grep -n "sessionId\|switchAuthMethod\|URLSearchParams" assets/app.js || echo "fully migrated: OK"
+grep -c "localStorage\." assets/app.js
 grep -c "postToFunction(" assets/app.js
-grep -c "sessionStorage" assets/app.js
+grep -c "sessionStorage\." assets/app.js
 ```
 
-Expected — `9` lines using `postToFunction` (one declaration plus eight call sites) and `4` using `sessionStorage` (`getItem` and `removeItem` in `loadCreds`, `setItem` in `saveCreds`, `removeItem` in `clearCreds`):
+Expected — no `localStorage` API call survives; `9` lines use `postToFunction` (one declaration plus eight call sites); `4` use a `sessionStorage` method (`getItem` and `removeItem` in `loadCreds`, `setItem` in `saveCreds`, `removeItem` in `clearCreds`):
 
 ```
 syntax OK
 fully migrated: OK
+0
 9
 4
 ```
+
+`grep -c` returning `0` also exits non-zero, so `localStorage\.` printing `0` is the pass condition here — not an error.
 
 If `grep` prints any `sessionId` or `URLSearchParams` line, an edit was missed. Every remaining `fetch(` in the file should be inside `postToFunction` or `handleLogin`:
 
@@ -2169,8 +2320,9 @@ Replace with:
 3. **check-status.js**: Retrieves campaign status and updates message statuses from Twilio
 4. **resume-execution.js**: Resumes interrupted campaigns from the last checkpoint
 5. **get-phone-numbers.js** / **get-content-templates.js** / **list-campaigns.js**: Populate the From dropdown, the template picker, and the campaign list
+6. **webhook.js**: Receives delivery-status callbacks from Twilio
 
-Every Function receives `accountSid`, `clientId` and `clientSecret` in its POST body and builds a per-request Twilio client through `assets/twilio-oauth.private.js`. The injected runtime credentials (`context.ACCOUNT_SID` / `context.AUTH_TOKEN`) are used for Twilio Sync only.
+The first five receive `accountSid`, `clientId` and `clientSecret` in their POST body and build a per-request Twilio client through `assets/twilio-oauth.private.js`. `webhook.js` is the exception: Twilio calls it, not the browser, so it carries no user credentials and uses only the injected runtime credentials. Those runtime credentials (`context.ACCOUNT_SID` / `context.AUTH_TOKEN`) are used for Twilio Sync access throughout, never for the user's own account.
 ```
 
 - [ ] **Step 4: Correct the chunk size (lines 31 and 140)**
@@ -2300,8 +2452,14 @@ Replace with:
 ### Sign-In Fails
 
 - *"Invalid OAuth credentials"* — check the Client ID and Client Secret, and that the secret has not been rotated. The secret is shown only once at creation; if it was lost, create a new one.
-- *"These OAuth credentials do not belong to that Account SID"* (Twilio error 70051) — either the Account SID is mistyped, or the OAuth app was created under a different account or subaccount.
-- Sign-in deliberately reads one phone number to prove the credentials match the Account SID. If the app lacks the Phone Numbers read scope, sign-in fails even with a valid Client ID and Secret.
+- *"Those OAuth credentials are valid, but they do not grant access to that Account SID"* (Twilio error 70051) — the credentials work, but not against this account. Either the Account SID is mistyped, or the OAuth app lacks the Phone Numbers read scope.
+- *"Those OAuth credentials do not belong to that Account SID"* — the same underlying mistake reported via a plain HTTP 401 rather than error 70051, usually an OAuth app created under a different account or subaccount.
+- *"That Account SID was not found"* (Twilio error 20404) — check the SID against the Console dashboard.
+- *"Twilio's token endpoint did not respond in time"* — a transient upstream problem, not a credential problem. Try again.
+
+Sign-in deliberately reads one phone number to prove the credentials match the Account SID. That is why a missing Phone Numbers read scope fails sign-in even with a valid Client ID and Secret.
+
+**Quote these strings exactly as `functions/verify.js` emits them.** The earlier draft of this section paired the *401* wording ("do not belong to") with the *70051* label, so a user searching for the text they actually saw on screen would find nothing in the README.
 
 ### Template Picker Is Empty
 
@@ -2330,9 +2488,11 @@ grep -n "Auth Token\|API Key\|auth\.js\|sessionId\|twilio\.json\|1-hour TTL" REA
 
 Expected output — three surviving mentions, all legitimate:
 
-- the `.env` local-development block (lines 61-68), which uses `AUTH_TOKEN` for the *deployment's* runtime credentials, not the user's
-- the Environment Variables section's `AUTH_TOKEN` entry, same reason
-- the Security Considerations sentence that names the Auth Token historically
+- the Environment Variables section's `AUTH_TOKEN` entry, which is the *deployment's* runtime credential for Sync, not the user's
+- the Security Considerations bullet naming the Auth Token historically ("wrote the user's Auth Token into a Sync Document; that store is gone")
+- the `sessionStorage`/XSS bullet's comparison ("the Client Secret sits where the Auth Token used to")
+
+Note the `.env` block at lines 61-68 does **not** match, despite containing `AUTH_TOKEN`: the grep pattern `Auth Token` has a space and this is the underscored env-var name. Do not go hunting for a match there.
 
 Any other match is a missed edit. `auth.js`, `sessionId`, `twilio.json` and `1-hour TTL` must return nothing.
 
@@ -2406,7 +2566,7 @@ Switch the channel to WhatsApp, then to RCS.
 Expected one of two outcomes:
 
 - **Scope present** — the dropdown lists templates and `#content-template-help` reads "Select a content template".
-- **Scope absent** — the dropdown falls back to "None (Use custom message)" with a disabled `Error: Failed to fetch content templates` option, and `#content-template-help` shows that text in red. Typing a literal message body and sending must still work.
+- **Scope absent** — the dropdown falls back to "None (Use custom message)" with a disabled option reading `Error: Failed to fetch WhatsApp templates: …` (or `RCS`), and `#content-template-help` shows that text in red. Typing a literal message body and sending must still work. Note the endpoint answers **HTTP 200** here, not 500 — the per-channel inner `catch` handles it and sets `success: false`. Do not treat a 200 in the Network tab as proof the scope is present; read the response body.
 
 Either is a pass. A failure is a channel that cannot send at all, an unhandled exception in the console, or a silently empty picker with no explanation.
 
@@ -2448,6 +2608,8 @@ Send roughly 250 messages, which exceeds one `CHUNK_SIZE = 100` invocation and f
 Expected: the campaign runs to completion without manual intervention, and the count matches what was submitted.
 
 This step is what proves Task 8's `ReferenceError` fix. `resume-execution.js` returned `hasMore: !isComplete` with `isComplete` never declared, so **every** resume threw before this change. No local check substitutes for this one.
+
+**Use a WhatsApp or RCS content template with at least one variable for this step, not a plain SMS.** The browser's own chunk loop calls `send-messages`, so a plain 250-message SMS run never exercises `resume-execution` at all — click "Resume Campaign" explicitly to force it. Then read the delivered messages: the variables must be **filled on every chunk**, not just the first. Before this change `resume-execution` dropped `contentVariables` entirely, and nothing in this checklist would have caught it, because no other step asserts on message *content*.
 
 If a resume stalls, click "Resume Campaign" and confirm it continues from the checkpoint rather than restarting from message 1.
 

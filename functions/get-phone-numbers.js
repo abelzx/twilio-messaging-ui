@@ -1,12 +1,13 @@
-const twilio = require('twilio');
-
 /**
- * Get SMS-enabled phone numbers from Twilio account
+ * POST /get-phone-numbers — SMS-enabled numbers on the caller's own account.
  */
+
+const oauth = require(Runtime.getAssets()['/twilio-oauth.js'].path);
+
 exports.handler = async function(context, event, callback) {
   const response = new Twilio.Response();
   response.appendHeader('Access-Control-Allow-Origin', '*');
-  response.appendHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  response.appendHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   response.appendHeader('Access-Control-Allow-Headers', 'Content-Type');
   response.appendHeader('Content-Type', 'application/json');
 
@@ -14,96 +15,104 @@ exports.handler = async function(context, event, callback) {
     return callback(null, response);
   }
 
+  let client;
   try {
-    const { sessionId } = event;
+    client = await oauth.authenticate(oauth.credsFrom(event));
+  } catch (error) {
+    response.setStatusCode(error.statusCode || 401);
+    response.setBody({ error: error.message });
+    return callback(null, response);
+  }
 
-    if (!sessionId) {
-      response.setStatusCode(400);
-      response.setBody({ error: 'sessionId is required' });
-      return callback(null, response);
-    }
+  try {
+    const channel = String(event.channel || 'sms').toLowerCase();
 
-    // Get credentials from Sync using runtime credentials
-    const runtimeClient = twilio(context.ACCOUNT_SID, context.AUTH_TOKEN);
-    const syncServiceSid = context.SYNC_SERVICE_SID || await getOrCreateSyncService(runtimeClient);
-    const syncClient = runtimeClient.sync.v1.services(syncServiceSid);
-    
-    const credentialsDoc = await syncClient.documents(`credentials_${sessionId}`).fetch();
-    const credentials = credentialsDoc.data;
+    // A Messaging Service can send on any channel, so it is offered everywhere.
+    // Fetched concurrently with the channel-specific list: this is a second network
+    // call inside a 10s Function budget, and serialising them wastes headroom.
+    const servicesPromise = client.messaging.v1.services.list({ limit: 50 });
 
-    // Initialize Twilio client with user credentials
-    let client;
-    if (credentials.authToken) {
-      client = twilio(credentials.accountSid, credentials.authToken);
-    } else if (credentials.apiKey && credentials.apiSecret) {
-      client = twilio(credentials.apiKey, credentials.apiSecret, { 
-        accountSid: credentials.accountSid 
-      });
+    let directPromise;
+    if (channel === 'whatsapp' || channel === 'rcs') {
+      // `channel` is required by this endpoint; omitting it throws.
+      directPromise = client.messaging.v2.channelsSenders
+        .list({ channel, limit: 100 })
+        .then((registered) => ({
+          total: registered.length,
+          senders: registered
+            .filter((s) => String(s.status || '').toUpperCase() === 'ONLINE')
+            .map((s) => ({
+              // senderId already carries the channel prefix (whatsapp:+65…), which
+              // is exactly what `from` needs. Do not strip it — the send path's
+              // prefixing is idempotent.
+              value: s.senderId,
+              label: s.profile && s.profile.name
+                ? `${s.senderId.replace(/^[a-z]+:/, '')} · ${s.profile.name}`
+                : s.senderId.replace(/^[a-z]+:/, ''),
+              status: s.status,
+              kind: 'direct',
+            })),
+        }));
+    } else if (channel === 'messenger') {
+      // Facebook Pages are not exposed by any list API, so a Messaging Service that
+      // owns the Page is the only selectable sender here.
+      directPromise = Promise.resolve({ total: 0, senders: [] });
     } else {
-      throw new Error('Invalid credentials');
+      const needsMms = channel === 'mms';
+      // MMS carries media, and a number that can send SMS cannot necessarily
+      // send MMS — on the test account 5 of 13 sms-capable numbers are not
+      // mms-capable. Filtering both on `sms` offers senders that will fail.
+      directPromise = client.incomingPhoneNumbers.list({ limit: 100 }).then((numbers) => {
+        const capable = numbers.filter((n) => {
+          const c = n.capabilities || {};
+          const flag = needsMms ? c.mms : c.sms;
+          return flag === true || flag === 'true';
+        });
+        return {
+          total: capable.length,
+          senders: capable.map((n) => ({
+            value: n.phoneNumber,
+            label: n.friendlyName && n.friendlyName !== n.phoneNumber
+              ? `${n.phoneNumber} · ${n.friendlyName}`
+              : n.phoneNumber,
+            status: 'ONLINE',
+            kind: 'direct',
+          })),
+        };
+      });
     }
 
-    // Fetch all phone numbers
-    const phoneNumbers = await client.incomingPhoneNumbers.list({ limit: 100 });
-    
-    // Filter for SMS-capable numbers and format them
-    const smsNumbers = phoneNumbers
-      .filter(number => {
-        // Check if number has SMS capability
-        const capabilities = number.capabilities || {};
-        return capabilities.sms === true || capabilities.sms === 'true';
-      })
-      .map(number => ({
-        phoneNumber: number.phoneNumber,
-        friendlyName: number.friendlyName || number.phoneNumber,
-        sid: number.sid,
-        capabilities: number.capabilities
-      }));
+    const [direct, services] = await Promise.all([directPromise, servicesPromise]);
+
+    const serviceSenders = services.map((s) => ({
+      value: s.sid,
+      label: `${s.friendlyName} · ${s.sid.slice(0, 10)}…`,
+      status: 'ONLINE',
+      kind: 'service',
+    }));
 
     response.setStatusCode(200);
     response.setBody({
       success: true,
-      phoneNumbers: smsNumbers
+      channel,
+      senders: [...direct.senders, ...serviceSenders],
+      directCount: direct.senders.length,
+      serviceCount: serviceSenders.length,
+      // The frontend needs both counts to tell "none registered" apart from
+      // "some registered but none usable" — two different things to say.
+      usableCount: direct.senders.length + serviceSenders.length,
+      totalRegistered: direct.total,
+      // Kept so nothing that still reads `phoneNumbers` breaks silently.
+      phoneNumbers: direct.senders.map((s) => ({ phoneNumber: s.value })),
     });
-
     return callback(null, response);
   } catch (error) {
     console.error('Get phone numbers error:', error);
     response.setStatusCode(500);
-    response.setBody({ 
+    response.setBody({
       error: 'Failed to fetch phone numbers',
-      message: error.message 
+      message: error.message
     });
     return callback(null, response);
   }
 };
-
-async function getOrCreateSyncService(client) {
-  try {
-    // Try to find existing service
-    const services = await client.sync.v1.services.list({ limit: 20 });
-    const existingService = services.find(s => s.friendlyName === 'Messaging UI Sync Service');
-    if (existingService) {
-      return existingService.sid;
-    }
-    
-    // Create new service if not found
-    const service = await client.sync.v1.services.create({
-      friendlyName: 'Messaging UI Sync Service'
-    });
-    return service.sid;
-  } catch (error) {
-    console.error('Error getting/creating Sync service:', error);
-    // If we can't create/get Sync service, try to continue with first available
-    try {
-      const services = await client.sync.v1.services.list({ limit: 1 });
-      if (services.length > 0) {
-        return services[0].sid;
-      }
-    } catch (e) {
-      console.error('Error getting any Sync service:', e);
-    }
-    throw error;
-  }
-}
-

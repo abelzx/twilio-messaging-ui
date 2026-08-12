@@ -1,8 +1,10 @@
 const twilio = require('twilio');
+const oauth = require(Runtime.getAssets()['/twilio-oauth.js'].path);
 
 /**
- * Send messages endpoint with chunking and timeout handling
- * Uses Twilio Sync to track progress and enable resumable execution
+ * POST /send-messages — sends a chunk of messages via the caller's OAuth app,
+ * with chunking and timeout handling.
+ * Uses Twilio Sync to track progress and enable resumable execution.
  */
 
 /**
@@ -69,9 +71,8 @@ exports.handler = async function(context, event, callback) {
   const CHUNK_SIZE = 100; // Process 100 messages at a time for full-speed sending
 
   try {
-    const { 
-      sessionId, 
-      messages, 
+    const {
+      messages,
       campaignId,
       channel = 'sms',
       from,
@@ -79,73 +80,83 @@ exports.handler = async function(context, event, callback) {
       campaignName
     } = event;
 
-    if (!sessionId || !messages || !Array.isArray(messages) || messages.length === 0) {
+    if (!messages || !Array.isArray(messages) || messages.length === 0) {
       response.setStatusCode(400);
-      response.setBody({ error: 'sessionId and messages array are required' });
+      response.setBody({ error: 'messages array is required' });
       return callback(null, response);
     }
 
-    // Get credentials from Sync using runtime credentials
-    const runtimeClient = twilio(context.ACCOUNT_SID, context.AUTH_TOKEN);
-    const syncServiceSid = context.SYNC_SERVICE_SID || await getOrCreateSyncService(runtimeClient);
-    const syncClient = runtimeClient.sync.v1.services(syncServiceSid);
-    
-    const credentialsDoc = await syncClient.documents(`credentials_${sessionId}`).fetch();
-    const credentials = credentialsDoc.data;
-
-    // Initialize Twilio client with user credentials
+    let creds;
     let client;
-    if (credentials.authToken) {
-      client = twilio(credentials.accountSid, credentials.authToken);
-    } else if (credentials.apiKey && credentials.apiSecret) {
-      client = twilio(credentials.apiKey, credentials.apiSecret, { 
-        accountSid: credentials.accountSid 
-      });
-    } else {
-      throw new Error('Invalid credentials');
+    try {
+      creds = oauth.credsFrom(event);
+      client = await oauth.authenticate(creds);
+    } catch (error) {
+      response.setStatusCode(error.statusCode || 401);
+      response.setBody({ error: error.message });
+      return callback(null, response);
     }
 
-    // Get or create campaign document in Sync
-    // Use campaignId directly if provided, otherwise create a new one with prefix
+    const ownerKey = oauth.ownerKeyFor(creds);
+
+    // The runtime client is used for Sync only, never for the user's account.
+    const runtimeClient = twilio(context.ACCOUNT_SID, context.AUTH_TOKEN);
+    const syncServiceSid = context.SYNC_SERVICE_SID || await oauth.getOrCreateSyncService(runtimeClient);
+    const syncClient = runtimeClient.sync.v1.services(syncServiceSid);
+
+    // Get or create the campaign document in Sync.
     const campaignDocName = campaignId || `campaign_${Date.now()}`;
-    let campaignDoc;
+    let campaignDoc = null;
     try {
       campaignDoc = await syncClient.documents(campaignDocName).fetch();
     } catch (error) {
-      // Create new campaign document
-      // Store messages array and metadata for resume functionality
+      // 20404 is "document not found"; anything else is a real failure.
+      if (error.status !== 404 && error.code !== 20404) {
+        throw error;
+      }
+    }
+
+    if (campaignDoc) {
+      // An existing campaign may only be added to by the OAuth app that created
+      // it. 404 rather than 403, so a guessed campaign ID is not confirmed to
+      // exist. Documents predating this migration have no ownerKey and so fail
+      // this check, consistent with their absence from the campaign list.
+      // Same `!data` guard as list-campaigns.js and check-status.js — a document
+      // with no data must fail the ownership check, not throw.
+      if (!campaignDoc.data || campaignDoc.data.ownerKey !== ownerKey) {
+        response.setStatusCode(404);
+        response.setBody({ error: 'Campaign not found' });
+        return callback(null, response);
+      }
+    } else {
       campaignDoc = await syncClient.documents.create({
         uniqueName: campaignDocName,
         data: {
-          accountSid: credentials.accountSid,
+          ownerKey,
+          accountSid: client.accountSid, // display only; never an authorization key
           totalMessages: messages.length,
           sent: 0,
           failed: 0,
           pending: messages.length,
           statuses: {},
           startIndex: resumeFrom,
-          messages: messages, // Store messages for resume
-          channel: channel, // Store channel for resume
-          from: from, // Store from number/ID for resume
-          campaignName: campaignName || null, // Store campaign name
+          messages: messages, // stored so the campaign can be resumed
+          channel: channel,
+          from: from,
+          campaignName: campaignName || null,
           createdAt: new Date().toISOString(),
           lastUpdated: new Date().toISOString()
         }
       });
     }
-    
-    // Ensure accountSid is set (for existing campaigns)
-    if (!campaignDoc.data.accountSid) {
-      campaignDoc.data.accountSid = credentials.accountSid;
-    }
-    
-    // Ensure messages and metadata are stored (for existing campaigns that might not have them)
+
+    // Backfill resume metadata on campaigns created before it was stored.
     if (!campaignDoc.data.messages && resumeFrom === 0) {
       campaignDoc.data.messages = messages;
       campaignDoc.data.channel = channel;
       campaignDoc.data.from = from;
     }
-    
+
     // Update campaign name if provided and not already set
     if (campaignName && !campaignDoc.data.campaignName) {
       campaignDoc.data.campaignName = campaignName;
@@ -200,27 +211,35 @@ exports.handler = async function(context, event, callback) {
             }
           }
 
-          // Add channel-specific parameters
+          // Resolve the sender BEFORE any channel prefixing. A Messaging Service is
+          // chosen by SID and must travel as messagingServiceSid — never as From, and
+          // never with a channel prefix glued to it. This was inside the messenger
+          // branch until a service became selectable on every channel; left there,
+          // picking one for WhatsApp produced from: "whatsapp:MG7f6b…".
+          const MESSAGING_SERVICE_SID = /^MG[0-9a-f]{32}$/i;
+          const usingService = MESSAGING_SERVICE_SID.test(String(messageParams.from || ''));
+          if (usingService) {
+            messageParams.messagingServiceSid = String(messageParams.from);
+            delete messageParams.from;
+          }
+
+          // The recipient always takes the channel prefix. From only takes it when a
+          // concrete sender was chosen — a service SID must stay bare.
           if (channel === 'whatsapp') {
-            messageParams.from = `whatsapp:${messageParams.from}`;
-            messageParams.to = `whatsapp:${messageParams.to}`;
+            const wa = (v) => (String(v).startsWith('whatsapp:') ? String(v) : `whatsapp:${v}`);
+            messageParams.to = wa(messageParams.to);
+            if (messageParams.from) messageParams.from = wa(messageParams.from);
           } else if (channel === 'messenger') {
-            messageParams.messagingServiceSid = message.messagingServiceSid || context.MESSAGING_SERVICE_SID;
-          } else if (channel === 'mms') {
-            // MMS uses the same API as SMS but can include media
-            // Media URLs can be added via message.mediaUrl if provided
+            const ms = (v) => (String(v).startsWith('messenger:') ? String(v) : `messenger:${v}`);
+            messageParams.to = ms(messageParams.to);
+            if (messageParams.from) messageParams.from = ms(messageParams.from);
+            if (!usingService) {
+              const svc = message.messagingServiceSid || context.MESSAGING_SERVICE_SID;
+              if (svc) messageParams.messagingServiceSid = svc;
+            }
+          } else if (channel === 'mms' || channel === 'rcs') {
             if (message.mediaUrl) {
               messageParams.mediaUrl = Array.isArray(message.mediaUrl) ? message.mediaUrl : [message.mediaUrl];
-            }
-          } else if (channel === 'rcs') {
-            // RCS uses the same API as SMS/MMS
-            // RCS-specific features can be added here if needed
-            if (message.mediaUrl) {
-              messageParams.mediaUrl = Array.isArray(message.mediaUrl) ? message.mediaUrl : [message.mediaUrl];
-            }
-            // RCS can also use content templates
-            if (message.contentSid) {
-              messageParams.contentSid = message.contentSid;
             }
           }
 
@@ -323,33 +342,4 @@ exports.handler = async function(context, event, callback) {
     return callback(null, response);
   }
 };
-
-async function getOrCreateSyncService(client) {
-  try {
-    // Try to find existing service
-    const services = await client.sync.v1.services.list({ limit: 20 });
-    const existingService = services.find(s => s.friendlyName === 'Messaging UI Sync Service');
-    if (existingService) {
-      return existingService.sid;
-    }
-    
-    // Create new service if not found
-    const service = await client.sync.v1.services.create({
-      friendlyName: 'Messaging UI Sync Service'
-    });
-    return service.sid;
-  } catch (error) {
-    console.error('Error getting/creating Sync service:', error);
-    // If we can't create/get Sync service, try to continue with first available
-    try {
-      const services = await client.sync.v1.services.list({ limit: 1 });
-      if (services.length > 0) {
-        return services[0].sid;
-      }
-    } catch (e) {
-      console.error('Error getting any Sync service:', e);
-    }
-    throw error;
-  }
-}
 
