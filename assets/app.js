@@ -1007,9 +1007,17 @@ function displayCampaigns(campaigns) {
     let html = '<div class="campaigns-list">';
     campaigns.forEach(campaign => {
         const isActive = campaign.campaignId === currentCampaignId;
-        const progress = campaign.totalMessages > 0 
-            ? ((campaign.sent + campaign.failed) / campaign.totalMessages * 100).toFixed(1) 
+        // Progress is how far through the recipient list we are, not a ratio of
+        // send attempts — a resent chunk would otherwise push this past 100%.
+        const processed = Number.isFinite(campaign.startIndex)
+            ? campaign.startIndex
+            : (campaign.sent || 0);
+        const progress = campaign.totalMessages > 0
+            ? Math.min(100, (processed / campaign.totalMessages) * 100).toFixed(1)
             : 0;
+        const duplicateNote = (campaign.sent || 0) > campaign.totalMessages
+            ? `<p class="campaign-warning">${campaign.sent} messages sent for ${campaign.totalMessages} recipients — this campaign was sent more than once.</p>`
+            : '';
         
         const createdDate = campaign.createdAt 
             ? new Date(campaign.createdAt).toLocaleString() 
@@ -1062,6 +1070,7 @@ function displayCampaigns(campaigns) {
                         <span class="stat-value">${campaign.read}</span>
                     </div>
                 </div>
+                ${duplicateNote}
                 <div class="campaign-progress">
                     <div class="progress-bar" style="width: 100%; height: 6px; background: #e0e0e0; border-radius: 3px; margin-top: 10px;">
                         <div class="progress-fill" style="width: ${progress}%; height: 100%; background: #4caf50; border-radius: 3px;"></div>

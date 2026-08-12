@@ -75,13 +75,10 @@ exports.handler = async function(context, event, callback) {
               read: status === 'read'
             };
 
-            // Update stats if needed
-            if (status === 'delivered' && !campaignData.statuses[messageSid].delivered) {
-              campaignData.delivered = (campaignData.delivered || 0) + 1;
-            }
-            if (status === 'read' && !campaignData.statuses[messageSid].read) {
-              campaignData.read = (campaignData.read || 0) + 1;
-            }
+            // Counters are derived in check-status.js from this statuses map, not
+            // maintained here. Two writers meant two chances to double-count, and
+            // the guard on the increments this replaced was inverted anyway: it
+            // tested the object it had just overwritten, so it never fired.
 
             campaignData.lastUpdated = new Date().toISOString();
 

@@ -90,19 +90,38 @@ exports.handler = async function(context, event, callback) {
     campaignData.statuses = statusUpdates;
     campaignData.lastUpdated = new Date().toISOString();
 
-    // Calculate delivered and read counts
+    // Single source of truth for the derived counters. The webhook records
+    // per-message status; this is the only place that counts them, so a badge
+    // and a counter cannot disagree.
+    //
+    // Terminal failure is `failed` or `undelivered`. `undelivered` matters: Meta
+    // rejecting a WhatsApp template (error 63049) lands here, and reporting that
+    // as a success is worse than reporting nothing.
+    const TERMINAL_FAILURE = new Set(['failed', 'undelivered']);
+
     let delivered = 0;
     let read = 0;
+    let failed = 0;
     for (const statusInfo of Object.values(statusUpdates)) {
-      if (statusInfo.delivered || statusInfo.status === 'delivered') {
+      const status = String(statusInfo.status || '').toLowerCase();
+      if (statusInfo.delivered || status === 'delivered' || status === 'read') {
         delivered++;
       }
-      if (statusInfo.read || statusInfo.status === 'read') {
+      if (statusInfo.read || status === 'read') {
         read++;
       }
+      if (TERMINAL_FAILURE.has(status)) {
+        failed++;
+      }
     }
+
     campaignData.delivered = delivered;
     campaignData.read = read;
+    campaignData.failed = failed;
+    // Anything accepted by Twilio that has not yet reached a terminal state.
+    // Clamped at zero: a chunk sent twice inflates `sent` past the recipient
+    // count, and a negative "pending" is noise rather than information.
+    campaignData.pending = Math.max(0, (campaignData.sent || 0) - delivered - failed);
 
     // Update Sync document
     await syncClient.documents(campaignId).update({
