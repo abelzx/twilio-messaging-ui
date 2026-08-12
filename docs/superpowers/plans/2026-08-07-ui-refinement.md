@@ -1411,6 +1411,311 @@ git commit -m "feat: offer a Messaging Service as the From on every channel"
 
 ---
 
+---
+
+### Task H: Port the top bar and sign-in card from the sibling project
+
+Requested by the user: the top bar's icon, colour and Sign Out button, and the sign-in page, should match `twilio-lookup-api-ui`. The current top bar renders a **phone emoji** via `.top-nav .logo::before { content: "📱" }` — replace it with the real Twilio logo image that project uses. Also delete the sentence *"The account is detected automatically from your credentials."* from the sign-in page.
+
+**Reference files** (read them; do not invent an alternative):
+- `/Users/hng/Documents/GitHub/twilio-lookup-api-ui/assets/index.html` — the `<nav class="topbar">` block at lines 50-60, and the `.login-card` block at lines 18-46
+- `/Users/hng/Documents/GitHub/twilio-lookup-api-ui/assets/styles.css` — `.topbar*` rules, and `.login-view` / `.login-card*` at lines 593-670
+- `/Users/hng/Documents/GitHub/twilio-lookup-api-ui/assets/twilio_logo.png` — 200×200 PNG, displayed at 30px in the bar and 36px on the card
+
+**Files:**
+- Create: `assets/twilio_logo.png` (copied from the reference project)
+- Modify: `assets/index.html`, `assets/styles.css`
+
+- [ ] **Step 1: Copy the logo asset**
+
+```bash
+cp /Users/hng/Documents/GitHub/twilio-lookup-api-ui/assets/twilio_logo.png assets/twilio_logo.png
+```
+
+It deploys as a **public** asset at `/twilio_logo.png` — correct, it is a logo. Reference it as `twilio_logo.png` (relative), matching how `styles.css` is referenced in this project.
+
+- [ ] **Step 2: Add the missing token**
+
+`:root` in `assets/styles.css` has no `--header-height`; the ported `.topbar` needs it. Add it alongside the other tokens:
+
+```css
+    --header-height: 56px;
+```
+
+- [ ] **Step 3: Replace the top bar markup**
+
+In `assets/index.html`, replace the whole `<nav class="top-nav">…</nav>` block with the sibling project's shape. **The two IDs must survive verbatim** — `app.js` reads `logout-btn` and `account-indicator`, and renaming either silently breaks sign-out or the account display:
+
+```html
+            <nav class="topbar">
+                <div class="topbar__logo">
+                    <img src="twilio_logo.png" alt="Twilio" width="30" height="30">
+                    <span>Twilio</span>
+                </div>
+                <div class="topbar__sep"></div>
+                <span class="topbar__title">Messaging — Bulk Sender</span>
+                <div class="topbar__spacer"></div>
+                <span class="topbar__account" id="account-indicator"></span>
+                <button type="button" class="topbar__signout" id="logout-btn">Sign out</button>
+            </nav>
+```
+
+Note the button loses `class="btn btn-secondary"` and gains `topbar__signout` — that is the point of the request. Its label becomes "Sign out" (sentence case), matching the sibling project.
+
+- [ ] **Step 4: Port the top bar CSS and delete the emoji**
+
+Delete the `.top-nav`, `.top-nav .nav-content`, `.top-nav .logo`, **`.top-nav .logo::before`** (the phone emoji) and `.top-nav .nav-actions` rules. Replace with the sibling project's rules, adapted to this project's token names:
+
+```css
+.topbar {
+    position: sticky;
+    top: 0;
+    z-index: 100;
+    height: var(--header-height);
+    background: var(--twilio-navy);
+    display: flex;
+    align-items: center;
+    padding: 0 24px;
+    gap: 16px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+}
+
+.topbar__logo {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.topbar__logo img {
+    width: 30px;
+    height: 30px;
+    display: block;
+}
+
+.topbar__logo span {
+    color: #FFFFFF;
+    font-weight: 600;
+    font-size: 15px;
+    letter-spacing: -0.01em;
+}
+
+.topbar__sep {
+    width: 1px;
+    height: 24px;
+    background: rgba(255, 255, 255, 0.15);
+}
+
+.topbar__title {
+    color: rgba(255, 255, 255, 0.85);
+    font-size: 14px;
+    font-weight: 400;
+}
+
+.topbar__spacer {
+    flex: 1;
+}
+
+.topbar__account {
+    font-size: 12px;
+    color: rgba(255, 255, 255, 0.65);
+    font-family: var(--mono);
+    max-width: 260px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.topbar__signout {
+    background: none;
+    border: 1px solid rgba(255, 255, 255, 0.25);
+    color: rgba(255, 255, 255, 0.8);
+    font-size: 12px;
+    font-family: var(--font);
+    font-weight: 500;
+    padding: 5px 12px;
+    border-radius: var(--radius);
+    cursor: pointer;
+    transition: background 0.12s, border-color 0.12s;
+}
+
+.topbar__signout:hover {
+    background: rgba(255, 255, 255, 0.1);
+    border-color: rgba(255, 255, 255, 0.4);
+}
+
+.topbar__signout:focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.25);
+}
+```
+
+**Check the cascade.** The generic `.btn` rules added earlier are broad; confirm no leftover rule still targets the sign-out button now that it no longer carries `.btn`. Also confirm `.top-nav` is fully gone — a stale rule with `content: "📱"` left in the file would reappear if any markup still used that class.
+
+- [ ] **Step 5: Rebuild the sign-in screen as a login card**
+
+Replace the `.login-container` / `.login-header` / `.login-form` markup inside `#login-screen` with the sibling project's card shape. **Keep every ID**: `login-form`, `client-id`, `client-secret`, `login-btn`, `login-error`. Keep it a real `<form>` with a `type="submit"` button — `app.js` binds the form's `submit` event, unlike the sibling project which binds a button click.
+
+```html
+        <div id="login-screen" class="screen active">
+            <div class="login-view">
+                <div class="login-card">
+                    <div class="login-card__logo">
+                        <img src="twilio_logo.png" alt="Twilio" width="36" height="36">
+                        <span>Twilio</span>
+                    </div>
+                    <h1 class="login-card__title">Messaging — Bulk Sender</h1>
+                    <p class="login-card__subtitle">
+                        Sign in with a Twilio OAuth app. Your credentials are stored only in this browser.
+                    </p>
+
+                    <form id="login-form">
+                        <div class="form-group">
+                            <label for="client-id">Client ID</label>
+                            <input type="text" id="client-id" required spellcheck="false"
+                                   autocomplete="username"
+                                   placeholder="Your OAuth app's Client ID">
+                        </div>
+                        <div class="form-group">
+                            <label for="client-secret">Client Secret</label>
+                            <input type="password" id="client-secret" required spellcheck="false"
+                                   autocomplete="current-password"
+                                   placeholder="••••••••••••••••••••••••••••••••">
+                        </div>
+                        <button type="submit" id="login-btn" class="btn btn-primary login-card__submit">Sign in</button>
+                    </form>
+
+                    <p class="login-card__error" id="login-error"></p>
+                    <p class="login-card__hint">
+                        Create an OAuth app in the Twilio Console under
+                        <strong>Account &rsaquo; API keys &amp; tokens &rsaquo; OAuth apps</strong>,
+                        granting the <strong>Messaging</strong>, <strong>Phone Numbers</strong> and
+                        <strong>Content</strong> scopes.
+                    </p>
+                </div>
+            </div>
+        </div>
+```
+
+The sentence *"The account is detected automatically from your credentials."* is deliberately **not** carried over — the user asked for it gone.
+
+- [ ] **Step 6: Port the login card CSS**
+
+```css
+.login-view {
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--bg);
+    padding: 24px;
+}
+
+.login-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-md);
+    padding: 32px;
+    width: 100%;
+    max-width: 420px;
+}
+
+.login-card__logo {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 20px;
+}
+
+.login-card__logo img { display: block; }
+
+.login-card__logo span {
+    font-weight: 700;
+    font-size: 16px;
+    color: var(--twilio-navy);
+    letter-spacing: -0.01em;
+}
+
+.login-card__title {
+    margin: 0 0 6px;
+    font-size: 19px;
+    font-weight: 700;
+    color: var(--twilio-navy);
+    letter-spacing: -0.02em;
+}
+
+.login-card__subtitle {
+    margin: 0 0 24px;
+    font-size: 13px;
+    color: var(--text-muted);
+    line-height: 1.5;
+}
+
+.login-card__submit {
+    width: 100%;
+    padding: 11px;
+    font-size: 14px;
+    margin-top: 20px;
+}
+
+.login-card__error {
+    margin: 12px 0 0;
+    font-size: 13px;
+    color: var(--danger);
+    font-weight: 500;
+    display: none;
+}
+
+.login-card__error.show { display: block; }
+
+.login-card__hint {
+    margin: 20px 0 0;
+    padding-top: 16px;
+    border-top: 1px solid var(--border);
+    font-size: 12px;
+    color: var(--text-muted);
+    line-height: 1.5;
+}
+
+.login-card__hint strong {
+    font-weight: 600;
+    color: var(--text);
+}
+```
+
+**Two cascade hazards to resolve, not assume away:**
+
+1. `#login-error` is toggled by `app.js` with `classList.add('show')` / `remove('show')`. The old `.login-error` rule may also target it. Confirm exactly one rule governs its visibility, and that `.login-card__error.show` wins — otherwise a failed sign-in shows nothing.
+2. `.screen` / `.screen.active` control which view is visible. `.login-view` is a flex centering container *inside* `#login-screen`. Read the `.screen` rules and confirm `display` does not conflict — if `.screen.active` sets `display: block`, the inner `.login-view` flex still works, but verify rather than assume.
+
+Delete the now-unused `.login-container`, `.login-header` and `.login-help` rules, and any `.login-form` rule that no longer applies.
+
+- [ ] **Step 7: Verify**
+
+```bash
+test -f assets/twilio_logo.png && echo "logo present: OK"
+grep -c "📱" assets/styles.css assets/index.html
+grep -n "top-nav" assets/index.html assets/styles.css || echo "top-nav fully removed: OK"
+grep -n "detected automatically" assets/index.html || echo "sentence removed: OK"
+grep -c "header-height" assets/styles.css
+for id in login-form client-id client-secret login-btn login-error logout-btn account-indicator; do
+  printf '%-20s ' "$id"; grep -c "id=\"$id\"" assets/index.html
+done
+comm -23 <(grep -oE 'var\(--[a-z0-9-]+' assets/styles.css | sed 's/var(//' | sort -u) \
+         <(grep -oE '^\s*--[a-z0-9-]+' assets/styles.css | tr -d ' ' | sed 's/:$//' | sort -u)
+```
+
+Expected: logo present; `0` emoji in both files; no `top-nav` anywhere; sentence gone; `--header-height` referenced at least twice (definition + use); every ID exactly `1`; and no output from the variable audit.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add assets/twilio_logo.png assets/index.html assets/styles.css
+git commit -m "style: port the top bar and sign-in card from twilio-lookup-api-ui"
+```
+
+---
+
 ## Done When
 
 - [ ] Selecting WhatsApp lists WhatsApp senders, not SMS numbers
