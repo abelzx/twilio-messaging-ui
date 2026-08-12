@@ -50,7 +50,7 @@ The application processes messages in chunks of 100 at a time. If execution appr
 
 ```bash
 git clone <your-repo-url>
-cd messaging-ui
+cd twilio-messaging-ui
 npm install
 ```
 
@@ -169,7 +169,7 @@ Two limits are worth stating plainly:
 ## Project Structure
 
 ```
-messaging-ui/
+twilio-messaging-ui/
 ├── functions/
 │   ├── verify.js                # Validates OAuth credentials at sign-in
 │   ├── send-messages.js         # Message sending with chunking
