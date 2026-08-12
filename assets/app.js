@@ -1050,7 +1050,7 @@ function displayCampaigns(campaigns) {
                 </div>
                 <div class="campaign-stats">
                     <div class="stat-item">
-                        <span class="stat-label">Total:</span>
+                        <span class="stat-label">Recipients:</span>
                         <span class="stat-value">${campaign.totalMessages}</span>
                     </div>
                     <div class="stat-item">
@@ -1151,7 +1151,11 @@ function displayMessageDetails(campaign) {
     let html = `
         <div style="margin-bottom: 15px; padding: 12px; background: var(--twilio-gray-50); border-radius: 6px;">
             <div style="display: flex; gap: 20px; flex-wrap: wrap;">
-                <div><strong>Total Messages:</strong> ${campaign.totalMessages || 0}</div>
+                <!-- "Recipients", not "Total Messages": this sits above a table of
+                     message records, and a resent chunk means more records than
+                     recipients. Labelling 3 as "Total Messages" above 5 rows made
+                     the panel contradict itself. `Sent` accounts for the rows. -->
+                <div><strong>Recipients:</strong> ${campaign.totalMessages || 0}</div>
                 <div><strong>Sent:</strong> <span style="color: var(--twilio-success);">${campaign.sent || 0}</span></div>
                 <div><strong>Failed:</strong> <span style="color: var(--twilio-error);">${campaign.failed || 0}</span></div>
                 <div><strong>Delivered:</strong> <span style="color: var(--twilio-success);">${campaign.delivered || 0}</span></div>
