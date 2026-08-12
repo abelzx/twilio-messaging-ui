@@ -1190,6 +1190,227 @@ git commit -m "feat: derive the Account SID from the token and sign in with two 
 
 ---
 
+---
+
+### Task G: Offer a Messaging Service as the From on every channel
+
+Requested by the user. A Messaging Service can send on any channel, picking a sender from its pool — that is the recommended production shape (sticky sender, geo-match, pool failover). Today it is offered for Messenger only.
+
+**The trap this task exists to avoid.** The channel prefix helpers glue their prefix onto whatever sits in `from`:
+
+```js
+const wa = (v) => (String(v).startsWith('whatsapp:') ? String(v) : `whatsapp:${v}`);
+messageParams.from = wa(messageParams.from);
+```
+
+Task D put the `MG…` detection *inside* the messenger branch, so it protects only that channel. Offer a service for WhatsApp with the code as it stands and you get `from: "whatsapp:MG7f6b5fdd…"`, which fails on every message. So **sender resolution must be hoisted above all channel prefixing**, and `from` must only ever be prefixed when it holds a concrete sender.
+
+A second rule falls out of the same restructure: **the recipient always takes the channel prefix; the sender only does when it is not a service.** Those two were tangled together in one branch before.
+
+**Files:**
+- Modify: `functions/get-phone-numbers.js`
+- Modify: `functions/send-messages.js`, `functions/resume-execution.js`
+- Modify: `assets/app.js`
+
+- [ ] **Step 1: Return Messaging Services for every channel**
+
+In `functions/get-phone-numbers.js`, tag each sender with a `kind` so the frontend can group them, and fetch the services concurrently with the channel-specific list — this adds a second API call inside a 10-second budget, so do not serialise them.
+
+Restructure the branch so it computes `direct` senders, then appends services:
+
+```js
+    const channel = String(event.channel || 'sms').toLowerCase();
+
+    // A Messaging Service can send on any channel, so it is offered everywhere.
+    // Fetched concurrently with the channel-specific list: this is a second network
+    // call inside a 10s Function budget, and serialising them wastes headroom.
+    const servicesPromise = client.messaging.v1.services.list({ limit: 50 });
+
+    let directPromise;
+    if (channel === 'whatsapp' || channel === 'rcs') {
+      directPromise = client.messaging.v2.channelsSenders
+        .list({ channel, limit: 100 })
+        .then((registered) => ({
+          total: registered.length,
+          senders: registered
+            .filter((s) => String(s.status || '').toUpperCase() === 'ONLINE')
+            .map((s) => ({
+              value: s.senderId,
+              label: s.profile && s.profile.name
+                ? `${s.senderId.replace(/^[a-z]+:/, '')} · ${s.profile.name}`
+                : s.senderId.replace(/^[a-z]+:/, ''),
+              status: s.status,
+              kind: 'direct',
+            })),
+        }));
+    } else if (channel === 'messenger') {
+      // Facebook Pages are not exposed by any list API, so a Messaging Service that
+      // owns the Page is the only selectable sender here.
+      directPromise = Promise.resolve({ total: 0, senders: [] });
+    } else {
+      const needsMms = channel === 'mms';
+      directPromise = client.incomingPhoneNumbers.list({ limit: 100 }).then((numbers) => {
+        const capable = numbers.filter((n) => {
+          const c = n.capabilities || {};
+          const flag = needsMms ? c.mms : c.sms;
+          return flag === true || flag === 'true';
+        });
+        return {
+          total: capable.length,
+          senders: capable.map((n) => ({
+            value: n.phoneNumber,
+            label: n.friendlyName && n.friendlyName !== n.phoneNumber
+              ? `${n.phoneNumber} · ${n.friendlyName}`
+              : n.phoneNumber,
+            status: 'ONLINE',
+            kind: 'direct',
+          })),
+        };
+      });
+    }
+
+    const [direct, services] = await Promise.all([directPromise, servicesPromise]);
+
+    const serviceSenders = services.map((s) => ({
+      value: s.sid,
+      label: `${s.friendlyName} · ${s.sid.slice(0, 10)}…`,
+      status: 'ONLINE',
+      kind: 'service',
+    }));
+
+    response.setStatusCode(200);
+    response.setBody({
+      success: true,
+      channel,
+      senders: [...direct.senders, ...serviceSenders],
+      directCount: direct.senders.length,
+      serviceCount: serviceSenders.length,
+      usableCount: direct.senders.length + serviceSenders.length,
+      totalRegistered: direct.total,
+      phoneNumbers: direct.senders.map((s) => ({ phoneNumber: s.value })),
+    });
+    return callback(null, response);
+```
+
+- [ ] **Step 2: Hoist sender resolution above channel prefixing, in BOTH send files**
+
+In `functions/send-messages.js` and `functions/resume-execution.js`, replace the whole `// Add channel-specific parameters` block with:
+
+```js
+          // Resolve the sender BEFORE any channel prefixing. A Messaging Service is
+          // chosen by SID and must travel as messagingServiceSid — never as From, and
+          // never with a channel prefix glued to it. This was inside the messenger
+          // branch until a service became selectable on every channel; left there,
+          // picking one for WhatsApp produced from: "whatsapp:MG7f6b…".
+          const MESSAGING_SERVICE_SID = /^MG[0-9a-f]{32}$/i;
+          const usingService = MESSAGING_SERVICE_SID.test(String(messageParams.from || ''));
+          if (usingService) {
+            messageParams.messagingServiceSid = String(messageParams.from);
+            delete messageParams.from;
+          }
+
+          // The recipient always takes the channel prefix. From only takes it when a
+          // concrete sender was chosen — a service SID must stay bare.
+          if (channel === 'whatsapp') {
+            const wa = (v) => (String(v).startsWith('whatsapp:') ? String(v) : `whatsapp:${v}`);
+            messageParams.to = wa(messageParams.to);
+            if (messageParams.from) messageParams.from = wa(messageParams.from);
+          } else if (channel === 'messenger') {
+            const ms = (v) => (String(v).startsWith('messenger:') ? String(v) : `messenger:${v}`);
+            messageParams.to = ms(messageParams.to);
+            if (messageParams.from) messageParams.from = ms(messageParams.from);
+            if (!usingService) {
+              const svc = message.messagingServiceSid || context.MESSAGING_SERVICE_SID;
+              if (svc) messageParams.messagingServiceSid = svc;
+            }
+          } else if (channel === 'mms' || channel === 'rcs') {
+            if (message.mediaUrl) {
+              messageParams.mediaUrl = Array.isArray(message.mediaUrl) ? message.mediaUrl : [message.mediaUrl];
+            }
+          }
+```
+
+Two notes on what changed and why:
+
+- **`mms` and `rcs` are merged.** Their bodies are now identical. The old `rcs` branch also re-assigned `messageParams.contentSid`, which the general content-template block above already set — along with `contentVariables`, which that duplicate omitted. Dropping the duplicate is safe and removes a line that looked like it handled templates while handling them worse.
+- `context.MESSAGING_SERVICE_SID` remains the messenger fallback for a typed Page ID, guarded by `if (svc)` so an unset variable is not sent as `undefined`.
+
+- [ ] **Step 3: Group the dropdown**
+
+In `assets/app.js`, `renderSenderOptions` currently appends a flat list. Split it into two `<optgroup>`s so a service is not mistaken for a phone number:
+
+```js
+    const direct = senders.filter((s) => s.kind !== 'service');
+    const services = senders.filter((s) => s.kind === 'service');
+
+    const addGroup = (labelText, items) => {
+        if (!items.length) return;
+        const group = document.createElement('optgroup');
+        group.label = labelText;
+        for (const sender of items) {
+            const opt = document.createElement('option');
+            opt.value = sender.value;
+            opt.textContent = sender.label;
+            group.appendChild(opt);
+        }
+        select.appendChild(group);
+    };
+
+    addGroup(`${noun.replace(/^./, (c) => c.toUpperCase())}s`, direct);
+    addGroup('Messaging Services', services);
+```
+
+Update the help text to name both counts, and the empty state to fire only when *both* are empty:
+
+```js
+    const parts = [];
+    if (data.directCount) parts.push(`${data.directCount} ${noun}${data.directCount === 1 ? '' : 's'}`);
+    if (data.serviceCount) parts.push(`${data.serviceCount} Messaging Service${data.serviceCount === 1 ? '' : 's'}`);
+    const hidden = (data.totalRegistered || 0) - (data.directCount || 0);
+    setSenderHelp(
+        parts.join(' · ') + (hidden > 0 ? ` · ${hidden} not online` : ''),
+        false
+    );
+```
+
+The existing `if (!senders.length)` empty state already covers "both empty", since `senders` is the concatenation — keep it, but make its message mention that no Messaging Services exist either.
+
+- [ ] **Step 4: Verify**
+
+```bash
+for f in functions/get-phone-numbers.js functions/send-messages.js functions/resume-execution.js assets/app.js; do
+  node --check "$f" || echo "SYNTAX FAIL: $f"
+done
+grep -c "MESSAGING_SERVICE_SID = /" functions/send-messages.js functions/resume-execution.js
+grep -c "usingService" functions/send-messages.js functions/resume-execution.js
+grep -c "optgroup" assets/app.js
+grep -c "Promise.all(\[directPromise, servicesPromise\])" functions/get-phone-numbers.js
+```
+
+Expected: no syntax failures; `1` for the regex and `3` for `usingService` in **each** send file; at least `1` for `optgroup`; `1` for the concurrent fetch.
+
+- [ ] **Step 5: Prove the trap is closed**
+
+This is the point of the task. With a probe against the real handlers of **both** send files, for each of `sms`, `mms`, `whatsapp`, `rcs`, `messenger`, capture the `messageParams` passed to `messages.create` when `from` is a Messaging Service SID, and confirm for every channel:
+
+- `messagingServiceSid` equals the SID
+- `from` is **absent** from the params
+- **no `whatsapp:MG…` or `messenger:MG…` value appears anywhere**
+- `to` still carries the channel prefix for whatsapp and messenger, and does not for sms/mms/rcs
+
+Then repeat with a concrete sender (`+6500000000` for whatsapp, `+1…` for sms) and confirm `from` is present and prefixed correctly, with no `messagingServiceSid` set except on messenger's env fallback.
+
+Report the actual params for every combination.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add functions/get-phone-numbers.js functions/send-messages.js functions/resume-execution.js assets/app.js
+git commit -m "feat: offer a Messaging Service as the From on every channel"
+```
+
+---
+
 ## Done When
 
 - [ ] Selecting WhatsApp lists WhatsApp senders, not SMS numbers
