@@ -811,6 +811,142 @@ git commit -m "fix: use MMS-capable numbers for MMS and Messaging Services for M
 
 ---
 
+---
+
+### Task E: One source of truth for campaign counters
+
+Reported by the user from a screenshot: a campaign showed **`Failed: 0`** while two of its messages displayed a red `UNDELIVERED` badge with error 63049, and the progress bar read **166.7% complete**.
+
+**Three defects, one root cause: the counters are incremented at send time and by the webhook, but only *some* are recomputed from the message statuses afterwards.**
+
+1. **`undelivered` is never counted as a failure.** The string appears in exactly one place in the codebase — `assets/app.js:1174`, which picks the badge colour. `check-status.js` recomputes `delivered` and `read` from the statuses map but not `failed`; `webhook.js` never increments `failed` for any status. So a message Meta rejected is reported as a success.
+2. **Progress can exceed 100%.** `assets/app.js:1011` computes `((campaign.sent + campaign.failed) / campaign.totalMessages * 100)` with no ceiling. A campaign whose chunk was sent twice reports `sent: 5` against `totalMessages: 3` → 166.7%.
+3. **`webhook.js`'s de-duplication guard is inverted and its increments are dead code.** It assigns the merged status object first, then tests `!campaignData.statuses[messageSid].delivered` — which the assignment has already set to `true`. The guard is always false, so the increment never runs. Masked today only because `check-status` recomputes `delivered` separately.
+
+**The fix is structural, not three patches:** `check-status.js` becomes the single place that derives counters from the statuses map. `webhook.js` stops maintaining counters and only records per-message status. That removes the double-counting class of bug rather than correcting one instance of it.
+
+**Terminal failure is defined as `failed` or `undelivered`** — matching what `app.js:1174` already uses for the badge, so the badge and the counter can no longer disagree.
+
+**Not in scope:** `totalMessages` stays the number of recipients (3), even when more message records exist. A campaign has 3 recipients; the table legitimately lists 5 rows because 5 messages were created. Renaming or inflating `totalMessages` would misreport the campaign. Step 3 surfaces the discrepancy explicitly instead.
+
+**Files:**
+- Modify: `functions/check-status.js`
+- Modify: `functions/webhook.js`
+- Modify: `assets/app.js`
+
+- [ ] **Step 1: Derive every counter in `check-status.js`**
+
+Replace the "Calculate delivered and read counts" block with a single derivation. Note `sent` is deliberately *not* derived from the map — it means "messages Twilio accepted", which is what send time recorded.
+
+```js
+    // Single source of truth for the derived counters. The webhook records
+    // per-message status; this is the only place that counts them, so a badge
+    // and a counter cannot disagree.
+    //
+    // Terminal failure is `failed` or `undelivered`. `undelivered` matters: Meta
+    // rejecting a WhatsApp template (error 63049) lands here, and reporting that
+    // as a success is worse than reporting nothing.
+    const TERMINAL_FAILURE = new Set(['failed', 'undelivered']);
+
+    let delivered = 0;
+    let read = 0;
+    let failed = 0;
+    for (const statusInfo of Object.values(statusUpdates)) {
+      const status = String(statusInfo.status || '').toLowerCase();
+      if (statusInfo.delivered || status === 'delivered' || status === 'read') {
+        delivered++;
+      }
+      if (statusInfo.read || status === 'read') {
+        read++;
+      }
+      if (TERMINAL_FAILURE.has(status)) {
+        failed++;
+      }
+    }
+
+    campaignData.delivered = delivered;
+    campaignData.read = read;
+    campaignData.failed = failed;
+    // Anything accepted by Twilio that has not yet reached a terminal state.
+    // Clamped at zero: a chunk sent twice inflates `sent` past the recipient
+    // count, and a negative "pending" is noise rather than information.
+    campaignData.pending = Math.max(0, (campaignData.sent || 0) - delivered - failed);
+```
+
+- [ ] **Step 2: Stop `webhook.js` maintaining counters**
+
+The webhook's two increments are dead code (the guard is inverted) and duplicate what Step 1 now derives. Delete them. Find the block that increments `campaignData.delivered` and `campaignData.read` — the two `if` statements after the status assignment — and remove both, leaving a comment:
+
+```js
+            // Counters are derived in check-status.js from this statuses map, not
+            // maintained here. Two writers meant two chances to double-count, and
+            // the guard on the increments this replaced was inverted anyway: it
+            // tested the object it had just overwritten, so it never fired.
+```
+
+Keep everything else: the per-message status assignment, the `delivered`/`read` flags on the individual status entry, and the Sync update.
+
+- [ ] **Step 3: Cap progress and surface a duplicate send**
+
+In `assets/app.js`, replace the percentage calculation at roughly line 1011:
+
+```js
+        // Progress is how far through the recipient list we are, not a ratio of
+        // send attempts — a resent chunk would otherwise push this past 100%.
+        const processed = Number.isFinite(campaign.startIndex)
+            ? campaign.startIndex
+            : (campaign.sent || 0);
+        const percent = campaign.totalMessages > 0
+            ? Math.min(100, (processed / campaign.totalMessages) * 100).toFixed(1)
+            : '0.0';
+```
+
+Then, where the campaign card renders its counters, add a note when more messages exist than recipients. This is the one case where the numbers legitimately look wrong, so say why rather than hide it:
+
+```js
+        const duplicateNote = (campaign.sent || 0) > campaign.totalMessages
+            ? `<p class="campaign-warning">${campaign.sent} messages sent for ${campaign.totalMessages} recipients — this campaign was sent more than once.</p>`
+            : '';
+```
+
+Insert `${duplicateNote}` into the campaign card markup after the counters line. Add the style to `assets/styles.css`:
+
+```css
+.campaign-warning {
+    margin: 8px 0 0;
+    font-size: 12px;
+    color: var(--warning);
+}
+```
+
+- [ ] **Step 4: Verify**
+
+```bash
+node --check functions/check-status.js && echo "status OK"
+node --check functions/webhook.js && echo "webhook OK"
+node --check assets/app.js && echo "app OK"
+grep -c "TERMINAL_FAILURE" functions/check-status.js
+grep -c "campaignData.delivered = (campaignData.delivered || 0) + 1" functions/webhook.js
+grep -c "Math.min(100" assets/app.js
+```
+
+Expected: three `OK` lines, `2` for `TERMINAL_FAILURE` (declaration plus use), `0` for the removed webhook increment, and `1` for the progress cap.
+
+- [ ] **Step 5: Prove it against the real campaign that exposed the bug**
+
+Campaign `wa-resume-test` on the `oauthtest` deployment has exactly the pathological shape: 3 recipients, 5 messages, 2 of them `undelivered` with error 63049. After redeploy, `check-status` for it must report **`failed: 2`**, `delivered: 3`, `read: 3`, `pending: 0` — and the progress must read `100.0%`, not 166.7%.
+
+Ask the coordinator to redeploy, then confirm with the campaignId in `/tmp/wa_cid.txt`. Report the actual counters.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add functions/check-status.js functions/webhook.js assets/app.js assets/styles.css
+git commit -m "fix: count undelivered as failed and stop progress exceeding 100%"
+```
+
+---
+
 ## Done When
 
 - [ ] Selecting WhatsApp lists WhatsApp senders, not SMS numbers
