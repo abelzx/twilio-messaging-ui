@@ -415,6 +415,14 @@ of work rather than a footnote to an auth migration.
 Bounding the token exchange (§ Components) reduces the *odds* of the second case by
 keeping the invocation inside its budget. It does not close either case.
 
+**How to detect it in the field.** The `sent` / `failed` / `delivered` counters are
+incremented cumulatively rather than derived from the messages array, so a chunk sent
+twice inflates `sent` past `totalMessages` and drives `pending` **negative**. A campaign
+reporting `pending < 0` has double-sent, which is otherwise invisible. Observed
+deliberately during verification on 2026-08-12 by rewinding `startIndex` without
+rewinding `sent`: the response returned `{sent: 5, pending: -2}` for a 3-message
+campaign. Worth checking before concluding a campaign completed cleanly.
+
 ## Out of scope
 
 - Deduplicating the send loop between `send-messages.js` and `resume-execution.js`.
