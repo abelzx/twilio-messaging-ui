@@ -1716,6 +1716,266 @@ git commit -m "style: port the top bar and sign-in card from twilio-lookup-api-u
 
 ---
 
+---
+
+### Task I: Stop the 5-second refresh resetting scroll, and export the delivery table to CSV
+
+Two user requests.
+
+**1. Scrolling back through campaigns keeps jumping to the top.** Root cause: `startStatusAutoRefresh` runs a `setInterval` every 5 seconds calling both `checkCampaignStatus()` and `loadCampaigns()`. Each rebuilds its panel with a wholesale `innerHTML` assignment (`assets/app.js:1126` for the campaign list, `displayMessageDetails` for the delivery table), which destroys the scroll container and resets `scrollTop` to 0. **Both panels are affected**, not just the campaign list — the delivery table's own `overflow-y: auto` container is rebuilt on the same tick.
+
+**2. Export the Message Delivery Status table to CSV.**
+
+For the CSV, match the sibling project's helpers rather than inventing new ones — `toCsv` and `downloadCsv` in `/Users/hng/Documents/GitHub/twilio-lookup-api-ui/assets/app.js:589-615`. They use RFC-style escaping (`"` doubled, fields quoted when they contain `"`/`,`/CR/LF), CRLF line endings, and a UTF-8 BOM so Excel reads it correctly.
+
+**Files:**
+- Modify: `assets/app.js`, `assets/index.html`, `assets/styles.css`
+
+- [ ] **Step 1: Two small helpers for preserving scroll**
+
+Add near the top of `assets/app.js`:
+
+```js
+// The 5s poll rebuilds whole panels with innerHTML, which destroys the scroll
+// container and snaps the user back to the top. Two defences: skip the write
+// entirely when nothing changed, and restore scrollTop when it did.
+const renderSignatures = {};
+
+/** True when this panel's data is unchanged since the last render. */
+function renderUnchanged(key, signature, stillPresent) {
+    if (renderSignatures[key] === signature && stillPresent) return true;
+    renderSignatures[key] = signature;
+    return false;
+}
+
+/** Runs `write`, keeping the scroll position of `selector` inside `container`. */
+function withPreservedScroll(container, selector, write) {
+    const before = container.querySelector(selector);
+    const top = before ? before.scrollTop : 0;
+    write();
+    if (top) {
+        const after = container.querySelector(selector);
+        if (after) after.scrollTop = top;
+    }
+}
+```
+
+- [ ] **Step 2: Apply both to the campaign list**
+
+In `displayCampaigns`, before building `html`, compute a signature over everything the markup depends on — including `currentCampaignId`, because the active highlight changes without the campaign data changing:
+
+```js
+    const signature = JSON.stringify([
+        currentCampaignId,
+        campaigns.map((c) => [
+            c.campaignId, c.campaignName, c.totalMessages, c.sent, c.failed,
+            c.delivered, c.read, c.startIndex, c.isComplete, c.lastUpdated,
+        ]),
+    ]);
+    // Nothing to redraw: leave the DOM alone so the user's scroll survives.
+    if (renderUnchanged('campaigns', signature, Boolean(campaignsContent.querySelector('.campaigns-list')))) {
+        return;
+    }
+```
+
+Then wrap the existing write at the end of the function:
+
+```js
+    withPreservedScroll(campaignsContent, '.campaigns-list', () => {
+        campaignsContent.innerHTML = html;
+    });
+```
+
+- [ ] **Step 3: Give the delivery table's scroll container a class, and apply the same treatment**
+
+The table's scrollable wrapper is currently an inline-styled `div` with no class, so it cannot be selected. In `displayMessageDetails`, change:
+
+```html
+        <div style="overflow-x: auto; max-height: 600px; overflow-y: auto;">
+```
+
+to:
+
+```html
+        <div class="message-status-scroll">
+```
+
+and add the rule to `assets/styles.css`:
+
+```css
+.message-status-scroll {
+    overflow-x: auto;
+    overflow-y: auto;
+    max-height: 600px;
+}
+```
+
+Then in `displayMessageDetails`, add a signature check over the statuses and counters, and wrap its write:
+
+```js
+    const signature = JSON.stringify([
+        campaign.campaignId, campaign.sent, campaign.failed, campaign.delivered,
+        campaign.read, campaign.totalMessages,
+        statusEntries.map(([sid, s]) => [sid, s.status, s.delivered, s.read, s.errorCode, s.dateUpdated]),
+    ]);
+    if (renderUnchanged('details', signature, Boolean(messageDetailsContent.querySelector('.message-status-scroll')))) {
+        return;
+    }
+```
+
+and at the end:
+
+```js
+    withPreservedScroll(messageDetailsContent, '.message-status-scroll', () => {
+        messageDetailsContent.innerHTML = html;
+    });
+```
+
+**Careful:** the signature check must sit *after* `statusEntries` is built and sorted, and the early `return` for "no messages yet" must stay before it — otherwise an empty campaign caches a signature for markup it never wrote.
+
+- [ ] **Step 4: Remember which campaign is displayed**
+
+The export needs the data currently on screen. Add a module-level holder and set it in `displayMessageDetails`:
+
+```js
+// The campaign currently rendered in the delivery panel, so Export CSV can use it.
+let displayedCampaign = null;
+```
+
+Set `displayedCampaign = campaign;` at the top of `displayMessageDetails`, **before** the signature early-return — the export must work even on a tick that skipped redrawing.
+
+- [ ] **Step 5: CSV helpers, matching the sibling project**
+
+```js
+/** RFC-style CSV: quote fields containing a quote, comma, CR or LF; double quotes. */
+function toCsv(rows) {
+    if (!rows.length) return '';
+    const headers = Array.from(rows.reduce((keys, row) => {
+        Object.keys(row).forEach((k) => keys.add(k));
+        return keys;
+    }, new Set()));
+    const escape = (val) => {
+        const s = val == null ? '' : String(val);
+        return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+    };
+    return [
+        headers.map(escape).join(','),
+        ...rows.map((row) => headers.map((h) => escape(row[h] ?? '')).join(',')),
+    ].join('\r\n');
+}
+
+function downloadCsv(text, filename) {
+    // BOM so Excel reads it as UTF-8 rather than mangling non-ASCII.
+    const blob = new Blob(['﻿' + text], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+}
+```
+
+- [ ] **Step 6: The export itself**
+
+Columns mirror the on-screen table exactly, in the same order, so the file matches what the user is looking at:
+
+```js
+function exportMessageStatusCsv() {
+    const campaign = displayedCampaign;
+    const statuses = (campaign && campaign.statuses) || {};
+    const entries = Object.entries(statuses);
+
+    if (!entries.length) {
+        alert('No messages to export yet.');
+        return;
+    }
+
+    // Same order as the table: most recently sent first.
+    entries.sort((a, b) => {
+        const dateA = a[1].sentAt || a[1].dateSent || '';
+        const dateB = b[1].sentAt || b[1].dateSent || '';
+        if (!dateA && !dateB) return 0;
+        if (!dateA) return 1;
+        if (!dateB) return -1;
+        return new Date(dateB) - new Date(dateA);
+    });
+
+    const rows = entries.map(([sid, s]) => ({
+        'Message SID': sid,
+        'To': s.to || '',
+        'Status': s.status || '',
+        'Delivered': s.delivered ? 'Yes' : 'No',
+        'Read': s.read ? 'Yes' : 'No',
+        'Error Code': s.errorCode == null ? '' : s.errorCode,
+        'Error Message': s.errorMessage || '',
+        'Sent At': s.sentAt || s.dateSent || '',
+        'Updated At': s.dateUpdated || '',
+        'Webhook Received': s.webhookReceivedAt || '',
+    }));
+
+    const label = (campaign.campaignName || campaign.campaignId || 'campaign')
+        .replace(/[^a-z0-9._-]+/gi, '-')
+        .replace(/^-+|-+$/g, '')
+        .slice(0, 60);
+    const stamp = new Date().toISOString().slice(0, 10);
+    downloadCsv(toCsv(rows), `${label}-messages-${stamp}.csv`);
+}
+```
+
+- [ ] **Step 7: Wire up the button**
+
+In `assets/index.html`, the Message Delivery Status header has a Close button. Add an Export CSV button before it:
+
+```html
+                                    <div style="display: flex; gap: 8px; align-items: center;">
+                                        <button id="export-csv-btn" class="btn btn-secondary" style="padding: 5px 15px; font-size: 14px;">Export CSV</button>
+                                        <button id="close-message-details-btn" class="btn btn-secondary" style="padding: 5px 15px; font-size: 14px;">Close</button>
+                                    </div>
+```
+
+Match the existing Close button's markup and inline sizing rather than introducing a new style. In `setupEventListeners`, alongside the existing close handler:
+
+```js
+    const exportCsvBtn = document.getElementById('export-csv-btn');
+    if (exportCsvBtn) {
+        exportCsvBtn.addEventListener('click', exportMessageStatusCsv);
+    }
+```
+
+- [ ] **Step 8: Verify**
+
+```bash
+node --check assets/app.js && echo "app OK"
+grep -c "withPreservedScroll" assets/app.js
+grep -c "renderUnchanged" assets/app.js
+grep -c "message-status-scroll" assets/app.js assets/styles.css
+grep -n 'style="overflow-x: auto; max-height: 600px' assets/app.js || echo "inline scroll style replaced: OK"
+grep -c "export-csv-btn" assets/index.html assets/app.js
+comm -23 <(grep -oE 'var\(--[a-z0-9-]+' assets/styles.css | sed 's/var(//' | sort -u) \
+         <(grep -oE '^\s*--[a-z0-9-]+' assets/styles.css | tr -d ' ' | sed 's/:$//' | sort -u)
+```
+
+Expected: `app OK`; `3` for `withPreservedScroll` (declaration + two uses); `3` for `renderUnchanged`; `1` in each file for `message-status-scroll`; the inline style gone; `1` in each file for the button; empty variable audit.
+
+- [ ] **Step 9: Prove the behaviour**
+
+`node` cannot exercise scroll, so prove what is provable and state the rest plainly for the user to confirm:
+
+1. **Signature skipping works.** Extract `renderUnchanged` and drive it directly: same key + same signature + present → `true` on the second call; a changed signature → `false`; `stillPresent = false` → `false` even when the signature matches (so a cleared panel always redraws). Report actual results.
+2. **The CSV is correct.** Extract `toCsv` and run it over rows containing a comma, a double quote, a newline and an empty value. Confirm the output quotes exactly the fields that need it, doubles the inner quote, and uses CRLF. Report the raw output with escapes visible.
+3. **The filename sanitiser** turns a campaign name with spaces and slashes into a safe filename. Report input and output.
+4. State clearly that the scroll-preservation itself needs the user's eyes: scroll down the campaign list, wait through two 5-second ticks, and confirm the position holds.
+
+- [ ] **Step 10: Commit**
+
+```bash
+git add assets/app.js assets/index.html assets/styles.css
+git commit -m "fix: keep scroll position through the 5s refresh, and export delivery status to CSV"
+```
+
+---
+
 ## Done When
 
 - [ ] Selecting WhatsApp lists WhatsApp senders, not SMS numbers
