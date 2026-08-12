@@ -947,6 +947,249 @@ git commit -m "fix: count undelivered as failed and stop progress exceeding 100%
 
 ---
 
+---
+
+### Task F: Derive the Account SID from the token; sign in with two fields
+
+The design spec asserted the Account SID could not be reliably derived from the access token, citing the sibling project's comment to that effect. **That was wrong, and the spec must be corrected.** The sibling project scans for a bare `AC`-shaped claim, which genuinely is not present — but it never looked for the Twilio Resource Name form.
+
+**Established by decoding a real token on 2026-08-12:**
+
+```
+act.sub          = trn:us1:iam:account:AC41b8…533     <- the account
+urn:tw:iam_ctx   = trn:us1:iam:account:AC41b8…533     <- same value
+sub              = trn:us1:iam:oauthapp:OQdd2247…     <- the OAuth app
+```
+
+`authStrategy.getAuthString()` returns the string `"Bearer <jwt>"`; the JWT's payload carries `act.sub`, and the SID extracted from it matched the typed Account SID exactly.
+
+**The user chose `act.sub`** as the source — it is a standard RFC 8693 actor claim rather than Twilio's private `urn:tw:` namespace, so it is the more defensible of the two.
+
+Sign-in becomes **OAuth Client ID + Client Secret only**.
+
+**Consequences to handle deliberately:**
+
+- The Account SID is still required for five v2010 calls that embed it in the URL path (`messages.create`, `incomingPhoneNumbers.list`, `messages(sid).fetch`). Nothing about that changes — it is now *derived* rather than *typed*.
+- `setCredentialProvider()` blanks `accountSid`, and the SID is only knowable once a token exists. So derivation must happen in `authenticate()`, after the token fetch — not in `createOAuthClient()`, which has no token yet.
+- **A failure to derive breaks every send.** It must throw a clear, distinct error, not fall through to an empty SID producing `/Accounts//Messages.json`.
+- The SID-mismatch error class disappears: there is no typed value left to mismatch. Twilio error 70051 still means a missing scope and must keep its message.
+- `/verify` should now **return** the derived `accountSid`. This reverses an earlier decision, and correctly: the field was dropped from the response because the caller had just typed it, so echoing it said nothing. Now the caller does not know it, so returning it is the only way the UI can show which account is in use.
+- `ownerKey` stays `oauth:<clientId>`. Campaign ownership is unaffected.
+
+**Files:**
+- Modify: `assets/twilio-oauth.private.js`
+- Modify: `functions/verify.js`
+- Modify: `functions/send-messages.js`, `functions/resume-execution.js` (display field only)
+- Modify: `assets/index.html`, `assets/app.js`
+- Modify: `README.md`, `docs/superpowers/specs/2026-08-07-oauth-login-design.md`
+
+- [ ] **Step 1: `credsFrom` stops requiring an Account SID**
+
+In `assets/twilio-oauth.private.js`, reduce the required set to two fields. Keep the same "name the missing field" behaviour.
+
+```js
+function credsFrom(event) {
+  const clientId = String(event.clientId || '').trim();
+  const clientSecret = String(event.clientSecret || '').trim();
+
+  const missing = [];
+  if (!clientId) missing.push('OAuth Client ID');
+  if (!clientSecret) missing.push('OAuth Client Secret');
+  if (missing.length) {
+    throw httpError(400, `${missing.join(', ')} ${missing.length === 1 ? 'is' : 'are'} required.`);
+  }
+
+  // No accountSid: it is derived from the access token in `authenticate`.
+  return { clientId, clientSecret };
+}
+```
+
+- [ ] **Step 2: Add the extractor**
+
+```js
+/**
+ * Pulls the Account SID out of an access token's `act.sub` claim.
+ *
+ * `getAuthString()` returns "Bearer <jwt>". The JWT payload carries the acting
+ * account as a Twilio Resource Name:
+ *
+ *   act.sub = "trn:us1:iam:account:AC0123…"
+ *
+ * `act` is the RFC 8693 actor claim, preferred over Twilio's private
+ * `urn:tw:iam_ctx` (which holds the same value) because it is a standard claim.
+ * `urn:tw:iam_ctx` is read only as a fallback.
+ *
+ * Returns null if no SID can be found — callers must treat that as fatal rather
+ * than proceeding with an empty SID, which would build /Accounts//Messages.json.
+ */
+function accountSidFromAuthString(authString) {
+  try {
+    const jwt = String(authString || '').split(' ').pop();
+    const segment = jwt.split('.')[1];
+    if (!segment) return null;
+    const payload = JSON.parse(Buffer.from(segment, 'base64url').toString('utf8'));
+    const candidates = [payload && payload.act && payload.act.sub, payload && payload['urn:tw:iam_ctx']];
+    for (const candidate of candidates) {
+      const match = String(candidate || '').match(/AC[0-9a-f]{32}/i);
+      if (match) return match[0];
+    }
+  } catch {
+    // Malformed token: fall through to null and let the caller fail loudly.
+  }
+  return null;
+}
+```
+
+- [ ] **Step 3: `createOAuthClient` no longer sets the SID; `authenticate` does**
+
+Remove the `client.setAccountSid(creds.accountSid)` line and its comment from `createOAuthClient` — there is no token at that point, so the SID is unknowable. Replace the comment with:
+
+```js
+  // accountSid is deliberately NOT set here: it comes from the access token, which
+  // does not exist until `authenticate` fetches one. Anything using this client
+  // directly must set it, or v2010 URIs come out as /Accounts//Messages.json.
+```
+
+Then in `authenticate`, derive and set it. Keep the existing deadline handling exactly as it is:
+
+```js
+async function authenticate(creds, timeoutMs = TOKEN_DEADLINE_MS) {
+  const { client, authStrategy } = createOAuthClient(creds);
+  let authString;
+  try {
+    authString = await withDeadline(
+      authStrategy.getAuthString(),
+      timeoutMs,
+      "Twilio's token endpoint did not respond in time. Try again."
+    );
+  } catch (err) {
+    if (err.name === 'DeadlineError') {
+      throw httpError(504, err.message);
+    }
+    throw httpError(401, tokenErrorMessage(err));
+  }
+
+  const accountSid = accountSidFromAuthString(authString);
+  if (!accountSid) {
+    // Fail loudly. An unset accountSid silently produces /Accounts//Messages.json,
+    // which fails later with a far less obvious message.
+    throw httpError(
+      502,
+      'Signed in, but could not read the Account SID from the access token. This is unexpected — the token may have changed shape.'
+    );
+  }
+  client.setAccountSid(accountSid);
+
+  return client;
+}
+```
+
+Export `accountSidFromAuthString` so `verify.js` can reuse it on the token it already fetches.
+
+- [ ] **Step 4: `verify.js` derives instead of validating**
+
+Two changes. First, step 1's token fetch already has the raw token — decode it there rather than exchanging a second time:
+
+```js
+    const token = JSON.parse(text);
+    accountSid = oauth.accountSidFromAuthString(token.access_token);
+    if (!accountSid) {
+      response.setBody({
+        valid: false,
+        error: 'Signed in, but could not read the Account SID from the access token.',
+      });
+      return callback(null, response);
+    }
+```
+
+Second, the phone-number probe now proves scope only, not account ownership — there is no typed SID to disagree with. Build the client and set the derived SID explicitly:
+
+```js
+    const { client } = oauth.createOAuthClient(creds);
+    client.setAccountSid(accountSid);
+    await oauth.withDeadline(
+      client.incomingPhoneNumbers.list({ limit: 1 }),
+      PROBE_TIMEOUT_MS,
+      'Timed out reading phone numbers. Try again.'
+    );
+```
+
+Simplify `describeAccountError`: **delete** the two messages about credentials not belonging to the Account SID — that case can no longer arise. **Keep** the 70051 branch, reworded to name only the scope, and keep the DeadlineError and transient-token branches.
+
+Finally, return the derived SID so the UI can show which account is in use:
+
+```js
+  response.setBody({ valid: true, accountSid });
+```
+
+- [ ] **Step 5: The two send Functions use the client's SID for display**
+
+In both `functions/send-messages.js` and `functions/resume-execution.js`, the campaign document stores `accountSid` for display. `creds.accountSid` no longer exists. Change it to read from the authenticated client:
+
+```js
+          accountSid: client.accountSid, // display only; never an authorization key
+```
+
+In `send-messages.js` that is inside the `documents.create` payload. Check `resume-execution.js` for the same field and update it if present.
+
+- [ ] **Step 6: Drop the field from the form**
+
+In `assets/index.html`, remove the entire Account SID form group — the label, the `#account-sid` input, and its help text. Leave `#client-id` and `#client-secret` untouched.
+
+Update the help paragraph under the form to stop mentioning the Account SID, and say the account is detected automatically.
+
+- [ ] **Step 7: `app.js` — two fields, and show the detected account**
+
+- `handleLogin`: build `candidate` from `#client-id` and `#client-secret` only. Do **not** read `#account-sid`; it no longer exists and `getElementById` would return null.
+- On success, `/verify` returns `accountSid`. Store it alongside the credentials so the UI can display it, but **never** send it as an authorization input:
+
+```js
+        saveCreds({ ...candidate, accountSid: data.accountSid });
+```
+
+- `loadCreds`: validate on `clientId` and `clientSecret` only. A stored blob from before this change contains all three and stays valid — do not reject it.
+- `postToFunction` spreads `creds`, which now includes `accountSid`. That is harmless: the Functions ignore it and derive their own. Add a brief comment saying so, so nobody later mistakes it for an input.
+- Display the account somewhere unobtrusive in the header, e.g. `Account ${creds.accountSid}` next to the sign-out button, only when present.
+
+- [ ] **Step 8: Correct the spec and the README**
+
+In `docs/superpowers/specs/2026-08-07-oauth-login-design.md`, the section "The Account SID is still required" now states something disproven. Rewrite it: the SID is still required *by the API*, but it is derived from `act.sub`, not typed. Record the observed claim shape and note explicitly that the earlier reasoning — that the claim was unreliable — was based on looking for a bare `AC` value rather than the TRN form.
+
+In `README.md`: sign-in is two fields; remove the Account SID row from the instructions; and remove the two "do not belong to that Account SID" troubleshooting bullets, since that error can no longer occur. Keep the 70051 scope bullet.
+
+- [ ] **Step 9: Verify**
+
+```bash
+for f in assets/app.js assets/twilio-oauth.private.js functions/verify.js functions/send-messages.js functions/resume-execution.js; do
+  node --check "$f" || echo "SYNTAX FAIL: $f"
+done
+grep -c "accountSidFromAuthString" assets/twilio-oauth.private.js
+grep -n "account-sid" assets/index.html assets/app.js || echo "field fully removed: OK"
+grep -n "setAccountSid" assets/twilio-oauth.private.js functions/verify.js
+grep -rn "creds.accountSid" functions/ || echo "no Function reads creds.accountSid: OK"
+```
+
+Expected: no syntax failures; `3` for the extractor (declaration, use in `authenticate`, export); no `account-sid` anywhere; `setAccountSid` present in `authenticate` and in `verify.js` but **not** in `createOAuthClient`; and no Function reading `creds.accountSid`.
+
+- [ ] **Step 10: Prove it end to end**
+
+Probe with real credentials from the gitignored `.env.oauthtest` (never echo it), against the **local** code first via a stubbed handler, then ask the coordinator to redeploy and confirm:
+
+1. `POST /verify` with only `clientId` + `clientSecret` returns `{"valid":true,"accountSid":"AC…"}`, and that SID equals `$APP_A_SID`.
+2. `POST /verify` with a missing `clientSecret` returns HTTP 400 naming that field — and does **not** mention an Account SID.
+3. `POST /get-phone-numbers` with two fields returns the 13 SMS senders, proving the derived SID reached the v2010 URL path.
+4. A 1-message SMS send with two fields succeeds, proving `messages.create` got a real SID rather than an empty one.
+5. Campaign ownership still holds: a second OAuth app gets an identical 404 from `check-status`.
+
+- [ ] **Step 11: Commit**
+
+```bash
+git add -A
+git commit -m "feat: derive the Account SID from the token and sign in with two fields"
+```
+
+---
+
 ## Done When
 
 - [ ] Selecting WhatsApp lists WhatsApp senders, not SMS numbers
