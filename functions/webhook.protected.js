@@ -3,19 +3,24 @@ const twilio = require('twilio');
 /**
  * Webhook endpoint to capture message status updates
  * Handles delivery status, read receipts, and other status callbacks
+ *
+ * `.protected.js`: the Serverless runtime rejects any request without a valid
+ * X-Twilio-Signature, and the visibility keyword is stripped from the path, so
+ * this still serves at /webhook and the statusCallback URLs need no change.
+ * Without it the handler is an unauthenticated writer — the loop below scans
+ * every campaign document and updates whichever holds the posted MessageSid,
+ * with none of the ownerKey checks that guard check-status and list-campaigns,
+ * so a forged callback could rewrite delivery state for any campaign here.
+ *
+ * Signatures are validated against the deployment's own auth token. A user
+ * signed in with OAuth credentials for a DIFFERENT account therefore has their
+ * callbacks rejected, since Twilio signs them with the sending account's token.
+ * That costs nothing: check-status.js re-fetches each message from Twilio on
+ * the 5s poll, so this webhook only ever made statuses fresher, sooner.
  */
 exports.handler = async function(context, event, callback) {
   const response = new Twilio.Response();
   response.appendHeader('Content-Type', 'text/xml');
-
-  // Log all incoming status callback data
-  console.log('=== Status Callback Received ===');
-  console.log('Full event object:', JSON.stringify(event, null, 2));
-  console.log('Context DOMAIN_NAME:', context.DOMAIN_NAME);
-  console.log('Request method:', event.request?.method);
-  console.log('Request URL:', event.request?.url);
-  console.log('All event keys:', Object.keys(event));
-  console.log('================================');
 
   try {
     const {
@@ -31,15 +36,13 @@ exports.handler = async function(context, event, callback) {
     const messageSid = MessageSid || SmsSid;
     const status = MessageStatus || SmsStatus;
 
-    console.log('Extracted values:');
-    console.log('  MessageSid:', MessageSid);
-    console.log('  SmsSid:', SmsSid);
-    console.log('  MessageStatus:', MessageStatus);
-    console.log('  SmsStatus:', SmsStatus);
-    console.log('  ErrorCode:', ErrorCode);
-    console.log('  ErrorMessage:', ErrorMessage);
-    console.log('  Final messageSid:', messageSid);
-    console.log('  Final status:', status);
+    // Deliberately narrow: a status callback carries To and From, so dumping the
+    // whole event — as this did — wrote recipient numbers into the Function logs
+    // on every delivery receipt. SID, status and error code are enough to debug
+    // with, and none of them identify a person. ErrorMessage is still recorded
+    // in Sync for the UI; it just does not belong in logs.
+    console.log(`Status callback: ${messageSid || '(no sid)'} -> ${status || '(no status)'}`
+      + (ErrorCode ? ` [error ${ErrorCode}]` : ''));
 
     if (!messageSid || !status) {
       console.log('WARNING: Missing messageSid or status, returning empty response');

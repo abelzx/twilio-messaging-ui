@@ -19,9 +19,9 @@ A web application for sending messages through Twilio's Programmable Messaging A
 3. **check-status.js**: Retrieves campaign status and updates message statuses from Twilio
 4. **resume-execution.js**: Resumes interrupted campaigns from the last checkpoint
 5. **get-phone-numbers.js** / **get-content-templates.js** / **list-campaigns.js**: Populate the From dropdown, the template picker, and the campaign list
-6. **webhook.js**: Receives delivery-status callbacks from Twilio
+6. **webhook.protected.js**: Receives delivery-status callbacks from Twilio
 
-The first five receive `accountSid`, `clientId` and `clientSecret` in their POST body and build a per-request Twilio client through `assets/twilio-oauth.private.js`. `webhook.js` is the exception: Twilio calls it, not the browser, so it carries no user credentials and uses only the injected runtime credentials. Those runtime credentials (`context.ACCOUNT_SID` / `context.AUTH_TOKEN`) are used for Twilio Sync access throughout, never for the user's own account.
+The first five receive `accountSid`, `clientId` and `clientSecret` in their POST body and build a per-request Twilio client through `assets/twilio-oauth.private.js`. `webhook.protected.js` is the exception: Twilio calls it, not the browser, so it carries no user credentials and uses only the injected runtime credentials. Those runtime credentials (`context.ACCOUNT_SID` / `context.AUTH_TOKEN`) are used for Twilio Sync access throughout, never for the user's own account.
 
 ### Frontend
 
@@ -175,6 +175,10 @@ A template with no type the channel can render is omitted rather than offered, s
 
 **The browser drives the loop.** Step 5 is initiated by the page, not by Twilio — `sendMessagesBatch()` in `assets/app.js` loops until the Function reports `isComplete`. This is a deliberate consequence of never storing user credentials server-side: the Functions receive a Client ID and Secret per request and keep nothing, so no scheduled job or queue could authenticate a continuation. The tab therefore has to stay open for the duration of a campaign. Making sending fire-and-forget would mean granting the deployment standing authorization to send on the user's behalf.
 
+## License
+
+[MIT](LICENSE) © Abel Ng
+
 ## Security Considerations
 
 - **No user credential is stored server-side** — not in Twilio Sync, not in environment variables, not in logs. Earlier versions of this app wrote the user's Auth Token into a Sync Document; that store is gone.
@@ -182,6 +186,7 @@ A template with no type the channel can render is omitted rather than offered, s
 - A fresh Twilio client is built per request, so nothing leaks between callers.
 - Campaigns are owned by the OAuth Client ID that created them. Requesting another app's campaign returns 404 rather than 403, so a guessed campaign ID is not confirmed to exist.
 - The deployment holds no credentials of its own beyond the runtime credentials used for Sync, so the public Function URLs cannot be used to spend the owner's balance.
+- The status-callback endpoint is a **protected** Function, so the runtime drops any request without a valid `X-Twilio-Signature`. It is the one endpoint that writes to campaign documents without an `ownerKey` check — it matches on `MessageSid` alone — so leaving it public would let a forged callback rewrite delivery state for any campaign in the deployment. Signatures are checked against the deployment's auth token, so callbacks for a user signed in from a different account are rejected; nothing is lost, because `check-status.js` re-fetches each message from Twilio on the poll and the webhook only ever made statuses fresher, sooner.
 
 Two limits are worth stating plainly:
 
@@ -200,7 +205,7 @@ twilio-messaging-ui/
 │   ├── get-phone-numbers.js     # From dropdown
 │   ├── get-content-templates.js # SMS/MMS/WhatsApp/RCS template picker
 │   ├── list-campaigns.js        # Campaign history
-│   └── webhook.js               # Delivery status callbacks
+│   └── webhook.protected.js     # Delivery status callbacks (signature-validated)
 ├── assets/
 │   ├── index.html               # Main HTML file
 │   ├── app.js                   # Frontend JavaScript
