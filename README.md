@@ -17,6 +17,8 @@ A web app for sending message campaigns through Twilio's Programmable Messaging 
 
 Functions run on the **Node.js 24** runtime, pinned in `.twilioserverlessrc` so every deploy targets it rather than inheriting whatever the last build used.
 
+> The `@twilio/runtime-handler` pin in `package.json` reads `2.0.3`, which looks stale next to Node 24's requirement of 2.1.2 — it isn't. Twilio [upgrades the handler automatically at build time](https://www.twilio.com/docs/serverless/functions-assets/node-upgrade) for any pin at 1.2.0 or above, and the Build API confirms `2.1.2` resolved. Pinning 2.1.2 directly is not an option: it is not published on npm (the registry stops at 2.1.0), so declaring it makes `npm install` fail with `ETARGET`. Raise the pin once Twilio publishes 2.1.2.
+
 ## Setup
 
 ```bash
