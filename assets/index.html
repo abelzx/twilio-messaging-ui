@@ -159,9 +159,11 @@
                                         </div>
                                         <div id="csv-summary" class="csv-summary" hidden></div>
 
+                                        <!-- E.164: leading +, country code, digits only. Kept in step
+                                             with the CSV sample in downloadSampleCsv(). -->
                                         <textarea id="recipients" rows="6" required
-                                                  placeholder="+1234567890&#10;+0987654321&#10;+1122334455"></textarea>
-                                        <small id="recipients-help">Enter phone numbers, one per line or comma-separated</small>
+                                                  placeholder="+6512345678&#10;+6598765432&#10;+6587654321"></textarea>
+                                        <small id="recipients-help">Enter numbers in E.164 format (+6512345678), one per line or comma-separated</small>
                                     </div>
 
                                     <button type="submit" class="btn btn-primary" id="send-btn">Send Messages</button>

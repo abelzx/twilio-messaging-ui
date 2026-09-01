@@ -33,6 +33,14 @@ let recipientsPlaceholder = null;
 // The campaign currently rendered in the delivery panel, so Export CSV can use it.
 let displayedCampaign = null;
 
+/**
+ * A real Twilio message SID: two-letter prefix plus 32 hex. Sends Twilio
+ * rejected outright never got one, so send-messages.js records them under a
+ * synthetic "failed-<n>" key; this tells the two apart for display. Mirrors the
+ * same constant in functions/check-status.js.
+ */
+const MESSAGE_SID = /^[A-Z]{2}[0-9a-f]{32}$/i;
+
 // The 5s poll rebuilds whole panels with innerHTML, which destroys the scroll
 // container and snaps the user back to the top. Two defences: skip the write
 // entirely when nothing changed, and restore scrollTop when it did.
@@ -265,7 +273,7 @@ function renderCsvState() {
 
     recipientsHelp.textContent = active
         ? `Taken from ${csvUpload.fileName} — clear the CSV to type recipients instead.`
-        : 'Enter phone numbers, one per line or comma-separated';
+        : 'Enter numbers in E.164 format (+6512345678), one per line or comma-separated';
 
     // Variable inputs only matter in variables mode; a Body-mode CSV leaves them alone.
     const overrideVars = active && csvUpload.mode === 'variables';
@@ -326,7 +334,11 @@ function renderCsvState() {
  */
 function downloadSampleCsv() {
     const template = selectedTemplate();
-    const numbers = ['+1234567890', '+0987654321'];  // same placeholders as the textarea
+    // Valid E.164, matching the Recipients placeholder: leading +, country code,
+    // no spaces or punctuation. The previous examples were malformed — +1 with
+    // nine digits, and one with a leading zero after the + — so copying the
+    // shape from the sample produced numbers Twilio would reject.
+    const numbers = ['+6512345678', '+6598765432'];
     let rows;
 
     if (template) {
@@ -1494,6 +1506,10 @@ function displayMessageDetails(campaign) {
         const errorCode = statusInfo.errorCode || '-';
         const errorMessage = (statusInfo.errorMessage || '-').replace(/"/g, '&quot;');
         const to = statusInfo.to || '-';
+        // Rejected sends are keyed "failed-<n>" because Twilio never issued a
+        // SID. Showing that internal key in a column headed "Message SID" would
+        // read as a real identifier, so say what actually happened instead.
+        const sidLabel = MESSAGE_SID.test(sid) ? sid : 'not accepted';
 
         const formatDate = (dateValue) => {
             if (!dateValue) return 'N/A';
@@ -1506,7 +1522,7 @@ function displayMessageDetails(campaign) {
 
         html += `
             <tr>
-                <td style="font-family: monospace; font-size: 11px; word-break: break-all;">${sid}</td>
+                <td style="font-family: monospace; font-size: 11px; word-break: break-all;">${sidLabel}</td>
                 <td>${to}</td>
                 <td><span class="status-badge ${statusClass}">${status}</span></td>
                 <td>${delivered}</td>
@@ -1663,6 +1679,7 @@ function interpretCsv(raw, template) {
     let fellBack = 0;
     const seen = new Set();
     let duplicates = 0;
+    let notE164 = 0;
 
     body.forEach((cells, i) => {
         const line = i + 2;  // 1-based, and the header occupies line 1
@@ -1677,6 +1694,12 @@ function interpretCsv(raw, template) {
             result.skipped.push({ line, reason: 'no recipient number' });
             return;
         }
+
+        // Flagged, not skipped. Twilio wants E.164, but a Messaging Service with
+        // a configured geography can accept national formats, so refusing them
+        // outright would reject numbers that would in fact deliver. A channel
+        // prefix is stripped first — a CSV may legitimately carry "whatsapp:+65…".
+        if (!/^\+[1-9]\d{6,14}$/.test(to.replace(/^[a-z]+:/i, ''))) notE164++;
 
         const message = { to };
 
@@ -1717,6 +1740,9 @@ function interpretCsv(raw, template) {
 
     if (blankCells) {
         result.warnings.push(`${blankCells} variable cell${blankCells === 1 ? '' : 's'} left blank — ${blankCells === 1 ? 'it' : 'they'} will render as empty text.`);
+    }
+    if (notE164) {
+        result.warnings.push(`${notE164} number${notE164 === 1 ? '' : 's'} ${notE164 === 1 ? 'is' : 'are'} not in E.164 format (a leading + and country code, e.g. +6512345678) and may be rejected.`);
     }
     if (fellBack) {
         result.warnings.push(`${fellBack} row${fellBack === 1 ? '' : 's'} had no message text and will use the message body typed above.`);
@@ -1780,7 +1806,7 @@ function exportMessageStatusCsv() {
     });
 
     const rows = entries.map(([sid, s]) => ({
-        'Message SID': sid,
+        'Message SID': MESSAGE_SID.test(sid) ? sid : 'not accepted',
         'To': s.to || '',
         'Status': s.status || '',
         'Delivered': s.delivered ? 'Yes' : 'No',

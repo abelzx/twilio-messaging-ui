@@ -71,6 +71,8 @@ Typing recipients sends everyone the same thing. **Upload CSV** instead to give 
 | A content template | `Number,{{1}},{{2}}` | that recipient's template variables |
 | No template | `Number,Body` | that recipient's message text |
 
+Recipient numbers go in **E.164** format — a leading `+`, country code, digits only, no spaces or punctuation, as in `+6512345678`. Anything else is flagged in the summary as likely to be rejected, but still sent: a Messaging Service with a configured geography can accept national formats, so refusing them outright would block numbers that would in fact deliver.
+
 Header matching is deliberately forgiving. The recipient column may be `Number`, `To`, `Phone`, `Phone Number`, `Recipient` or `MSISDN`; message text may be `Body`, `Message` or `Text`; and a variable column may be written `{{1}}`, `{{ 1 }}` or bare `1` — named variables like `{{name}}` work the same way. Case is ignored throughout. Quoted fields are handled, so a message body containing a comma is fine.
 
 While a file is loaded it is the single source of truth: the Recipients box and the variable inputs are disabled and dimmed, and **Clear CSV** returns to manual entry. Because the columns map to a specific template's variables, changing the template re-checks the file rather than sending the old mapping against new variables.

@@ -288,6 +288,16 @@ async function sendMessagesChunk(params) {
         };
       } else {
         failed++;
+        // Keyed by array position, as in send-messages.js — a rejected create()
+        // has no SID, and without an entry the failure is invisible in both the
+        // recomputed counters and the delivery table.
+        campaignData.statuses[`failed-${result.index}`] = {
+          status: 'failed',
+          to: result.to,
+          errorCode: result.errorCode || null,
+          errorMessage: result.error || 'Twilio rejected the message',
+          sentAt: new Date().toISOString()
+        };
       }
     });
 

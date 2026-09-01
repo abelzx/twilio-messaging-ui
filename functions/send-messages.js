@@ -288,6 +288,20 @@ exports.handler = async function(context, event, callback) {
           };
         } else {
           failed++;
+          // A rejected create() has no message SID, so it is keyed by its
+          // position in the array — stable, so re-running a chunk overwrites
+          // rather than duplicates. Without an entry here the failure was
+          // invisible twice over: check-status.js recomputes `failed` purely
+          // from this map, so it reset the count to zero, and the delivery
+          // table renders from this map, so the row never appeared. A number
+          // rejected for not being E.164 reported as "0 failed, no results".
+          campaignData.statuses[`failed-${result.index}`] = {
+            status: 'failed',
+            to: result.to,
+            errorCode: result.errorCode || null,
+            errorMessage: result.error || 'Twilio rejected the message',
+            sentAt: new Date().toISOString()
+          };
         }
       });
 

@@ -6,6 +6,13 @@
 const twilio = require('twilio');
 const oauth = require(Runtime.getAssets()['/twilio-oauth.js'].path);
 
+/**
+ * A real Twilio message SID: two-letter prefix (SM, MM) plus 32 hex. Used to
+ * tell fetchable messages apart from the synthetic "failed-<n>" keys that
+ * record a send Twilio refused before issuing a SID.
+ */
+const MESSAGE_SID = /^[A-Z]{2}[0-9a-f]{32}$/i;
+
 exports.handler = async function(context, event, callback) {
   const response = new Twilio.Response();
   response.appendHeader('Access-Control-Allow-Origin', '*');
@@ -66,6 +73,15 @@ exports.handler = async function(context, event, callback) {
     // Merge with existing webhook data to preserve delivered/read flags
     const statusUpdates = {};
     for (const [sid, statusInfo] of Object.entries(campaignData.statuses || {})) {
+      // Sends Twilio rejected outright have no SID and are keyed "failed-<n>"
+      // by send-messages.js. There is nothing to fetch, and asking would turn a
+      // recorded rejection into a generic lookup error, losing the real reason.
+      // Their stored status is already terminal, so the counter below sees them.
+      if (!MESSAGE_SID.test(sid)) {
+        statusUpdates[sid] = statusInfo;
+        continue;
+      }
+
       try {
         const message = await client.messages(sid).fetch();
         statusUpdates[sid] = {
