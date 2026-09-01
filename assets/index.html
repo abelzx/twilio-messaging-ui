@@ -148,6 +148,10 @@
                                     </div>
 
                                     <button type="submit" class="btn btn-primary" id="send-btn">Send Messages</button>
+                                    <!-- The chunk loop runs in this tab (see sendMessagesBatch in
+                                         app.js), so closing it halts the campaign. app.js promotes
+                                         this note to a live warning while a send is in flight. -->
+                                    <p class="send-note" id="send-note">Keep this tab open while sending — the campaign is driven from your browser, not from Twilio.</p>
                                 </form>
                             </div>
                         </div>

@@ -328,6 +328,36 @@ const CHANNEL_TEMPLATE_HELP = {
     mms: 'Only templates with a media type are listed — a text-only template has no media for MMS to send.',
 };
 
+// Idle copy lives in index.html so it renders as plain markup; captured on first
+// use so the two wordings never drift apart in two files.
+let sendNoteIdle = null;
+
+const SEND_NOTE_ACTIVE = 'Sending — keep this tab open. Closing it stops the campaign, '
+    + 'though progress is saved and you can resume from Campaigns.';
+
+/**
+ * Single owner of the Send button's state, and of the advisory beneath it.
+ *
+ * The chunk loop lives in sendMessagesBatch() in this file, not on the server:
+ * each round trip sends what fits in one 9-second Function invocation and the
+ * browser initiates the next. Credentials live only in sessionStorage, so
+ * nothing server-side could continue the campaign on its own. Closing the tab
+ * therefore halts sending — hence the promotion to a warning while in flight.
+ */
+function setSendingState(sending) {
+    const btn = document.getElementById('send-btn');
+    if (btn) {
+        btn.disabled = sending;
+        btn.textContent = sending ? 'Sending...' : 'Send Messages';
+    }
+
+    const note = document.getElementById('send-note');
+    if (!note) return;
+    if (sendNoteIdle === null) sendNoteIdle = note.textContent;
+    note.textContent = sending ? SEND_NOTE_ACTIVE : sendNoteIdle;
+    note.classList.toggle('send-note--active', sending);
+}
+
 function setSenderHelp(text, isProblem) {
     const help = document.getElementById('from-number-help');
     if (!help) return;
@@ -763,9 +793,7 @@ function escapeHtml(value) {
 async function handleSendMessages(e) {
     e.preventDefault();
     
-    const sendBtn = document.getElementById('send-btn');
-    sendBtn.disabled = true;
-    sendBtn.textContent = 'Sending...';
+    setSendingState(true);
 
     const channel = document.getElementById('channel').value;
     const fromInput = document.getElementById('from-number');
@@ -780,16 +808,14 @@ async function handleSendMessages(e) {
     // Validate from field
     if (!from) {
         alert('Please select a phone number or enter a Sender ID');
-        sendBtn.disabled = false;
-        sendBtn.textContent = 'Send Messages';
+        setSendingState(false);
         return;
     }
 
     // A template with no body and no content template selected is invalid
     if (!contentSid && !body) {
         alert('Please enter a message body or select a content template');
-        sendBtn.disabled = false;
-        sendBtn.textContent = 'Send Messages';
+        setSendingState(false);
         return;
     }
 
@@ -801,8 +827,7 @@ async function handleSendMessages(e) {
 
     if (recipients.length === 0) {
         alert('Please enter at least one recipient');
-        sendBtn.disabled = false;
-        sendBtn.textContent = 'Send Messages';
+        setSendingState(false);
         return;
     }
 
@@ -838,8 +863,7 @@ async function handleSendMessages(e) {
         await sendMessagesBatch(messages, channel, from, campaignName);
     } catch (error) {
         alert('Error: ' + error.message);
-        sendBtn.disabled = false;
-        sendBtn.textContent = 'Send Messages';
+        setSendingState(false);
     }
 }
 
@@ -892,8 +916,7 @@ async function sendMessagesBatch(messages, channel, from, campaignName) {
     // Start auto-refresh
     startStatusAutoRefresh();
     
-    document.getElementById('send-btn').disabled = false;
-    document.getElementById('send-btn').textContent = 'Send Messages';
+    setSendingState(false);
 }
 
 async function checkCampaignStatus() {

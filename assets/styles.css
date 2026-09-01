@@ -1365,6 +1365,29 @@ input::placeholder, textarea::placeholder { color: var(--text-muted); }
 
 .field-help--problem { color: var(--danger); }
 
+/* Advisory under the Send button. Quiet while idle — it is a caveat, not an
+   instruction — then promoted to a warning for the one window where acting on
+   it matters, which is while the tab is actually driving a send. */
+.send-note {
+    display: block;
+    margin: 10px 0 0;
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--text-secondary);
+}
+
+/* The tinted box carries the urgency, so the text stays --text rather than
+   --warning: warning-orange on this tint measures ~3.1:1, short of AA for copy
+   this size. Border and background do the signalling instead. */
+.send-note--active {
+    padding: 10px 12px;
+    border-radius: var(--radius);
+    border: 1px solid rgba(228, 98, 22, 0.35);
+    background: rgba(228, 98, 22, 0.08);
+    color: var(--text);
+    font-weight: 500;
+}
+
 /* Message SIDs are data, not prose — set them in the mono face so they can be
    compared column-wise. */
 .results-table td:first-child,

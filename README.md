@@ -1,14 +1,13 @@
 # Twilio Messaging UI
 
-A modern web application for sending messages through Twilio's Programmable Messaging API with support for all messaging channels (SMS, WhatsApp, Facebook Messenger). Built with Twilio Serverless Functions and Assets, featuring resumable execution to handle the 10-second function timeout limit.
+A web application for sending messages through Twilio's Programmable Messaging API with support for all messaging channels (SMS, WhatsApp, Facebook Messenger). Built with Twilio Serverless Functions and Assets.
 
 ## Features
 
 - **Multi-Channel Support**: Send messages via SMS, WhatsApp, and Facebook Messenger
 - **OAuth Authentication**: Sign in with an account-level [OAuth app](https://www.twilio.com/docs/iam/oauth-apps/account-oauth-apps) using the Client Credentials grant — scoped, independently revocable, and never stored server-side
-- **Resumable Execution**: Automatically handles 10-second function timeout by chunking messages and resuming from checkpoints
+- **Resumable Execution**: Automatically handles 10-second function timeout by chunking messages and resuming from checkpoints — driven from the browser, so [the tab stays open while sending](#2-send-messages)
 - **Progress Tracking**: Real-time campaign status updates using Twilio Sync
-- **Modern UI**: Clean, responsive interface built with vanilla JavaScript
 - **State Management**: Uses Twilio Sync to store campaign progress. No user credential is stored server-side.
 
 ## Architecture
@@ -118,6 +117,13 @@ Credentials are held in the browser's `sessionStorage` for the life of the tab a
 3. Enter your message body
 4. Enter recipient numbers (one per line or comma-separated)
 5. Click "Send Messages"
+6. **Keep the browser tab open until the campaign finishes**
+
+> **Keep the tab open while sending.** The chunk loop runs in your browser, not on Twilio. Each request sends what fits in one 9-second Function invocation and returns; the page then initiates the next one. Your OAuth credentials live only in this tab's `sessionStorage`, so nothing server-side can carry the campaign on by itself.
+>
+> Closing the tab, navigating away, or letting the machine sleep stops sending. Switching to another tab or app is fine — background tabs keep running, though browsers throttle timers to roughly one per second, which matches the delay already in the loop.
+>
+> Nothing is lost if sending is interrupted: progress is checkpointed to Twilio Sync, so the campaign appears as **In Progress** with a **Resume** button that picks up from the last index. No recipient is messaged twice. Note that closing the tab also clears your credentials, so you will need to sign in again before resuming.
 
 ### 3. Monitor Progress
 
@@ -166,6 +172,8 @@ A template with no type the channel can render is omitted rather than offered, s
 4. **Checkpointing**: Before timeout, saves current index to Sync
 5. **Resume**: Next execution starts from the saved checkpoint
 6. **Completion**: Process continues until all messages are sent
+
+**The browser drives the loop.** Step 5 is initiated by the page, not by Twilio — `sendMessagesBatch()` in `assets/app.js` loops until the Function reports `isComplete`. This is a deliberate consequence of never storing user credentials server-side: the Functions receive a Client ID and Secret per request and keep nothing, so no scheduled job or queue could authenticate a continuation. The tab therefore has to stay open for the duration of a campaign. Making sending fire-and-forget would mean granting the deployment standing authorization to send on the user's behalf.
 
 ## Security Considerations
 
