@@ -140,11 +140,28 @@
                                         <small id="message-body-help">Required if no content template is selected</small>
                                     </div>
 
-                                    <div class="form-group">
+                                    <div class="form-group" id="recipients-group">
                                         <label for="recipients">Recipients</label>
-                                        <textarea id="recipients" rows="6" required 
+
+                                        <!-- CSV upload. Personalises per recipient: with a template
+                                             selected the columns are its variables, otherwise a Body
+                                             column carries each recipient's own text. While a file is
+                                             loaded it is the single source of truth — the textarea and
+                                             the variable inputs above are disabled. -->
+                                        <div class="csv-upload">
+                                            <input type="file" id="csv-file" class="csv-file-input"
+                                                   accept=".csv,text/csv">
+                                            <label for="csv-file" class="btn btn-secondary csv-btn">Upload CSV</label>
+                                            <button type="button" id="csv-sample-btn"
+                                                    class="btn btn-secondary csv-btn">Download sample</button>
+                                            <button type="button" id="csv-clear-btn"
+                                                    class="btn btn-secondary csv-btn" hidden>Clear CSV</button>
+                                        </div>
+                                        <div id="csv-summary" class="csv-summary" hidden></div>
+
+                                        <textarea id="recipients" rows="6" required
                                                   placeholder="+1234567890&#10;+0987654321&#10;+1122334455"></textarea>
-                                        <small>Enter phone numbers, one per line or comma-separated</small>
+                                        <small id="recipients-help">Enter phone numbers, one per line or comma-separated</small>
                                     </div>
 
                                     <button type="submit" class="btn btn-primary" id="send-btn">Send Messages</button>

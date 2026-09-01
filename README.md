@@ -62,6 +62,21 @@ Credentials are held in the tab's `sessionStorage` and sent with each request. N
 
 Pick a channel, choose a sender, enter a message body or select a content template, paste recipients one per line or comma-separated, and send.
 
+#### Personalising per recipient with a CSV
+
+Typing recipients sends everyone the same thing. **Upload CSV** instead to give each recipient their own template variables or their own message text. **Download sample** generates a correctly-shaped file for whatever is currently selected, so the header never has to be guessed.
+
+| Selected | CSV header | Each row supplies |
+| --- | --- | --- |
+| A content template | `Number,{{1}},{{2}}` | that recipient's template variables |
+| No template | `Number,Body` | that recipient's message text |
+
+Header matching is deliberately forgiving. The recipient column may be `Number`, `To`, `Phone`, `Phone Number`, `Recipient` or `MSISDN`; message text may be `Body`, `Message` or `Text`; and a variable column may be written `{{1}}`, `{{ 1 }}` or bare `1` — named variables like `{{name}}` work the same way. Case is ignored throughout. Quoted fields are handled, so a message body containing a comma is fine.
+
+While a file is loaded it is the single source of truth: the Recipients box and the variable inputs are disabled and dimmed, and **Clear CSV** returns to manual entry. Because the columns map to a specific template's variables, changing the template re-checks the file rather than sending the old mapping against new variables.
+
+Rows with a problem are skipped and listed by line number — a missing number, or a column count that doesn't match the header — and the rest still send. A blank variable cell sends as empty text rather than falling back to the template's sample value, which would put someone else's placeholder data in a real message. A blank `Body` cell does fall back to the message body typed above, and the summary says how many rows that affected.
+
 > **Keep the tab open while sending.** The chunk loop runs in your browser, not on Twilio. Each request sends what fits in one 9-second Function invocation and returns; the page then initiates the next. Your credentials live only in this tab, so nothing server-side can carry the campaign on by itself.
 >
 > Closing the tab, navigating away, or letting the machine sleep stops sending. Switching to another tab or app is fine — background tabs keep running, though browsers throttle timers to about one per second, which matches the delay already in the loop.

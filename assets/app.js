@@ -16,6 +16,20 @@ let statusRefreshInterval = null;
 // Content templates loaded for the current channel (full objects from the API)
 let loadedTemplates = [];
 
+/**
+ * The uploaded CSV, or null in manual mode.
+ *
+ * `raw` holds the parsed rows verbatim so the file can be re-interpreted when
+ * the template changes — which column feeds which variable is a property of the
+ * template, not the file, so switching templates must re-map rather than send
+ * the previous mapping against new variables.
+ */
+let csvUpload = null;  // { fileName, raw, ...interpretCsv() result }
+
+// The Recipients placeholder as authored in index.html, captured before the CSV
+// state overwrites it so manual mode can be restored verbatim.
+let recipientsPlaceholder = null;
+
 // The campaign currently rendered in the delivery panel, so Export CSV can use it.
 let displayedCampaign = null;
 
@@ -172,6 +186,176 @@ function setupEventListeners() {
     if (exportCsvBtn) {
         exportCsvBtn.addEventListener('click', exportMessageStatusCsv);
     }
+
+    // CSV recipient upload
+    document.getElementById('csv-file').addEventListener('change', handleCsvFile);
+    document.getElementById('csv-sample-btn').addEventListener('click', downloadSampleCsv);
+    document.getElementById('csv-clear-btn').addEventListener('click', clearCsvUpload);
+}
+
+/** Read the chosen file, interpret it against the current template, and report. */
+async function handleCsvFile(event) {
+    const file = event.target.files && event.target.files[0];
+    if (!file) return;
+
+    try {
+        const raw = parseCsv(await file.text());
+        csvUpload = { fileName: file.name, raw, ...interpretCsv(raw, selectedTemplate()) };
+    } catch (error) {
+        console.error('Error reading CSV:', error);
+        csvUpload = { fileName: file.name, raw: [], rows: [], total: 0, skipped: [], warnings: [],
+            error: `Could not read that file: ${error.message}` };
+    }
+
+    // Reset the input so re-picking the same filename fires `change` again.
+    event.target.value = '';
+    renderCsvState();
+}
+
+/** Re-map an already-loaded file after the template or channel changed. */
+function reinterpretCsv() {
+    if (!csvUpload) return;
+    csvUpload = { fileName: csvUpload.fileName, raw: csvUpload.raw,
+        ...interpretCsv(csvUpload.raw, selectedTemplate()) };
+    renderCsvState();
+}
+
+function clearCsvUpload() {
+    csvUpload = null;
+    renderCsvState();
+}
+
+/** The currently selected template object, or null. */
+function selectedTemplate() {
+    const sid = document.getElementById('content-template').value;
+    return sid ? loadedTemplates.find(t => t.sid === sid) || null : null;
+}
+
+/** True when a CSV is loaded and usable, so it should drive the send. */
+function csvIsActive() {
+    return Boolean(csvUpload && !csvUpload.error && csvUpload.rows.length);
+}
+
+/**
+ * Paint the summary panel and mark the inputs the CSV has superseded. The
+ * textarea keeps its `required` attribute only in manual mode, or the browser
+ * would block submit on an empty field the user was told to ignore.
+ */
+function renderCsvState() {
+    const summary = document.getElementById('csv-summary');
+    const clearBtn = document.getElementById('csv-clear-btn');
+    const recipients = document.getElementById('recipients');
+    const recipientsHelp = document.getElementById('recipients-help');
+    const variables = document.getElementById('template-variables');
+
+    const active = csvIsActive();
+
+    clearBtn.hidden = !csvUpload;
+    recipients.disabled = active;
+    recipients.classList.toggle('csv-overridden', active);
+    if (active) recipients.removeAttribute('required');
+    else recipients.setAttribute('required', 'required');
+
+    // A dimmed empty box reads as broken rather than superseded, so say what is
+    // standing in for it. Stashed on first use so the original is restorable.
+    if (recipientsPlaceholder === null) recipientsPlaceholder = recipients.placeholder;
+    recipients.placeholder = active
+        ? `Using ${csvUpload.fileName} — ${csvUpload.rows.length} recipient${csvUpload.rows.length === 1 ? '' : 's'}`
+        : recipientsPlaceholder;
+
+    recipientsHelp.textContent = active
+        ? `Taken from ${csvUpload.fileName} — clear the CSV to type recipients instead.`
+        : 'Enter phone numbers, one per line or comma-separated';
+
+    // Variable inputs only matter in variables mode; a Body-mode CSV leaves them alone.
+    const overrideVars = active && csvUpload.mode === 'variables';
+    if (variables) {
+        variables.classList.toggle('csv-overridden', overrideVars);
+        variables.querySelectorAll('.template-variable-input')
+            .forEach(input => { input.disabled = overrideVars; });
+    }
+
+    if (!csvUpload) {
+        summary.hidden = true;
+        summary.innerHTML = '';
+        updateMessageBodyRequirement();
+        return;
+    }
+
+    summary.hidden = false;
+    summary.className = 'csv-summary'
+        + (csvUpload.error ? ' csv-summary--error'
+            : (csvUpload.skipped.length || csvUpload.warnings.length) ? ' csv-summary--warn' : '');
+
+    const parts = [`<span class="csv-summary__file">${escapeHtml(csvUpload.fileName)}</span>`];
+
+    if (csvUpload.error) {
+        parts.push(` — ${escapeHtml(csvUpload.error)}`);
+    } else {
+        const n = csvUpload.rows.length;
+        parts.push(` <span class="csv-summary__count">— ${n} of ${csvUpload.total} row${csvUpload.total === 1 ? '' : 's'} loaded`
+            + `, sending ${csvUpload.mode === 'variables' ? 'template variables' : 'a message body'} per recipient.</span>`);
+
+        if (csvUpload.mode === 'variables' && csvUpload.columns.length) {
+            parts.push(`<div class="csv-summary__map">${csvUpload.columns
+                .map(c => escapeHtml(`{{${c.key}}}`)).join('  ·  ')}</div>`);
+        }
+
+        if (csvUpload.skipped.length) {
+            const shown = csvUpload.skipped.slice(0, 10);
+            const rest = csvUpload.skipped.length - shown.length;
+            parts.push(`<ul class="csv-summary__list">${shown
+                .map(s => `<li>Line ${s.line} skipped — ${escapeHtml(s.reason)}</li>`).join('')
+                }${rest > 0 ? `<li>and ${rest} more</li>` : ''}</ul>`);
+        }
+
+        if (csvUpload.warnings.length) {
+            parts.push(`<ul class="csv-summary__list">${csvUpload.warnings
+                .map(w => `<li>${escapeHtml(w)}</li>`).join('')}</ul>`);
+        }
+    }
+
+    summary.innerHTML = parts.join('');
+    updateMessageBodyRequirement();
+}
+
+/**
+ * A blank CSV the user fills in. Columns come from the selected template's own
+ * variables, so the header always matches what the send expects, and the two
+ * example rows are seeded from the template's sample values where it has them.
+ */
+function downloadSampleCsv() {
+    const template = selectedTemplate();
+    const numbers = ['+1234567890', '+0987654321'];  // same placeholders as the textarea
+    let rows;
+
+    if (template) {
+        const vars = extractVariables(template);
+        if (!vars.length) {
+            rows = numbers.map(Number_ => ({ Number: Number_ }));
+        } else {
+            const samples = template.variables || {};
+            // Row 1 shows the template's own sample values so the expected kind
+            // of content is obvious; row 2 is left as visible fill-in slots. Two
+            // rows that differ are the point — they demonstrate that these vary
+            // per recipient, which two identical rows would not.
+            rows = numbers.map((num, i) => {
+                const row = { Number: num };
+                vars.forEach(({ key }) => {
+                    const sample = samples[key] != null ? String(samples[key]) : '';
+                    row[`{{${key}}}`] = i === 0 && sample ? sample : `<your {{${key}}} here>`;
+                });
+                return row;
+            });
+        }
+    } else {
+        rows = numbers.map((num, i) => ({ Number: num, Body: `Your message for recipient ${i + 1}` }));
+    }
+
+    const label = template
+        ? (template.friendlyName || 'template').replace(/[^a-z0-9._-]+/gi, '-').slice(0, 40)
+        : 'message-body';
+    downloadCsv(toCsv(rows), `sample-recipients-${label}.csv`);
 }
 
 async function handleLogin(e) {
@@ -503,6 +687,9 @@ async function handleChannelChange() {
     }
 
     updateMessageBodyRequirement();
+    // The channel switch may have changed the template selection out from under
+    // a loaded CSV, so re-map it against whatever is selected now.
+    reinterpretCsv();
 }
 
 // Populate the status filter dropdown with the distinct statuses present in the
@@ -565,10 +752,16 @@ function updateMessageBodyRequirement() {
     const messageBody = document.getElementById('message-body');
     const messageBodyHelp = document.getElementById('message-body-help');
     const templateSelected = !!document.getElementById('content-template').value;
+    // A Body-mode CSV carries the text per recipient, so the single field is
+    // then only a fallback for rows whose own cell is blank.
+    const csvSuppliesBody = csvIsActive() && csvUpload.mode === 'body';
 
     if (templateSelected) {
         messageBody.removeAttribute('required');
         messageBodyHelp.textContent = 'Optional when using a content template';
+    } else if (csvSuppliesBody) {
+        messageBody.removeAttribute('required');
+        messageBodyHelp.textContent = 'Taken per recipient from the CSV; used as a fallback for blank cells';
     } else {
         messageBody.setAttribute('required', 'required');
         messageBodyHelp.textContent = 'Required if no content template is selected';
@@ -591,14 +784,17 @@ function handleTemplateSelect() {
     updateMessageBodyRequirement();
     clearTemplateDetails();
 
-    const sid = document.getElementById('content-template').value;
-    if (!sid) return;
+    const template = selectedTemplate();
+    if (template) {
+        renderTemplatePreview(template);
+        renderTemplateVariableInputs(template);
+    }
 
-    const template = loadedTemplates.find(t => t.sid === sid);
-    if (!template) return;
-
-    renderTemplatePreview(template);
-    renderTemplateVariableInputs(template);
+    // Which column feeds which variable depends on the template, so an already
+    // loaded CSV is re-mapped here rather than sent against the old mapping.
+    // This runs after the variable inputs are rebuilt, because renderCsvState
+    // disables them and the rebuild would otherwise discard that.
+    reinterpretCsv();
 }
 
 // Build a readable preview from a template's `types` object.
@@ -790,6 +986,36 @@ function escapeHtml(value) {
 }
 
 
+/**
+ * Build one entry of the `messages` array the Functions consume.
+ *
+ * `row` is { to, body?, contentVariables? } — a bare { to } for a typed
+ * recipient, or a CSV row carrying its own text or variables. Row values take
+ * precedence; the form values fall through for anything the row omits.
+ *
+ * Only WhatsApp is prefixed here. The other channels' prefixing happens
+ * server-side in send-messages.js, which also resolves a Messaging Service
+ * sender, so duplicating either rule here would risk them drifting apart.
+ */
+function buildMessage(row, { channel, from, contentSid, body, contentVariables }) {
+    const wa = (value) => (value.startsWith('whatsapp:') ? value : `whatsapp:${value}`);
+    const message = {
+        to: channel === 'whatsapp' ? wa(row.to) : row.to,
+        from: channel === 'whatsapp' ? wa(from) : from
+    };
+
+    if (contentSid) {
+        message.contentSid = contentSid;
+        const vars = row.contentVariables || contentVariables;
+        if (vars) message.contentVariables = vars;
+    }
+
+    const text = row.body || body;
+    if (text) message.body = text;
+
+    return message;
+}
+
 async function handleSendMessages(e) {
     e.preventDefault();
     
@@ -805,6 +1031,8 @@ async function handleSendMessages(e) {
     const contentSid = document.getElementById('content-template').value;
     const contentVariables = contentSid ? getSelectedContentVariables() : null;
 
+    const usingCsv = csvIsActive();
+
     // Validate from field
     if (!from) {
         alert('Please select a phone number or enter a Sender ID');
@@ -812,18 +1040,27 @@ async function handleSendMessages(e) {
         return;
     }
 
-    // A template with no body and no content template selected is invalid
-    if (!contentSid && !body) {
+    // A loaded-but-unusable CSV is reported before the generic checks below: it
+    // is the actual blocker, and its message says what is wrong with the file.
+    if (csvUpload && !usingCsv) {
+        alert(csvUpload.error || 'The uploaded CSV has no usable rows. Fix it and re-upload, or clear it to type recipients instead.');
+        setSendingState(false);
+        return;
+    }
+
+    // Every message needs something to say: a template, a literal body, or —
+    // with a CSV loaded — a per-row body from the file.
+    if (!contentSid && !body && !usingCsv) {
         alert('Please enter a message body or select a content template');
         setSendingState(false);
         return;
     }
 
-    // Parse recipients
-    const recipients = recipientsText
-        .split(/[\n,]+/)
-        .map(r => r.trim())
-        .filter(r => r.length > 0);
+    // Parse recipients — from the CSV when one is loaded, else the textarea.
+    const recipients = usingCsv
+        ? csvUpload.rows
+        : recipientsText.split(/[\n,]+/).map(r => r.trim()).filter(r => r.length > 0)
+            .map(to => ({ to }));
 
     if (recipients.length === 0) {
         alert('Please enter at least one recipient');
@@ -831,30 +1068,12 @@ async function handleSendMessages(e) {
         return;
     }
 
-    // Format messages array
-    const messages = recipients.map(to => {
-        const message = {
-            to: channel === 'whatsapp' && !to.startsWith('whatsapp:')
-                ? `whatsapp:${to}`
-                : to,
-            from: channel === 'whatsapp' && !from.startsWith('whatsapp:')
-                ? `whatsapp:${from}`
-                : from
-        };
-
-        if (contentSid) {
-            message.contentSid = contentSid;
-            if (contentVariables) {
-                message.contentVariables = contentVariables;
-            }
-        }
-
-        if (body) {
-            message.body = body;
-        }
-
-        return message;
-    });
+    // Format messages array. Per-recipient values from the CSV win over the
+    // single form values, which then act as the fallback for whatever a row
+    // does not carry.
+    const messages = recipients.map(row => buildMessage(row, {
+        channel, from, contentSid, body, contentVariables
+    }));
 
     // Generate campaign ID
     currentCampaignId = `campaign_${Date.now()}`;
@@ -942,54 +1161,6 @@ async function checkCampaignStatus() {
 }
 
 
-async function resumeCampaign() {
-    const channel = document.getElementById('channel').value;
-    const fromInput = document.getElementById('from-number');
-    const fromSelect = document.getElementById('from-number-select');
-    const from = fromSelect.value || fromInput.value.trim();
-    const body = document.getElementById('message-body').value.trim();
-    const contentTemplateSid = document.getElementById('content-template').value;
-    const contentVariables = contentTemplateSid ? getSelectedContentVariables() : null;
-    const recipientsText = document.getElementById('recipients').value.trim();
-
-    const recipients = recipientsText
-        .split(/[\n,]+/)
-        .map(r => r.trim())
-        .filter(r => r.length > 0);
-
-    const messages = recipients.map(to => {
-        const message = {
-            to: channel === 'whatsapp' && !to.startsWith('whatsapp:') 
-                ? `whatsapp:${to}` 
-                : to,
-            from: channel === 'whatsapp' && !from.startsWith('whatsapp:')
-                ? `whatsapp:${from}`
-                : from
-        };
-
-        // Add content template if selected
-        if (contentTemplateSid) {
-            message.contentSid = contentTemplateSid;
-            if (contentVariables) {
-                message.contentVariables = contentVariables;
-            }
-        }
-
-        // Add body if provided
-        if (body) {
-            message.body = body;
-        }
-
-        return message;
-    });
-
-    try {
-        await sendMessagesBatch(messages, channel, from);
-    } catch (error) {
-        alert('Error resuming: ' + error.message);
-    }
-}
-
 async function resumeCampaignById(campaignId, event) {
     if (!creds) {
         alert('Please sign in to resume campaigns');
@@ -1072,8 +1243,7 @@ function showResumeOption() {
     loadCampaigns();
 }
 
-// Make resumeCampaign functions available globally
-window.resumeCampaign = resumeCampaign;
+// resumeCampaignById is reached from an onclick in the campaign list markup.
 window.resumeCampaignById = resumeCampaignById;
 
 // Campaign listing functions
@@ -1359,6 +1529,206 @@ function displayMessageDetails(campaign) {
     withPreservedScroll(messageDetailsContent, '.message-status-scroll', () => {
         messageDetailsContent.innerHTML = html;
     });
+}
+
+/**
+ * The inverse of toCsv(): parse CSV text into an array of row-arrays.
+ *
+ * Written against what spreadsheets actually emit rather than the happy path —
+ * `text.split(',')` breaks on the first quoted field containing a comma, which
+ * a message body very often does. Handles quoted fields spanning commas and
+ * newlines, "" as an escaped quote, CRLF or LF, and a leading BOM (downloadCsv
+ * writes one, so our own sample has to survive a round trip). Wholly blank
+ * lines are dropped; a row of empty cells is not, since that is real if ragged
+ * data the caller should get to reject.
+ */
+function parseCsv(text) {
+    const src = String(text).replace(/^﻿/, '');
+    const rows = [];
+    let row = [];
+    let field = '';
+    let quoted = false;
+
+    const endField = () => { row.push(field); field = ''; };
+    const endRow = () => {
+        endField();
+        // A trailing newline yields one final [''] which is not a real row.
+        if (row.length > 1 || row[0] !== '') rows.push(row);
+        row = [];
+    };
+
+    for (let i = 0; i < src.length; i++) {
+        const ch = src[i];
+
+        if (quoted) {
+            if (ch === '"') {
+                if (src[i + 1] === '"') { field += '"'; i++; }  // escaped quote
+                else quoted = false;                            // closing quote
+            } else {
+                field += ch;
+            }
+            continue;
+        }
+
+        if (ch === '"' && field === '') { quoted = true; }
+        else if (ch === ',') { endField(); }
+        else if (ch === '\r') { if (src[i + 1] === '\n') i++; endRow(); }
+        else if (ch === '\n') { endRow(); }
+        else { field += ch; }
+    }
+
+    if (field !== '' || row.length) endRow();
+    return rows;
+}
+
+// Header aliases. Hand-edited and re-exported CSVs will not match one exact
+// spelling, and rejecting "To" or "Phone" for not being "Number" would be a
+// pointless obstacle.
+const CSV_NUMBER_HEADERS = ['number', 'to', 'phone', 'phone number', 'recipient', 'msisdn'];
+const CSV_BODY_HEADERS = ['body', 'message', 'text'];
+
+/**
+ * Map a parsed CSV onto the send shape, given the currently selected template.
+ *
+ * Returns { mode, rows, columns, total, skipped, warnings, error }. `error` is
+ * set for problems with the file as a whole (no header, no number column) —
+ * those are fatal because nothing can be salvaged. Problems with individual
+ * rows land in `skipped` and the rest still send.
+ *
+ * Mode follows the template selection rather than the file: Twilio ignores Body
+ * when ContentSid is set, so a Body column alongside a template is a warning,
+ * not an instruction.
+ */
+function interpretCsv(raw, template) {
+    const result = { mode: null, rows: [], columns: [], total: 0, skipped: [], warnings: [], error: null };
+
+    if (!raw.length) {
+        result.error = 'That file is empty.';
+        return result;
+    }
+
+    const header = raw[0].map(h => String(h || '').trim());
+    const body = raw.slice(1);
+    result.total = body.length;
+
+    const numberIndex = header.findIndex(h => CSV_NUMBER_HEADERS.includes(h.toLowerCase()));
+    if (numberIndex === -1) {
+        result.error = `No recipient column found. Name the first column ${CSV_NUMBER_HEADERS.map(h => `"${h}"`).join(', ')} (any case).`;
+        return result;
+    }
+
+    const bodyIndex = header.findIndex(h => CSV_BODY_HEADERS.includes(h.toLowerCase()));
+
+    // Variable columns: "{{1}}", "{{ 1 }}", or a bare token naming one of the
+    // template's own variables, so "1" and "name" work as written.
+    const templateKeys = template ? extractVariables(template).map(v => v.key) : [];
+    const variableColumns = [];
+    header.forEach((h, index) => {
+        const braced = h.match(/^\{\{\s*([\w.-]+)\s*\}\}$/);
+        if (braced) variableColumns.push({ key: braced[1], index });
+        else if (templateKeys.includes(h)) variableColumns.push({ key: h, index });
+    });
+
+    result.mode = template ? 'variables' : 'body';
+    result.columns = result.mode === 'variables' ? variableColumns : [];
+
+    if (result.mode === 'variables') {
+        if (!variableColumns.length) {
+            result.error = templateKeys.length
+                ? `No variable columns found. This template needs ${templateKeys.map(k => `{{${k}}}`).join(', ')} — download the sample for the exact header.`
+                : 'The selected template takes no variables, so a CSV only needs a recipient column.';
+            if (templateKeys.length) return result;
+            result.error = null;
+        }
+        if (bodyIndex !== -1) {
+            result.warnings.push('A Body column is present but ignored: Twilio sends the template, not a literal body, when a template is selected.');
+        }
+        const missing = templateKeys.filter(k => !variableColumns.some(c => c.key === k));
+        if (missing.length) {
+            result.warnings.push(`No column for ${missing.map(k => `{{${k}}}`).join(', ')} — ${missing.length === 1 ? 'it' : 'they'} will send empty.`);
+        }
+        const unknown = variableColumns.filter(c => templateKeys.length && !templateKeys.includes(c.key));
+        if (unknown.length) {
+            result.warnings.push(`Ignoring ${unknown.map(c => `{{${c.key}}}`).join(', ')} — not used by this template.`);
+        }
+    }
+
+    const fallbackBody = document.getElementById('message-body').value.trim();
+    if (result.mode === 'body' && bodyIndex === -1 && !fallbackBody) {
+        result.error = `No message text found. Add a ${CSV_BODY_HEADERS.map(h => `"${h}"`).join(' / ')} column, type a message body above, or pick a content template.`;
+        return result;
+    }
+
+    let blankCells = 0;
+    let fellBack = 0;
+    const seen = new Set();
+    let duplicates = 0;
+
+    body.forEach((cells, i) => {
+        const line = i + 2;  // 1-based, and the header occupies line 1
+
+        if (cells.length !== header.length) {
+            result.skipped.push({ line, reason: `${cells.length} column${cells.length === 1 ? '' : 's'}, expected ${header.length}` });
+            return;
+        }
+
+        const to = String(cells[numberIndex] || '').trim();
+        if (!to) {
+            result.skipped.push({ line, reason: 'no recipient number' });
+            return;
+        }
+
+        const message = { to };
+
+        if (result.mode === 'variables') {
+            const vars = {};
+            result.columns
+                .filter(c => !templateKeys.length || templateKeys.includes(c.key))
+                .forEach(c => {
+                    const value = String(cells[c.index] ?? '').trim();
+                    // Blank stays blank. The variable inputs above still hold
+                    // seeded sample values, and quietly substituting one for
+                    // missing data would send the wrong thing to a real person.
+                    if (!value) blankCells++;
+                    vars[c.key] = value;
+                });
+            if (Object.keys(vars).length) message.contentVariables = vars;
+        } else {
+            // A blank cell falls back to the single message body above, so a
+            // partially-filled column is usable rather than fatal. Only a row
+            // with neither is skipped. Unlike variables, this substitution is
+            // announced below, and the fallback is text the user typed for this
+            // campaign rather than a template's leftover sample value.
+            const cell = bodyIndex === -1 ? '' : String(cells[bodyIndex] ?? '').trim();
+            const text = cell || fallbackBody;
+            if (!text) {
+                result.skipped.push({ line, reason: 'no message text' });
+                return;
+            }
+            if (!cell) fellBack++;
+            message.body = text;
+        }
+
+        if (seen.has(to)) duplicates++;
+        seen.add(to);
+
+        result.rows.push(message);
+    });
+
+    if (blankCells) {
+        result.warnings.push(`${blankCells} variable cell${blankCells === 1 ? '' : 's'} left blank — ${blankCells === 1 ? 'it' : 'they'} will render as empty text.`);
+    }
+    if (fellBack) {
+        result.warnings.push(`${fellBack} row${fellBack === 1 ? '' : 's'} had no message text and will use the message body typed above.`);
+    }
+    if (duplicates) {
+        result.warnings.push(`${duplicates} repeated number${duplicates === 1 ? '' : 's'} — sending more than once to the same recipient.`);
+    }
+    if (!result.rows.length && !result.error) {
+        result.error = 'No usable rows in that file.';
+    }
+
+    return result;
 }
 
 /** RFC-style CSV: quote fields containing a quote, comma, CR or LF; double quotes. */

@@ -1365,6 +1365,93 @@ input::placeholder, textarea::placeholder { color: var(--text-muted); }
 
 .field-help--problem { color: var(--danger); }
 
+/* --- CSV upload -------------------------------------------------------- */
+
+.csv-upload {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 10px;
+}
+
+/* The native control is unstyleable, so a label drives it. Clipped rather than
+   display:none so it stays focusable and reachable by keyboard and screen
+   readers; :focus-visible on the input rings the label. */
+.csv-file-input {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+}
+
+.csv-btn {
+    padding: 7px 14px;
+    font-size: 13px;
+}
+
+.csv-file-input:focus-visible + .csv-btn {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}
+
+/* Same reasoning as .send-note--active: the tinted box signals, and the copy
+   stays --text because coloured text this small fails AA on the tint. */
+.csv-summary {
+    margin: 0 0 10px;
+    padding: 10px 12px;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius);
+    background: var(--surface-hover);
+    font-size: 12px;
+    line-height: 1.55;
+    color: var(--text);
+}
+
+.csv-summary__file {
+    font-weight: 600;
+}
+
+.csv-summary__count {
+    color: var(--text-secondary);
+}
+
+.csv-summary__map {
+    margin-top: 6px;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-secondary);
+    word-break: break-word;
+}
+
+.csv-summary__list {
+    margin: 6px 0 0;
+    padding-left: 18px;
+}
+
+.csv-summary__list li { margin-top: 2px; }
+
+.csv-summary--error {
+    border-color: rgba(217, 31, 54, 0.4);
+    background: var(--danger-light);
+}
+
+.csv-summary--warn {
+    border-color: rgba(228, 98, 22, 0.35);
+    background: rgba(228, 98, 22, 0.08);
+}
+
+/* Inputs the loaded CSV has taken over. Dimmed and non-interactive, but still
+   legible, so it reads as "superseded" rather than "broken". */
+.csv-overridden {
+    opacity: 0.55;
+    pointer-events: none;
+}
+
 /* Advisory under the Send button. Quiet while idle — it is a caveat, not an
    instruction — then promoted to a warning for the one window where acting on
    it matters, which is while the tab is actually driving a send. */
