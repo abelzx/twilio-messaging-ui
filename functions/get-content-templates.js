@@ -1,8 +1,19 @@
 /**
- * POST /get-content-templates — content templates for WhatsApp and RCS.
+ * POST /get-content-templates — content templates for WhatsApp, RCS, SMS and MMS.
  */
 
 const oauth = require(Runtime.getAssets()['/twilio-oauth.js'].path);
+
+/**
+ * Channels that render exactly one content type, mapped to that type. Per
+ * Twilio's channel support matrix, SMS carries only twilio/text and MMS only
+ * twilio/media; every other channel accepts several types and is handled
+ * separately below.
+ */
+const SINGLE_TYPE_CHANNELS = {
+  sms: 'twilio/text',
+  mms: 'twilio/media'
+};
 
 exports.handler = async function(context, event, callback) {
   const response = new Twilio.Response();
@@ -134,6 +145,63 @@ exports.handler = async function(context, event, callback) {
           success: false,
           templates: [],
           error: `Failed to fetch RCS templates: ${error.message}`
+        });
+        return callback(null, response);
+      }
+    } else if (SINGLE_TYPE_CHANNELS[channel]) {
+      // SMS and MMS each carry exactly ONE content type — twilio/text and
+      // twilio/media respectively — unlike RCS and WhatsApp, which accept a
+      // spread of rich types. That makes both the filter and the payload a
+      // single-key affair, so the two share this branch.
+      const requiredType = SINGLE_TYPE_CHANNELS[channel];
+      const label = channel.toUpperCase();
+
+      try {
+        // Neither channel has a template approval process, so the plain
+        // contents.list() endpoint is enough — contentAndApprovals only
+        // matters for WhatsApp.
+        const contentTemplates = await client.content.v1.contents.list({ limit: 100 });
+
+        console.log(`Found ${contentTemplates.length} total content templates`);
+
+        // A template may define richer types alongside the required one; Twilio
+        // sends the most complex translation the destination channel supports,
+        // so those still deliver here — as their text or media translation. A
+        // template lacking the required type has nothing this channel can
+        // render and fails the send with error 216602, so it is filtered out
+        // rather than offered and left to fail per-recipient.
+        const channelTemplates = contentTemplates.filter(template => {
+          if (!isNotVerifyAutoCreated(template)) {
+            return false;
+          }
+          if (!template.types || typeof template.types !== 'object') {
+            return false;
+          }
+          return Object.prototype.hasOwnProperty.call(template.types, requiredType);
+        });
+
+        console.log(`Filtered to ${channelTemplates.length} ${label} templates`);
+
+        // `types` is narrowed to the one translation this channel delivers. The
+        // picker builds both its preview and its variable inputs from `types`,
+        // so leaving the rest in would preview a card the recipient never sees,
+        // or prompt for a media-URL variable on a channel that drops the media.
+        templates.push(...channelTemplates.map(template => ({
+          sid: template.sid,
+          friendlyName: template.friendlyName || template.name || template.sid,
+          language: template.language || 'en',
+          types: { [requiredType]: template.types[requiredType] },
+          variables: template.variables || {},
+          status: 'approved'
+        })));
+      } catch (error) {
+        console.error(`Error fetching ${label} content templates:`, error);
+        console.error('Error details:', error.message, error.stack);
+        response.setStatusCode(200);
+        response.setBody({
+          success: false,
+          templates: [],
+          error: `Failed to fetch ${label} templates: ${error.message}`
         });
         return callback(null, response);
       }

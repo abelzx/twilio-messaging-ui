@@ -133,6 +133,20 @@ Credentials are held in the browser's `sessionStorage` for the life of the tab a
 ### SMS
 - Requires a Twilio phone number
 - Format: `+1234567890`
+- Content templates are supported, limited to those defining a `twilio/text` type
+
+### MMS
+- Requires an MMS-capable Twilio phone number
+- Format: `+1234567890`
+- Content templates are supported, limited to those defining a `twilio/media` type
+
+#### How SMS and MMS templates are filtered
+
+Both channels render exactly one content type — `twilio/text` for SMS, `twilio/media` for MMS — so the picker lists only templates that define it. A template defining both appears under each channel.
+
+Templates that also carry richer types (card, carousel, quick-reply) are still listed, because Twilio delivers the most complex translation the destination channel supports; over SMS or MMS that is the text or media translation. The preview and variable inputs are narrowed to that translation, so what you see is what the recipient receives — a card's copy is not previewed on SMS, and a media-URL variable is not prompted for on a channel that drops the media.
+
+A template with no type the channel can render is omitted rather than offered, since sending it fails with [error 216602](https://www.twilio.com/docs/api/errors/216602).
 
 ### WhatsApp
 - Requires WhatsApp-enabled Twilio number
@@ -176,7 +190,7 @@ twilio-messaging-ui/
 │   ├── check-status.js          # Campaign status checker
 │   ├── resume-execution.js      # Resume interrupted campaigns
 │   ├── get-phone-numbers.js     # From dropdown
-│   ├── get-content-templates.js # WhatsApp/RCS template picker
+│   ├── get-content-templates.js # SMS/MMS/WhatsApp/RCS template picker
 │   ├── list-campaigns.js        # Campaign history
 │   └── webhook.js               # Delivery status callbacks
 ├── assets/

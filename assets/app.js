@@ -316,6 +316,18 @@ const CHANNEL_SENDER_ARTICLE = {
     messenger: 'a',
 };
 
+// Channels whose senders can carry a Content template. Messenger is absent
+// because its templates are governed by Facebook, not the Content API.
+const CONTENT_TEMPLATE_CHANNELS = ['sms', 'mms', 'whatsapp', 'rcs'];
+
+// Per-channel help under the template picker. SMS and MMS each get their own
+// line because their lists are deliberately narrower than the account's full
+// template set, which otherwise reads as a loading failure.
+const CHANNEL_TEMPLATE_HELP = {
+    sms: 'Only templates with a text type are listed — SMS cannot carry media, cards or buttons.',
+    mms: 'Only templates with a media type are listed — a text-only template has no media for MMS to send.',
+};
+
 function setSenderHelp(text, isProblem) {
     const help = document.getElementById('from-number-help');
     if (!help) return;
@@ -398,7 +410,7 @@ async function handleChannelChange() {
     filterRow.style.display = 'none';
 
     // Show/hide content template based on channel support
-    const supportsContentTemplates = ['whatsapp', 'rcs'].includes(channel);
+    const supportsContentTemplates = CONTENT_TEMPLATE_CHANNELS.includes(channel);
 
     if (!supportsContentTemplates) {
         contentTemplateGroup.style.display = 'none';
@@ -432,7 +444,8 @@ async function handleChannelChange() {
                 contentTemplateHelp.textContent = `Warning: ${data.error}`;
                 contentTemplateHelp.style.color = '#ff9800';
             } else {
-                contentTemplateHelp.textContent = 'Select a content template';
+                contentTemplateHelp.textContent =
+                    CHANNEL_TEMPLATE_HELP[channel] || 'Select a content template';
                 contentTemplateHelp.style.color = '';
             }
         } else {
