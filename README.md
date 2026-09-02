@@ -1,13 +1,30 @@
 # Twilio Messaging UI
 
-A web app for sending message campaigns through Twilio's Programmable Messaging API across SMS, MMS, RCS, WhatsApp and Facebook Messenger. Built with Twilio Serverless Functions and Assets.
+A web app for sending message campaigns across SMS, MMS, RCS, WhatsApp and Facebook Messenger, through either Twilio's Programmable Messaging API or its Bulk Messaging API. Built with Twilio Serverless Functions and Assets.
 
 ## Features
 
-- **Five channels**, with per-channel sender lists and content-template pickers
+- **Five channels** on Programmable Messaging, four on Bulk Messaging (no Messenger) — with per-channel sender lists and content-template pickers
 - **OAuth sign-in** with an account-level [OAuth app](https://www.twilio.com/docs/iam/oauth-apps/account-oauth-apps) using the Client Credentials grant — scoped, independently revocable, and never stored server-side
-- **Resumable campaigns** that survive the 10-second Function timeout by chunking and checkpointing to Twilio Sync
-- **Live delivery tracking** per message, with CSV export
+- **Resumable campaigns** on Programmable Messaging, surviving the 10-second Function timeout by chunking and checkpointing to Twilio Sync
+- **Live delivery tracking**, with CSV export — per message on Programmable Messaging, aggregate stats plus on-demand recipient rows on Bulk Messaging
+
+## Two sending APIs
+
+The app can send through either of Twilio's messaging APIs, chosen per campaign.
+
+| | Programmable Messaging | Bulk Messaging (beta) |
+| --- | --- | --- |
+| Request shape | one per recipient | one request for up to 10,000 recipients |
+| Channels | SMS, MMS, RCS, WhatsApp, Messenger | SMS, MMS, RCS, WhatsApp |
+| Tab must stay open | yes — the chunk loop runs in your browser | no — Twilio processes the request server-side |
+| Resumable | yes, checkpointed to Sync | not needed; there is no browser-driven loop to interrupt |
+| Sender | phone number, sender, or Messaging Service | phone number, sender, or sender pool — no Messaging Service |
+| Delivery detail | per message, polled every 5s | aggregate stats polled every 5s; per-recipient rows fetched only when the delivery panel opens or a CSV export is requested |
+| Scheduling | not exposed | up to 7 days ahead |
+| Channel fallback | no | WhatsApp to SMS only |
+
+Bulk Messaging is a [Public Beta](https://www.twilio.com/docs/bulk-messaging) product with no SLA, which is why it is a mode here rather than a replacement for Programmable Messaging.
 
 ## Prerequisites
 
@@ -52,9 +69,11 @@ Two optional variables are read if present: `SYNC_SERVICE_SID` to pin a specific
 
 ### Sign in
 
-Create an account-level OAuth app first: **Twilio Console → Settings → Account settings → OAuth applications**. Grant it Messaging (read and write), Phone Numbers (read), and Content (read), then copy the **Client ID** and **Client Secret** — the secret is shown only once.
+Create an account-level OAuth app first: **Twilio Console → Settings → Account settings → OAuth applications**. Grant it Messaging (read and write), Phone Numbers (read), and Content (read) — plus the **Comms** scopes if you intend to use Bulk Messaging mode, since that mode authenticates against `comms.twilio.com` rather than the endpoints the other three scopes cover. Then copy the **Client ID** and **Client Secret** — the secret is shown only once.
 
 Sign in with those two values. The Account SID is not typed; it is derived from the access token issued for your credentials and shown next to Sign Out. It is still needed internally, because Twilio's Messaging and Phone Numbers endpoints embed it in the request path.
+
+Signing in successfully does not prove the Comms scopes were granted — sign-in only exercises the Messaging and Phone Numbers scopes. A missing Comms grant surfaces later, the first time you submit a bulk campaign.
 
 Credentials are held in the tab's `sessionStorage` and sent with each request. Nothing is written to disk and nothing is stored server-side.
 
@@ -79,7 +98,9 @@ While a file is loaded it is the single source of truth: the Recipients box and 
 
 Rows with a problem are skipped and listed by line number — a missing number, or a column count that doesn't match the header — and the rest still send. A blank variable cell sends as empty text rather than falling back to the template's sample value, which would put someone else's placeholder data in a real message. A blank `Body` cell does fall back to the message body typed above, and the summary says how many rows that affected.
 
-> **Keep the tab open while sending.** The chunk loop runs in your browser, not on Twilio. Each request sends what fits in one 9-second Function invocation and returns; the page then initiates the next. Your credentials live only in this tab, so nothing server-side can carry the campaign on by itself.
+> **On Programmable Messaging, keep the tab open while sending.** The chunk loop runs in your browser, not on Twilio. Each request sends what fits in one 9-second Function invocation and returns; the page then initiates the next. Your credentials live only in this tab, so nothing server-side can carry the campaign on by itself.
+>
+> This does not apply in Bulk Messaging mode: one request covers the whole campaign (up to 10,000 recipients), Twilio processes it after that, and you can close the tab as soon as the request is accepted.
 >
 > Closing the tab, navigating away, or letting the machine sleep stops sending. Switching to another tab or app is fine — background tabs keep running, though browsers throttle timers to about one per second, which matches the delay already in the loop.
 >
@@ -88,6 +109,8 @@ Rows with a problem are skipped and listed by line number — a missing number, 
 ### Monitor progress
 
 The campaign card shows sent, failed, and pending counts with a progress percentage. The delivery panel lists per-message status, refreshed every 5 seconds, and exports to CSV.
+
+In Bulk Messaging mode the campaign card reports recipients **accepted**, not sent — the API answers `202` before any message leaves, so "accepted" is the honest word for what just happened. Delivery is reported separately by the stats block: `delivered`, `read`, `undelivered`, `failed` and `unaddressable`, polled on the same 5-second timer. Per-recipient rows are fetched only when the delivery panel is opened or a CSV export is requested, not on every poll — a 10,000-recipient operation is too large to pull down repeatedly just to refresh a summary.
 
 ## Channels
 
@@ -100,6 +123,8 @@ The campaign card shows sent, failed, and pending counts with a progress percent
 | Facebook Messenger | Facebook Page ID | not supported |
 
 A Messaging Service can be used as the sender on any channel. WhatsApp senders and recipients are auto-prefixed with `whatsapp:`, so either form works.
+
+This table describes what Programmable Messaging supports. Bulk Messaging mode offers the same four channels except Facebook Messenger, and cannot take a Messaging Service as the sender — see [Two sending APIs](#two-sending-apis).
 
 ### How SMS and MMS templates are filtered
 
@@ -115,6 +140,8 @@ Messages are processed in chunks of 100. `send-messages.js` keeps going until it
 
 **The browser drives that loop** — `sendMessagesBatch()` in `assets/app.js`, not a Twilio-side scheduler. This follows from never storing user credentials server-side: the Functions receive a Client ID and Secret per request and keep nothing, so no queue or cron could authenticate a continuation. Hence the tab must stay open. Making sending fire-and-forget would mean granting the deployment standing authorization to send on the user's behalf.
 
+None of this applies to Bulk Messaging mode. `send-bulk.js` submits the whole campaign in one request and returns; there is no loop in the browser to drive, and so nothing to check in on or resume.
+
 ## Architecture
 
 ```
@@ -123,13 +150,17 @@ functions/
   send-messages.js          Chunked sending, checkpointed to Sync
   resume-execution.js       Continues a campaign from its last checkpoint
   check-status.js           Campaign status, re-fetching each message from Twilio
-  get-phone-numbers.js      Senders for the selected channel
+  send-bulk.js              One-request sending via the Bulk Messaging API
+  check-bulk-status.js      Bulk operation stats, and recipients on demand
+  get-phone-numbers.js      Senders for the selected channel and mode
   get-content-templates.js  Template picker, scoped per channel
   list-campaigns.js         Campaign history
   webhook.protected.js      Delivery-status callbacks (signature-validated)
 assets/
   index.html  app.js  styles.css
   twilio-oauth.private.js   Shared OAuth client helper (private, not web-reachable)
+  twilio-comms.private.js   comms.twilio.com client (no SDK support exists)
+  bulk-payload.private.js   Pure request mapping for the Bulk API
 ```
 
 Every Function except the webhook receives `clientId` and `clientSecret` in its POST body and builds a per-request Twilio client through `assets/twilio-oauth.private.js`. The webhook is the exception: Twilio calls it, not the browser, so it carries no user credentials. The runtime credentials (`context.ACCOUNT_SID` / `context.AUTH_TOKEN`) are used for Sync access throughout, never for the user's own account.
@@ -145,7 +176,7 @@ Every Function except the webhook receives `clientId` and `clientSecret` in its 
 
 Two limits worth stating plainly:
 
-- **`sessionStorage` is readable by JavaScript on the page.** Any XSS on the deployed origin can exfiltrate it. OAuth does not remove that exposure — the Client Secret sits where the Auth Token used to. What changes is blast radius and revocability: the app is scoped to Messaging, Phone Numbers and Content, and its secret rotates independently of the account's master credential. Access tokens are never stored.
+- **`sessionStorage` is readable by JavaScript on the page.** Any XSS on the deployed origin can exfiltrate it. OAuth does not remove that exposure — the Client Secret sits where the Auth Token used to. What changes is blast radius and revocability: the app is scoped to Messaging, Phone Numbers and Content (plus Comms, if Bulk Messaging mode is granted), and its secret rotates independently of the account's master credential. Access tokens are never stored.
 - **The Function URLs are public.** Anyone with the URL can use the tool, but only with OAuth credentials they already hold.
 
 ## Troubleshooting
@@ -163,6 +194,10 @@ Two limits worth stating plainly:
 **Sync errors.** Confirm the Sync API is enabled on the account and that the runtime credentials have Sync access.
 
 **Timeouts.** Handled automatically by chunking. If a single chunk still overruns, lower `CHUNK_SIZE` in `send-messages.js`.
+
+**Bulk mode rejects the sender.** A Messaging Service cannot be used as a bulk sender — the Bulk API's `from` accepts a phone number, a sender, or a sender pool, and a Messaging Service is none of those. Pick a phone number or sender pool, or switch to Programmable Messaging.
+
+**Bulk mode returns 401 but sign-in worked.** Sign-in only proves the Messaging and Phone Numbers scopes. Bulk Messaging authenticates against `comms.twilio.com`, which needs the Comms scopes granted separately on the OAuth app.
 
 ## License
 
