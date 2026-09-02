@@ -1253,7 +1253,7 @@ async function sendMessagesBatch(messages, channel, from, campaignName) {
             isComplete = data.isComplete;
 
             // Update UI - fetch full campaign status to get delivery/read info
-            await checkCampaignStatus();
+            await refreshCurrentCampaign();
 
             if (!isComplete) {
                 // Wait a bit before resuming (to avoid hitting rate limits)
@@ -1261,7 +1261,7 @@ async function sendMessagesBatch(messages, channel, from, campaignName) {
             }
         } catch (error) {
             console.error('Error sending messages:', error);
-            
+
             // Show error but allow manual resume
             showResumeOption();
             throw error;
@@ -1269,8 +1269,8 @@ async function sendMessagesBatch(messages, channel, from, campaignName) {
     }
 
     // Final status check
-    await checkCampaignStatus();
-    
+    await refreshCurrentCampaign();
+
     // Reload campaigns list
     await loadCampaigns();
     
@@ -1364,6 +1364,108 @@ async function checkCampaignStatus() {
     }
 }
 
+/**
+ * Polls a bulk campaign's aggregate stats.
+ *
+ * Only the cheap endpoint runs on the timer. Per-recipient rows come from
+ * loadBulkMessages, called when the delivery panel is opened, because a
+ * 10,000-recipient operation is ten pages of API reads.
+ *
+ * The campaign card itself is redrawn by loadCampaigns() — check-bulk-status
+ * writes the stats into the campaign document, and list-campaigns.js turns them
+ * into the same counters the classic path renders.
+ */
+async function checkBulkCampaignStatus() {
+    if (!currentCampaignId || !creds) return;
+
+    try {
+        const response = await postToFunction('check-bulk-status', {
+            campaignId: currentCampaignId,
+        });
+        const data = await response.json();
+        if (!response.ok || !data.campaign) return;
+
+        // Once every operation is terminal nothing will change again, so stop
+        // polling rather than re-reading the same numbers every 5 seconds.
+        if (data.campaign.isComplete) stopStatusAutoRefresh();
+    } catch (error) {
+        console.error('Bulk status check failed:', error);
+    }
+}
+
+/**
+ * Fetches every per-recipient row, following the cursor the Function returns
+ * when one 9-second invocation cannot finish paging.
+ */
+async function loadBulkMessages(campaignId) {
+    const rows = [];
+    let cursor = null;
+
+    do {
+        const response = await postToFunction('check-bulk-status', {
+            campaignId,
+            includeMessages: true,
+            ...(cursor
+                ? { pageToken: cursor.pageToken, operationIndex: cursor.operationIndex }
+                : {}),
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Failed to load recipients');
+
+        rows.push(...(data.messages || []));
+        cursor = data.nextCursor;
+    } while (cursor);
+
+    return rows;
+}
+
+/**
+ * Bulk statuses are SCREAMING_CASE; the delivery table and CSV export were
+ * written against Programmable Messaging's lowercase vocabulary.
+ */
+function normaliseBulkStatus(status) {
+    return String(status || 'unknown').toLowerCase();
+}
+
+/**
+ * Reshapes bulk rows into the `statuses` map the existing table and CSV export
+ * already read, so neither needs a bulk-specific branch.
+ */
+function bulkRowsToStatuses(rows) {
+    const statuses = {};
+
+    rows.forEach((row, index) => {
+        const status = normaliseBulkStatus(row.status);
+        // Fall back to the index so two rows can never collide and silently
+        // drop one from the table.
+        const key = row.id || row.messageId || `bulk-${index}`;
+
+        statuses[key] = {
+            status,
+            to: (row.to && (row.to.address || row.to)) || '',
+            sentAt: row.createdAt || row.updatedAt || null,
+            dateSent: row.createdAt || null,
+            errorCode: row.errorCode == null ? null : row.errorCode,
+            errorMessage: row.errorMessage == null ? null : row.errorMessage,
+            delivered: status === 'delivered' || status === 'read',
+            read: status === 'read',
+        };
+    });
+
+    return statuses;
+}
+
+/**
+ * Routes the status poll by the campaign's own mode rather than the toggle:
+ * this only ever fires for currentCampaignId, whose mode was fixed the moment
+ * it was created or opened. check-status now returns 409 for a bulk campaign,
+ * and check-bulk-status returns 404 for a classic one, so calling the wrong
+ * one is never harmless.
+ */
+async function refreshCurrentCampaign() {
+    if (isBulkMode()) return checkBulkCampaignStatus();
+    return checkCampaignStatus();
+}
 
 async function resumeCampaignById(campaignId, event) {
     if (!creds) {
@@ -1600,6 +1702,24 @@ async function viewCampaign(campaignId) {
 
 async function fetchAndDisplayCampaignDetails(campaignId) {
     if (!creds) return;
+
+    if (isBulkMode()) {
+        try {
+            const rows = await loadBulkMessages(campaignId);
+            // displayMessageDetails reads campaign.statuses and stores the whole
+            // object in displayedCampaign, which is what CSV export exports.
+            displayMessageDetails({
+                campaignId,
+                mode: 'bulk',
+                statuses: bulkRowsToStatuses(rows),
+            });
+        } catch (error) {
+            console.error('Error loading bulk recipients:', error);
+            document.getElementById('message-details-content').innerHTML =
+                '<p style="color: #d32f2f; text-align: center; padding: 20px;">Error loading message details</p>';
+        }
+        return;
+    }
 
     try {
         const response = await postToFunction('check-status', { campaignId });
@@ -2029,9 +2149,16 @@ function startStatusAutoRefresh() {
     if (currentCampaignId && creds) {
         // Refresh every 5 seconds
         statusRefreshInterval = setInterval(async () => {
-            await checkCampaignStatus();
+            await refreshCurrentCampaign();
             await loadCampaigns(); // Also refresh the campaigns list
         }, 5000);
+    }
+}
+
+function stopStatusAutoRefresh() {
+    if (statusRefreshInterval) {
+        clearInterval(statusRefreshInterval);
+        statusRefreshInterval = null;
     }
 }
 
