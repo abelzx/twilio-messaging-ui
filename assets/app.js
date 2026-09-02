@@ -11,6 +11,12 @@ const CREDS_KEY = 'twilio_messaging_oauth';
  */
 let creds = null;
 let currentCampaignId = null;
+// The mode of currentCampaignId specifically — set wherever currentCampaignId
+// is set, and read by refreshCurrentCampaign(). Deliberately not the send-mode
+// toggle: history shows both kinds of campaign at once, so a bulk campaign
+// opened while the toggle reads "classic" must still be polled as bulk, or its
+// auto-refresh timer would call check-status and get a 409 every 5 seconds.
+let currentCampaignMode = 'classic';
 let resumeInterval = null;
 let statusRefreshInterval = null;
 // Content templates loaded for the current channel (full objects from the API)
@@ -533,6 +539,7 @@ async function handleLogin(e) {
 function handleLogout() {
     clearCreds();
     currentCampaignId = null;
+    currentCampaignMode = 'classic';
     if (resumeInterval) {
         clearInterval(resumeInterval);
         resumeInterval = null;
@@ -1215,6 +1222,7 @@ async function handleSendMessages(e) {
 
     // Generate campaign ID
     currentCampaignId = `campaign_${Date.now()}`;
+    currentCampaignMode = isBulkMode() ? 'bulk' : 'classic';
 
     try {
         if (isBulkMode()) {
@@ -1463,7 +1471,7 @@ function bulkRowsToStatuses(rows) {
  * one is never harmless.
  */
 async function refreshCurrentCampaign() {
-    if (isBulkMode()) return checkBulkCampaignStatus();
+    if (currentCampaignMode === 'bulk') return checkBulkCampaignStatus();
     return checkCampaignStatus();
 }
 
@@ -1496,8 +1504,10 @@ async function resumeCampaignById(campaignId, event) {
             throw new Error('Campaign data is missing. Cannot resume this campaign.');
         }
 
-        // Set current campaign ID
+        // Set current campaign ID. Resume only ever reaches a classic campaign
+        // — the Resume button is not offered for bulk (see displayCampaigns).
         currentCampaignId = campaignId;
+        currentCampaignMode = 'classic';
 
         // Continue resuming until complete
         let isComplete = false;
@@ -1620,17 +1630,24 @@ function displayCampaigns(campaigns) {
             ? new Date(campaign.lastUpdated).toLocaleString() 
             : 'Unknown';
 
-        const canResume = !campaign.isComplete && campaign.startIndex < campaign.totalMessages;
-        
+        // Bulk campaigns cannot be resumed: Twilio owns the processing, and no
+        // recipient list is stored to resume from. An operation continues on its
+        // own or has already finished.
+        const canResume = campaign.mode !== 'bulk' && !campaign.isComplete && campaign.startIndex < campaign.totalMessages;
+
         // Use campaign name if available, otherwise fall back to formatted timestamp
-        const displayName = campaign.campaignName || 
-            (campaign.createdAt ? new Date(campaign.createdAt).toLocaleString() : 
+        const displayName = campaign.campaignName ||
+            (campaign.createdAt ? new Date(campaign.createdAt).toLocaleString() :
             campaign.campaignId.replace('campaign_', ''));
-        
+
+        const modeBadge = campaign.mode === 'bulk'
+            ? '<span class="mode-badge mode-badge--bulk">Bulk</span> '
+            : '<span class="mode-badge mode-badge--classic">Classic</span> ';
+
         html += `
-            <div class="campaign-item ${isActive ? 'active' : ''}" onclick="viewCampaign('${campaign.campaignId}')">
+            <div class="campaign-item ${isActive ? 'active' : ''}" onclick="viewCampaign('${campaign.campaignId}', '${campaign.mode || 'classic'}')">
                 <div class="campaign-header">
-                    <div class="campaign-id">${displayName}</div>
+                    <div class="campaign-id">${modeBadge}${displayName}</div>
                     <div style="display: flex; gap: 8px; align-items: center;">
                         <div class="campaign-status-badge ${campaign.isComplete ? 'complete' : 'in-progress'}">
                             ${campaign.isComplete ? 'Complete' : 'In Progress'}
@@ -1684,26 +1701,33 @@ function displayCampaigns(campaigns) {
     });
 }
 
-async function viewCampaign(campaignId) {
+async function viewCampaign(campaignId, mode) {
     currentCampaignId = campaignId;
-    
+    // The row's own mode, not the toggle: history shows both kinds at once, and
+    // this drives both the immediate detail fetch below and every subsequent
+    // auto-refresh tick via refreshCurrentCampaign().
+    currentCampaignMode = mode === 'bulk' ? 'bulk' : 'classic';
+
     // Show message details section
     const messageDetailsSection = document.getElementById('message-details-section');
     if (messageDetailsSection) {
         messageDetailsSection.style.display = 'block';
         document.getElementById('message-details-content').innerHTML = '<p style="color: #666; text-align: center; padding: 20px;">Loading message details...</p>';
     }
-    
+
     // Fetch and display detailed campaign status
-    await fetchAndDisplayCampaignDetails(campaignId);
+    await fetchAndDisplayCampaignDetails(campaignId, mode);
     await loadCampaigns(); // Refresh list to highlight active campaign
     startStatusAutoRefresh();
 }
 
-async function fetchAndDisplayCampaignDetails(campaignId) {
+async function fetchAndDisplayCampaignDetails(campaignId, mode) {
     if (!creds) return;
 
-    if (isBulkMode()) {
+    // The row's own mode, not the toggle: history shows both kinds at once.
+    const bulk = (mode || (isBulkMode() ? 'bulk' : 'classic')) === 'bulk';
+
+    if (bulk) {
         try {
             const rows = await loadBulkMessages(campaignId);
             // displayMessageDetails reads campaign.statuses and stores the whole
