@@ -110,8 +110,19 @@ exports.handler = async function (context, event, callback) {
     });
   } catch (error) {
     console.error('Bulk campaign record failed:', error.message);
-    // The messages are already accepted. Report that plainly rather than
-    // returning an error that reads as though nothing was sent.
+    // The messages are already accepted regardless of which branch below
+    // fires. Report that plainly rather than returning an error that reads as
+    // though nothing was sent.
+    //
+    // 54301 is Sync's "unique name already exists" — naming the real cause
+    // here matters because a caller reusing a campaign ID would otherwise be
+    // told only that recording failed. This is NOT idempotency: the
+    // operations above are submitted before this write, so by the time the
+    // collision is detected the messages have already gone out a second
+    // time. Genuine deduplication would need to reserve the campaign ID
+    // before sending, which is out of scope here — this only reports the
+    // collision honestly instead of masking it.
+    const isDuplicateName = error.code === 54301 || error.status === 409;
     response.setStatusCode(200);
     response.setBody({
       success: true,
@@ -119,8 +130,9 @@ exports.handler = async function (context, event, callback) {
       operationIds,
       accepted: recipientCount,
       recordFailed: true,
-      warning:
-        'Twilio accepted the messages, but this campaign could not be recorded, so it will not appear in history. Track it in the Twilio Console using the operation ID.',
+      warning: isDuplicateName
+        ? `The campaign ID "${campaignDocName}" is already in use, so this campaign could not be recorded under it. The messages were already sent. Track them in the Twilio Console using the operation ID.`
+        : 'Twilio accepted the messages, but this campaign could not be recorded, so it will not appear in history. Track it in the Twilio Console using the operation ID.',
     });
     return callback(null, response);
   }

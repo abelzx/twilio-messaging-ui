@@ -84,6 +84,18 @@ exports.handler = async function (context, event, callback) {
       return callback(null, response);
     }
 
+    // A classic campaign owned by this same caller would otherwise pass the
+    // ownership check above and fall through to an empty operationIds array,
+    // an all-zero stats write, and a response claiming mode: 'bulk' for a
+    // document that is not. 404 rather than 409: this endpoint should not
+    // confirm the existence of a campaign it will not serve, the same
+    // reasoning the ownership check above already follows.
+    if (campaignData.mode !== 'bulk') {
+      response.setStatusCode(404);
+      response.setBody({ error: 'Campaign not found' });
+      return callback(null, response);
+    }
+
     const operationIds = Array.isArray(campaignData.operationIds)
       ? campaignData.operationIds
       : [];
@@ -98,15 +110,29 @@ exports.handler = async function (context, event, callback) {
     );
 
     const reachable = operations.filter(Boolean);
-    const stats = sumStats(reachable);
-    const isComplete =
-      reachable.length === operationIds.length &&
-      reachable.length > 0 &&
-      reachable.every((operation) => TERMINAL_STATUSES.has(String(operation.status)));
 
-    campaignData.stats = stats;
-    campaignData.operationStatuses = reachable.map((o) => o.status);
-    campaignData.isComplete = isComplete;
+    // A transient comms.twilio.com blip that fails every fetchOperation call
+    // must not look like a campaign that has sent nothing: overwriting a
+    // previous poll's real stats with all-zero would make a failed lookup
+    // indistinguishable from an empty campaign. When there was something to
+    // fetch and none of it came back, keep whatever was already recorded.
+    const totalFailure = operationIds.length > 0 && reachable.length === 0;
+
+    const stats = totalFailure ? campaignData.stats || sumStats([]) : sumStats(reachable);
+    const operationStatuses = totalFailure
+      ? campaignData.operationStatuses || []
+      : reachable.map((o) => o.status);
+    const isComplete = totalFailure
+      ? Boolean(campaignData.isComplete)
+      : reachable.length === operationIds.length &&
+        reachable.length > 0 &&
+        reachable.every((operation) => TERMINAL_STATUSES.has(String(operation.status)));
+
+    if (!totalFailure) {
+      campaignData.stats = stats;
+      campaignData.operationStatuses = operationStatuses;
+      campaignData.isComplete = isComplete;
+    }
     campaignData.lastUpdated = new Date().toISOString();
 
     // Fixed-size write: stats and a handful of statuses, never per-message rows.
@@ -156,7 +182,7 @@ exports.handler = async function (context, event, callback) {
         scheduledFor: campaignData.scheduledFor || null,
         recipientCount: campaignData.recipientCount || 0,
         operationIds,
-        operationStatuses: campaignData.operationStatuses,
+        operationStatuses,
         stats,
         isComplete,
         unreachableOperations: operationIds.length - reachable.length,
