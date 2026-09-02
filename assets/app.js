@@ -1217,7 +1217,11 @@ async function handleSendMessages(e) {
     currentCampaignId = `campaign_${Date.now()}`;
 
     try {
-        await sendMessagesBatch(messages, channel, from, campaignName);
+        if (isBulkMode()) {
+            await sendBulkCampaign(messages, channel, from, campaignName);
+        } else {
+            await sendMessagesBatch(messages, channel, from, campaignName);
+        }
     } catch (error) {
         alert('Error: ' + error.message);
         setSendingState(false);
@@ -1274,6 +1278,68 @@ async function sendMessagesBatch(messages, channel, from, campaignName) {
     startStatusAutoRefresh();
     
     setSendingState(false);
+}
+
+/**
+ * Submits a bulk campaign in a single request.
+ *
+ * No loop, and deliberately so: one operation covers 10,000 recipients and
+ * Twilio processes it server-side, which is the whole reason this mode exists.
+ * The `messages` array the classic path builds is reused as-is — each entry
+ * already carries `to`, and optionally `body` and `variables`.
+ */
+async function sendBulkCampaign(messages, channel, from, campaignName) {
+    const sendAtInput = document.getElementById('send-at');
+    const fallbackInput = document.getElementById('fallback-to-sms');
+
+    // datetime-local yields a value with no timezone ("2026-09-10T09:30"), which
+    // the API would read as UTC. Converting through Date attaches the browser's
+    // offset, so the user gets the time they actually picked.
+    const sendAt = sendAtInput && sendAtInput.value
+        ? new Date(sendAtInput.value).toISOString()
+        : null;
+
+    const first = messages[0] || {};
+
+    const response = await postToFunction('send-bulk', {
+        channel,
+        from,
+        body: document.getElementById('message-body').value || '',
+        contentSid: first.contentSid || null,
+        mediaUrl: first.mediaUrl || null,
+        recipients: messages.map((message) => ({
+            to: message.to,
+            ...(message.body ? { body: message.body } : {}),
+            ...(message.contentVariables
+                ? { variables: typeof message.contentVariables === 'string'
+                    ? JSON.parse(message.contentVariables)
+                    : message.contentVariables }
+                : {}),
+        })),
+        campaignName: campaignName || null,
+        sendAt,
+        fallbackToSms: Boolean(fallbackInput && fallbackInput.checked),
+    });
+
+    const data = await response.json();
+
+    if (!response.ok) {
+        throw new Error(data.error || 'Failed to submit the bulk campaign');
+    }
+
+    currentCampaignId = data.campaignId;
+
+    if (data.warning) alert(data.warning);
+    if (data.partial) alert(data.error);
+
+    if (currentCampaignId) {
+        await checkBulkCampaignStatus();
+        await loadCampaigns();
+        startStatusAutoRefresh();
+    }
+
+    setSendingState(false);
+    return data;
 }
 
 async function checkCampaignStatus() {
