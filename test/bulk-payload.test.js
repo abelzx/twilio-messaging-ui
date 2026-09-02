@@ -320,3 +320,50 @@ test('rejects a sendAt that is not RFC 3339', () => {
     (err) => err.statusCode === 400 && /date/i.test(err.message)
   );
 });
+
+test('expresses WhatsApp fallback as an ordered addresses array', () => {
+  const [out] = payload.buildPayloads({
+    ...BASE,
+    channel: 'whatsapp',
+    from: '+15017122661',
+    fallbackToSms: true,
+    recipients: [{ to: '+15558675310' }],
+  });
+  assert.deepStrictEqual(out.to, [
+    {
+      addresses: [
+        { address: '+15558675310', channel: 'WHATSAPP' },
+        { address: '+15558675310', channel: 'PHONE' },
+      ],
+    },
+  ]);
+});
+
+test('keeps variables alongside a fallback addresses array', () => {
+  const [out] = payload.buildPayloads({
+    ...BASE,
+    channel: 'whatsapp',
+    from: '+15017122661',
+    fallbackToSms: true,
+    body: '',
+    contentSid: 'HXb0bb2f2f0f4d4a1e8f2b1c3d4e5f6a7b',
+    recipients: [{ to: '+15558675310', variables: { 1: 'Sarah' } }],
+  });
+  assert.deepStrictEqual(out.to[0].variables, { 1: 'Sarah' });
+  assert.strictEqual(out.to[0].addresses.length, 2);
+  assert.strictEqual('address' in out.to[0], false);
+});
+
+test('rejects fallback on RCS, where addresses[] cannot express it', () => {
+  assert.throws(
+    () => payload.buildPayloads({ ...BASE, channel: 'rcs', fallbackToSms: true }),
+    (err) => err.statusCode === 400 && /WhatsApp/i.test(err.message)
+  );
+});
+
+test('rejects fallback on SMS, which is already the fallback', () => {
+  assert.throws(
+    () => payload.buildPayloads({ ...BASE, fallbackToSms: true }),
+    (err) => err.statusCode === 400 && /WhatsApp/i.test(err.message)
+  );
+});

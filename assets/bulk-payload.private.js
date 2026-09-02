@@ -198,6 +198,24 @@ function resolveSchedule(sendAt) {
   return { sendAt: value };
 }
 
+/**
+ * Fallback is expressed per recipient as an ordered `addresses` array, which
+ * needs no sender pool.
+ *
+ * WhatsApp only, and not for want of trying: an RCS recipient's channel is
+ * already PHONE (see CHANNEL_MAP), so an RCS-then-SMS array would name the same
+ * channel twice and mean nothing. RCS fallback requires sender-pool
+ * `channels.priority`, which this app does not create.
+ */
+function assertFallbackSupported(channel) {
+  if (channel !== 'whatsapp') {
+    throw httpError(
+      400,
+      'Channel fallback is only available on WhatsApp. On RCS it requires a sender pool, which this app does not manage.'
+    );
+  }
+}
+
 function buildPayloads(request) {
   const channel = String((request && request.channel) || '').toLowerCase();
   const channelNames = CHANNEL_MAP[channel];
@@ -213,15 +231,24 @@ function buildPayloads(request) {
     throw httpError(400, 'At least one recipient is required.');
   }
 
+  const fallbackToSms = Boolean(request.fallbackToSms);
+  if (fallbackToSms) assertFallbackSupported(channel);
+
   const from = resolveSender(request.from, channelNames);
   const { content, perRecipientBody } = resolveContent(request, recipients);
   const campaignBody = String(request.body == null ? '' : request.body);
 
   const to = recipients.map((recipient) => {
-    const entry = {
-      address: bareAddress(recipient.to),
-      channel: channelNames.to,
-    };
+    const address = bareAddress(recipient.to);
+
+    const entry = fallbackToSms
+      ? {
+          addresses: [
+            { address, channel: channelNames.to },
+            { address, channel: 'PHONE' },
+          ],
+        }
+      : { address, channel: channelNames.to };
 
     // `variables.body` below is set unconditionally in perRecipientBody mode,
     // clobbering any `variables.body` a caller supplied directly. This can't
