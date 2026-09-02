@@ -88,9 +88,11 @@ In `package.json`, add `"test"` to `scripts` so it reads:
   "scripts": {
     "deploy": "twilio serverless:deploy",
     "start": "twilio serverless:start",
-    "test": "node --test test/"
+    "test": "node --test test/*.js"
   },
 ```
+
+The glob is load-bearing. `node --test test/` tries to `require()` the directory itself and dies with `MODULE_NOT_FOUND` before loading a single test — verified on Node 22.17.0 and Node 24.20.0. Passing the pattern lets the shell expand it to real files.
 
 - [ ] **Step 2: Keep tests out of the deployment**
 
