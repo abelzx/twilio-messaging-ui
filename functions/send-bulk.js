@@ -1,0 +1,144 @@
+const twilio = require('twilio');
+const oauth = require(Runtime.getAssets()['/twilio-oauth.js'].path);
+const comms = require(Runtime.getAssets()['/twilio-comms.js'].path);
+const bulk = require(Runtime.getAssets()['/bulk-payload.js'].path);
+
+/**
+ * POST /send-bulk — submits a campaign through the Bulk Messaging API.
+ *
+ * Unlike send-messages.js there is no chunk loop and no checkpoint: one request
+ * carries up to 10,000 recipients, so the browser does not have to drive
+ * anything and the tab need not stay open. Campaigns above 10,000 become
+ * several operations, submitted here in one invocation.
+ */
+exports.handler = async function (context, event, callback) {
+  const response = new Twilio.Response();
+  response.appendHeader('Access-Control-Allow-Origin', '*');
+  response.appendHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  response.appendHeader('Access-Control-Allow-Headers', 'Content-Type');
+  response.appendHeader('Content-Type', 'application/json');
+
+  if (event.request.method === 'OPTIONS') {
+    return callback(null, response);
+  }
+
+  let creds;
+  let authString;
+  let accountSid;
+  try {
+    creds = oauth.credsFrom(event);
+    const authed = await oauth.authenticateWithToken(creds);
+    authString = authed.authString;
+    accountSid = authed.accountSid;
+  } catch (error) {
+    response.setStatusCode(error.statusCode || 401);
+    response.setBody({ error: error.message });
+    return callback(null, response);
+  }
+
+  // Payloads are built before anything is sent, so a mapping or validation
+  // error costs nothing: nothing has left the building yet.
+  let payloads;
+  try {
+    payloads = bulk.buildPayloads({
+      channel: event.channel,
+      from: event.from,
+      body: event.body,
+      contentSid: event.contentSid,
+      mediaUrl: event.mediaUrl,
+      recipients: event.recipients,
+      campaignName: event.campaignName,
+      sendAt: event.sendAt,
+      fallbackToSms: event.fallbackToSms,
+    });
+  } catch (error) {
+    response.setStatusCode(error.statusCode || 400);
+    response.setBody({ error: error.message });
+    return callback(null, response);
+  }
+
+  const recipientCount = payloads.reduce((total, p) => total + p.to.length, 0);
+
+  const operationIds = [];
+  let submitError = null;
+  try {
+    for (const payload of payloads) {
+      const { operationId } = await comms.createMessages(authString, payload);
+      operationIds.push(operationId);
+    }
+  } catch (error) {
+    // Any operation already accepted will send regardless of this failure, so
+    // the campaign is still recorded below with the IDs that succeeded.
+    // Dropping them would leave traffic in flight that nothing can track.
+    submitError = error;
+  }
+
+  if (operationIds.length === 0) {
+    response.setStatusCode((submitError && submitError.statusCode) || 502);
+    response.setBody({
+      error: (submitError && submitError.message) || 'Twilio accepted no operations.',
+    });
+    return callback(null, response);
+  }
+
+  const campaignDocName = event.campaignId || `campaign_${Date.now()}`;
+
+  try {
+    const runtimeClient = twilio(context.ACCOUNT_SID, context.AUTH_TOKEN);
+    const syncServiceSid =
+      context.SYNC_SERVICE_SID || (await oauth.getOrCreateSyncService(runtimeClient));
+
+    await runtimeClient.sync.v1.services(syncServiceSid).documents.create({
+      uniqueName: campaignDocName,
+      data: {
+        mode: 'bulk',
+        ownerKey: oauth.ownerKeyFor(creds),
+        accountSid, // display only; never an authorization key
+        operationIds,
+        recipientCount,
+        // No recipient list and no per-message statuses: there is nothing to
+        // resume, so there is nothing to checkpoint — and a Sync Document holds
+        // only 16KiB, which a 10,000-recipient list would blow past many times.
+        channel: String(event.channel || '').toLowerCase(),
+        from: event.from || null,
+        campaignName: event.campaignName || null,
+        scheduledFor: event.sendAt || null,
+        stats: null,
+        createdAt: new Date().toISOString(),
+        lastUpdated: new Date().toISOString(),
+      },
+    });
+  } catch (error) {
+    console.error('Bulk campaign record failed:', error.message);
+    // The messages are already accepted. Report that plainly rather than
+    // returning an error that reads as though nothing was sent.
+    response.setStatusCode(200);
+    response.setBody({
+      success: true,
+      campaignId: null,
+      operationIds,
+      accepted: recipientCount,
+      recordFailed: true,
+      warning:
+        'Twilio accepted the messages, but this campaign could not be recorded, so it will not appear in history. Track it in the Twilio Console using the operation ID.',
+    });
+    return callback(null, response);
+  }
+
+  response.setStatusCode(submitError ? 207 : 200);
+  response.setBody({
+    success: true,
+    campaignId: campaignDocName,
+    operationIds,
+    // "accepted", not "sent": a 202 means Twilio took the request. Delivery is
+    // what the stats block reports later.
+    accepted: recipientCount,
+    ...(submitError
+      ? {
+          partial: true,
+          error: `Accepted ${operationIds.length} of ${payloads.length} batches. The rest failed: ${submitError.message}`,
+        }
+      : {}),
+  });
+  return callback(null, response);
+};
