@@ -92,7 +92,9 @@ A blank variable cell still sends as empty text rather than falling back to the 
 
 - **Tags.** The campaign name, channel and `mode` as key/value pairs, within the limit of 10 pairs, 128-character keys and 256-character values. These correlate this app's traffic in Twilio's logs.
 - **Scheduling.** An optional `sendAt` field, RFC 3339, up to seven days ahead. A scheduled operation reports status `SCHEDULED`.
-- **Channel fallback.** The per-recipient `addresses[]` form — for example `WHATSAPP` then `PHONE` for the same number — which needs no sender pool. Sender-pool `channels.priority` is the richer mechanism but requires creating and managing a pool resource, so it is out of scope here.
+- **Channel fallback, WhatsApp only.** The per-recipient `addresses[]` form — `WHATSAPP` then `PHONE` for the same number — which needs no sender pool.
+
+  RCS-to-SMS fallback cannot be expressed this way, and the design table above shows why: an RCS recipient's `to[].channel` is already `PHONE`, so both attempts would be identical. RCS falls back only through sender-pool `channels.priority` or per-channel `content.modules`, both of which need a pool resource to be created and managed. Out of scope; the fallback control appears on WhatsApp alone.
 
 ## Tracking and state
 
