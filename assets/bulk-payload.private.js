@@ -67,6 +67,9 @@ function resolveSender(from, channelNames) {
   return { address: bareAddress(raw), channel: channelNames.from };
 }
 
+const MAX_RECIPIENTS_PER_OPERATION = 10000;
+const MAX_PAYLOAD_BYTES = 10 * 1024 * 1024;
+
 const CONTENT_SID = /^HX[0-9a-f]{32}$/i;
 
 /**
@@ -279,12 +282,35 @@ function buildPayloads(request) {
     return entry;
   });
 
-  const payload = { from, to, content, tags: buildTags(request, channel) };
-
   const schedule = resolveSchedule(request.sendAt);
-  if (schedule) payload.schedule = schedule;
+  const tags = buildTags(request, channel);
 
-  return [payload];
+  const payloads = [];
+  for (let i = 0; i < to.length; i += MAX_RECIPIENTS_PER_OPERATION) {
+    const slice = to.slice(i, i + MAX_RECIPIENTS_PER_OPERATION);
+    const one = { from, to: slice, content, tags };
+    if (schedule) one.schedule = schedule;
+
+    // Recipient count is bounded above; payload *size* is not, because variable
+    // values are arbitrary. Measured per operation, since that is what is sent.
+    const bytes = Buffer.byteLength(JSON.stringify(one), 'utf8');
+    if (bytes > MAX_PAYLOAD_BYTES) {
+      throw httpError(
+        400,
+        `One request would be ${(bytes / 1024 / 1024).toFixed(1)}MB, over the Bulk Messaging limit of 10MB. Shorten the personalisation values or split the campaign.`
+      );
+    }
+
+    payloads.push(one);
+  }
+
+  return payloads;
 }
 
-module.exports = { buildPayloads, CHANNEL_MAP, bareAddress };
+module.exports = {
+  buildPayloads,
+  CHANNEL_MAP,
+  bareAddress,
+  escapeLiquid,
+  MAX_RECIPIENTS_PER_OPERATION,
+};

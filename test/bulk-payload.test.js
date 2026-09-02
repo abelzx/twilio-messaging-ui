@@ -367,3 +367,61 @@ test('rejects fallback on SMS, which is already the fallback', () => {
     (err) => err.statusCode === 400 && /WhatsApp/i.test(err.message)
   );
 });
+
+function manyRecipients(count) {
+  return Array.from({ length: count }, (_, i) => ({
+    to: `+1555${String(1000000 + i).slice(-7)}`,
+  }));
+}
+
+test('returns one payload at exactly the 10,000 limit', () => {
+  const out = payload.buildPayloads({ ...BASE, recipients: manyRecipients(10000) });
+  assert.strictEqual(out.length, 1);
+  assert.strictEqual(out[0].to.length, 10000);
+});
+
+test('splits into consecutive operations above the limit', () => {
+  const out = payload.buildPayloads({ ...BASE, recipients: manyRecipients(25000) });
+  assert.strictEqual(out.length, 3);
+  assert.deepStrictEqual(out.map((p) => p.to.length), [10000, 10000, 5000]);
+});
+
+test('every split payload carries identical sender, content and tags', () => {
+  const out = payload.buildPayloads({
+    ...BASE,
+    campaignName: 'Big',
+    recipients: manyRecipients(15000),
+  });
+  assert.deepStrictEqual(out[0].from, out[1].from);
+  assert.deepStrictEqual(out[0].content, out[1].content);
+  assert.deepStrictEqual(out[0].tags, out[1].tags);
+});
+
+test('splits preserve recipient order across the boundary', () => {
+  const recipients = manyRecipients(10002);
+  const out = payload.buildPayloads({ ...BASE, recipients });
+  assert.strictEqual(out[0].to[0].address, recipients[0].to);
+  assert.strictEqual(out[0].to[9999].address, recipients[9999].to);
+  assert.strictEqual(out[1].to[0].address, recipients[10000].to);
+  assert.strictEqual(out[1].to[1].address, recipients[10001].to);
+});
+
+test('rejects a single payload over 10MB', () => {
+  const fat = Array.from({ length: 2000 }, (_, i) => ({
+    to: `+1555${String(1000000 + i).slice(-7)}`,
+    variables: { 1: 'y'.repeat(6000) },
+  }));
+  assert.throws(
+    () => payload.buildPayloads({
+      ...BASE,
+      body: '',
+      contentSid: 'HXb0bb2f2f0f4d4a1e8f2b1c3d4e5f6a7b',
+      recipients: fat,
+    }),
+    (err) => err.statusCode === 400 && /10MB/i.test(err.message)
+  );
+});
+
+test('exposes the recipient limit so callers need not hard-code it', () => {
+  assert.strictEqual(payload.MAX_RECIPIENTS_PER_OPERATION, 10000);
+});
