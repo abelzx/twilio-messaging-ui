@@ -94,4 +94,33 @@ async function createMessages(authString, payload) {
   return { operationId };
 }
 
-module.exports = { createMessages, BASE_URL };
+/** Aggregate status and stats for one operation. */
+async function fetchOperation(authString, operationId) {
+  const response = await request(
+    authString,
+    'GET',
+    `/Messages/Operations/${encodeURIComponent(operationId)}`
+  );
+  return response.json();
+}
+
+/**
+ * One page of the Messages an operation created.
+ *
+ * Page size is pinned to the documented maximum of 1000 to keep the number of
+ * round trips down: a 10,000-recipient operation is ten pages rather than a
+ * hundred. `pagination.next` is opaque and is returned as-is for the caller to
+ * pass back.
+ */
+async function listMessages(authString, { operationId, pageToken, pageSize = 1000 } = {}) {
+  const response = await request(authString, 'GET', '/Messages', {
+    query: { operation_id: operationId, pageSize, pageToken },
+  });
+  const body = await response.json();
+  return {
+    messages: Array.isArray(body.messages) ? body.messages : [],
+    nextPageToken: (body.pagination && body.pagination.next) || null,
+  };
+}
+
+module.exports = { createMessages, fetchOperation, listMessages, BASE_URL };

@@ -91,3 +91,67 @@ test('reports a non-JSON error body without throwing on the parse', async (t) =>
   );
   assert.strictEqual(calls.length, 1);
 });
+
+const OPERATION = {
+  id: 'comms_operation_01h2x',
+  status: 'COMPLETED',
+  stats: { total: 2, recipients: 2, delivered: 1, failed: 1 },
+  createdAt: '2026-09-02T06:20:00Z',
+  updatedAt: '2026-09-02T06:21:00Z',
+};
+
+test('fetches one operation by id', async (t) => {
+  const calls = stubFetch(t, () => jsonResponse(200, OPERATION));
+
+  const operation = await comms.fetchOperation(AUTH, 'comms_operation_01h2x');
+
+  assert.strictEqual(
+    calls[0].url,
+    'https://comms.twilio.com/v1/Messages/Operations/comms_operation_01h2x'
+  );
+  assert.strictEqual(calls[0].options.method, 'GET');
+  assert.deepStrictEqual(operation, OPERATION);
+});
+
+test('URL-encodes an operation id', async (t) => {
+  const calls = stubFetch(t, () => jsonResponse(200, OPERATION));
+  await comms.fetchOperation(AUTH, 'a/b c');
+  assert.strictEqual(
+    calls[0].url,
+    'https://comms.twilio.com/v1/Messages/Operations/a%2Fb%20c'
+  );
+});
+
+test('lists messages for an operation at the maximum page size', async (t) => {
+  const calls = stubFetch(t, () =>
+    jsonResponse(200, { messages: [{ id: 'm1' }], pagination: { next: null } })
+  );
+
+  const page = await comms.listMessages(AUTH, { operationId: 'comms_operation_01h2x' });
+
+  const url = new URL(calls[0].url);
+  assert.strictEqual(url.pathname, '/v1/Messages');
+  assert.strictEqual(url.searchParams.get('operation_id'), 'comms_operation_01h2x');
+  assert.strictEqual(url.searchParams.get('pageSize'), '1000');
+  assert.deepStrictEqual(page, { messages: [{ id: 'm1' }], nextPageToken: null });
+});
+
+test('returns the next page token when there is another page', async (t) => {
+  stubFetch(t, () =>
+    jsonResponse(200, { messages: [], pagination: { next: 'tok2', self: 'tok1' } })
+  );
+  const page = await comms.listMessages(AUTH, { operationId: 'op' });
+  assert.strictEqual(page.nextPageToken, 'tok2');
+});
+
+test('sends a page token when given one', async (t) => {
+  const calls = stubFetch(t, () => jsonResponse(200, { messages: [] }));
+  await comms.listMessages(AUTH, { operationId: 'op', pageToken: 'tok2' });
+  assert.strictEqual(new URL(calls[0].url).searchParams.get('pageToken'), 'tok2');
+});
+
+test('tolerates a response with no messages array', async (t) => {
+  stubFetch(t, () => jsonResponse(200, {}));
+  const page = await comms.listMessages(AUTH, { operationId: 'op' });
+  assert.deepStrictEqual(page, { messages: [], nextPageToken: null });
+});
