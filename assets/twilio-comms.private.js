@@ -164,4 +164,20 @@ async function listMessages(
   };
 }
 
-module.exports = { createMessages, fetchOperation, listMessages, BASE_URL };
+/**
+ * Sender pools available for bulk sends.
+ *
+ * The response key is unconfirmed against a live account — Task 22 verifies it.
+ * Both `senderPools` and `sender_pools` are accepted so a naming difference
+ * degrades to an empty list rather than a crash.
+ */
+async function listSenderPools(authString) {
+  const response = await request(authString, 'GET', '/SenderPools', {
+    query: { pageSize: 100 },
+  });
+  const body = await response.json();
+  const pools = body.senderPools || body.sender_pools || body.pools;
+  return Array.isArray(pools) ? pools : [];
+}
+
+module.exports = { createMessages, fetchOperation, listMessages, listSenderPools, BASE_URL };

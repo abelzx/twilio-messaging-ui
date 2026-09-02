@@ -195,3 +195,19 @@ test('does not retry a 400', async (t) => {
   await assert.rejects(() => comms.createMessages(AUTH, {}, { baseDelay: 1 }));
   assert.strictEqual(attempts, 1);
 });
+
+test('lists sender pools', async (t) => {
+  const calls = stubFetch(t, () =>
+    jsonResponse(200, { senderPools: [{ id: 'SP1', friendlyName: 'Marketing' }] })
+  );
+
+  const pools = await comms.listSenderPools(AUTH);
+
+  assert.strictEqual(new URL(calls[0].url).pathname, '/v1/SenderPools');
+  assert.deepStrictEqual(pools, [{ id: 'SP1', friendlyName: 'Marketing' }]);
+});
+
+test('returns an empty array when no sender pools exist', async (t) => {
+  stubFetch(t, () => jsonResponse(200, {}));
+  assert.deepStrictEqual(await comms.listSenderPools(AUTH), []);
+});

@@ -3,6 +3,7 @@
  */
 
 const oauth = require(Runtime.getAssets()['/twilio-oauth.js'].path);
+const comms = require(Runtime.getAssets()['/twilio-comms.js'].path);
 
 exports.handler = async function(context, event, callback) {
   const response = new Twilio.Response();
@@ -16,8 +17,11 @@ exports.handler = async function(context, event, callback) {
   }
 
   let client;
+  let authString;
   try {
-    client = await oauth.authenticate(oauth.credsFrom(event));
+    const authed = await oauth.authenticateWithToken(oauth.credsFrom(event));
+    client = authed.client;
+    authString = authed.authString;
   } catch (error) {
     response.setStatusCode(error.statusCode || 401);
     response.setBody({ error: error.message });
@@ -27,10 +31,35 @@ exports.handler = async function(context, event, callback) {
   try {
     const channel = String(event.channel || 'sms').toLowerCase();
 
-    // A Messaging Service can send on any channel, so it is offered everywhere.
-    // Fetched concurrently with the channel-specific list: this is a second network
-    // call inside a 10s Function budget, and serialising them wastes headroom.
-    const servicesPromise = client.messaging.v1.services.list({ limit: 50 });
+    const mode = String(event.mode || 'classic').toLowerCase();
+
+    // In bulk mode a Messaging Service is not a valid sender — the Bulk API's
+    // `from` takes an address/channel pair, a senderId or a senderPoolId, and an
+    // MG SID is none of them. Sender pools take its place in the dropdown.
+    //
+    // A pool listing that fails must not fail the whole request: phone numbers
+    // are the common case and are still perfectly usable without pools.
+    const secondaryPromise = mode === 'bulk'
+      ? comms
+          .listSenderPools(authString)
+          .then((pools) => pools.map((pool) => ({
+            value: pool.id,
+            label: `${pool.friendlyName || pool.id} · pool`,
+            status: 'ONLINE',
+            kind: 'pool',
+          })))
+          .catch((error) => {
+            console.error('Sender pool list failed:', error.message);
+            return [];
+          })
+      : client.messaging.v1.services.list({ limit: 50 }).then((services) =>
+          services.map((s) => ({
+            value: s.sid,
+            label: `${s.friendlyName} · ${s.sid.slice(0, 10)}…`,
+            status: 'ONLINE',
+            kind: 'service',
+          }))
+        );
 
     let directPromise;
     if (channel === 'whatsapp' || channel === 'rcs') {
@@ -82,19 +111,13 @@ exports.handler = async function(context, event, callback) {
       });
     }
 
-    const [direct, services] = await Promise.all([directPromise, servicesPromise]);
-
-    const serviceSenders = services.map((s) => ({
-      value: s.sid,
-      label: `${s.friendlyName} · ${s.sid.slice(0, 10)}…`,
-      status: 'ONLINE',
-      kind: 'service',
-    }));
+    const [direct, serviceSenders] = await Promise.all([directPromise, secondaryPromise]);
 
     response.setStatusCode(200);
     response.setBody({
       success: true,
       channel,
+      mode,
       senders: [...direct.senders, ...serviceSenders],
       directCount: direct.senders.length,
       serviceCount: serviceSenders.length,
