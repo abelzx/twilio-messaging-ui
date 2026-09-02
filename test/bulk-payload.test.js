@@ -68,3 +68,88 @@ test('rejects an empty recipient list', () => {
     (err) => err.statusCode === 400
   );
 });
+
+test('wraps a literal body so Liquid cannot interpret it', () => {
+  const [out] = payload.buildPayloads({ ...BASE, body: 'Hi {{name}}, 50% off' });
+  assert.deepStrictEqual(out.content, {
+    text: '{% raw %}Hi {{name}}, 50% off{% endraw %}',
+  });
+});
+
+test('wraps a body with no Liquid syntax too, so behaviour does not vary', () => {
+  const [out] = payload.buildPayloads({ ...BASE, body: 'Hello' });
+  assert.strictEqual(out.content.text, '{% raw %}Hello{% endraw %}');
+});
+
+test('rejects a body that would break out of the raw wrapper', () => {
+  assert.throws(
+    () => payload.buildPayloads({ ...BASE, body: 'a {% endraw %} b' }),
+    (err) => err.statusCode === 400 && /endraw/i.test(err.message)
+  );
+});
+
+test('sends a content template by id with no text', () => {
+  const [out] = payload.buildPayloads({
+    ...BASE,
+    body: '',
+    contentSid: 'HXb0bb2f2f0f4d4a1e8f2b1c3d4e5f6a7b',
+  });
+  assert.deepStrictEqual(out.content, { contentId: 'HXb0bb2f2f0f4d4a1e8f2b1c3d4e5f6a7b' });
+});
+
+test('a content template wins over a typed body', () => {
+  const [out] = payload.buildPayloads({
+    ...BASE,
+    body: 'ignored',
+    contentSid: 'HXb0bb2f2f0f4d4a1e8f2b1c3d4e5f6a7b',
+  });
+  assert.deepStrictEqual(out.content, { contentId: 'HXb0bb2f2f0f4d4a1e8f2b1c3d4e5f6a7b' });
+});
+
+test('carries positional template variables per recipient', () => {
+  const [out] = payload.buildPayloads({
+    ...BASE,
+    body: '',
+    contentSid: 'HXb0bb2f2f0f4d4a1e8f2b1c3d4e5f6a7b',
+    recipients: [
+      { to: '+15558675310', variables: { 1: 'Sarah', 2: '10am' } },
+      { to: '+15558675311', variables: { 1: 'Ravi', 2: '2pm' } },
+    ],
+  });
+  assert.deepStrictEqual(out.to, [
+    { address: '+15558675310', channel: 'PHONE', variables: { 1: 'Sarah', 2: '10am' } },
+    { address: '+15558675311', channel: 'PHONE', variables: { 1: 'Ravi', 2: '2pm' } },
+  ]);
+});
+
+test('carries named template variables unchanged', () => {
+  const [out] = payload.buildPayloads({
+    ...BASE,
+    body: '',
+    contentSid: 'HXb0bb2f2f0f4d4a1e8f2b1c3d4e5f6a7b',
+    recipients: [{ to: '+15558675310', variables: { name: 'Sarah' } }],
+  });
+  assert.deepStrictEqual(out.to[0].variables, { name: 'Sarah' });
+});
+
+test('omits variables entirely when a recipient has none', () => {
+  const [out] = payload.buildPayloads(BASE);
+  assert.strictEqual('variables' in out.to[0], false);
+});
+
+test('sends an empty variable as empty text, not a fallback', () => {
+  const [out] = payload.buildPayloads({
+    ...BASE,
+    body: '',
+    contentSid: 'HXb0bb2f2f0f4d4a1e8f2b1c3d4e5f6a7b',
+    recipients: [{ to: '+15558675310', variables: { 1: '' } }],
+  });
+  assert.deepStrictEqual(out.to[0].variables, { 1: '' });
+});
+
+test('rejects a request with neither body nor content template', () => {
+  assert.throws(
+    () => payload.buildPayloads({ ...BASE, body: '' }),
+    (err) => err.statusCode === 400 && /message body|content template/i.test(err.message)
+  );
+});

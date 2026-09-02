@@ -67,6 +67,63 @@ function resolveSender(from, channelNames) {
   return { address: bareAddress(raw), channel: channelNames.from };
 }
 
+const CONTENT_SID = /^HX[0-9a-f]{32}$/i;
+
+/**
+ * Wraps text so Liquid renders it verbatim.
+ *
+ * `content.text` is Liquid-templated, so an unwrapped `{{name}}` in a body typed
+ * by a user would be interpreted and almost certainly render empty. The classic
+ * path sends bodies literally, and the two modes must not differ on this.
+ *
+ * `{% endraw %}` in the text would close the wrapper early and expose the rest
+ * to interpretation. Liquid offers no way to escape it, so it is refused.
+ */
+function escapeLiquid(text) {
+  const raw = String(text);
+  if (/\{%-?\s*endraw\s*-?%\}/.test(raw)) {
+    throw httpError(
+      400,
+      'The message body contains the literal text "{% endraw %}", which cannot be sent safely on this mode. Remove it, or switch to Programmable Messaging.'
+    );
+  }
+  return `{% raw %}${raw}{% endraw %}`;
+}
+
+/**
+ * Resolves the single `content` object shared by every recipient in the request.
+ *
+ * Precedence is template, then per-recipient text, then literal body. The middle
+ * case is the CSV `Body` column: the Bulk API carries one content object per
+ * request, so per-recipient text has no direct equivalent and is routed through
+ * a single Liquid variable instead. Liquid substitutes in one pass, so a
+ * recipient's own text is not itself re-rendered.
+ */
+function resolveContent(request, recipients) {
+  const contentSid = String(request.contentSid || '').trim();
+  if (contentSid) {
+    if (!CONTENT_SID.test(contentSid)) {
+      throw httpError(400, `"${contentSid}" is not a content template SID.`);
+    }
+    return { content: { contentId: contentSid }, perRecipientBody: false };
+  }
+
+  const body = String(request.body == null ? '' : request.body);
+  const anyOwnBody = recipients.some(
+    (recipient) => String(recipient.body == null ? '' : recipient.body).trim() !== ''
+  );
+
+  if (anyOwnBody) {
+    return { content: { text: '{{body}}' }, perRecipientBody: true };
+  }
+
+  if (!body.trim()) {
+    throw httpError(400, 'A message body or a content template is required.');
+  }
+
+  return { content: { text: escapeLiquid(body) }, perRecipientBody: false };
+}
+
 function buildPayloads(request) {
   const channel = String((request && request.channel) || '').toLowerCase();
   const channelNames = CHANNEL_MAP[channel];
@@ -83,13 +140,32 @@ function buildPayloads(request) {
   }
 
   const from = resolveSender(request.from, channelNames);
+  const { content, perRecipientBody } = resolveContent(request, recipients);
+  const campaignBody = String(request.body == null ? '' : request.body);
 
-  const to = recipients.map((recipient) => ({
-    address: bareAddress(recipient.to),
-    channel: channelNames.to,
-  }));
+  const to = recipients.map((recipient) => {
+    const entry = {
+      address: bareAddress(recipient.to),
+      channel: channelNames.to,
+    };
 
-  return [{ from, to }];
+    const variables = { ...(recipient.variables || {}) };
+
+    if (perRecipientBody) {
+      // A blank cell falls back to the body typed above, matching the classic
+      // path. A blank *variable* does not fall back — see resolveContent.
+      const own = String(recipient.body == null ? '' : recipient.body);
+      variables.body = own.trim() === '' ? campaignBody : own;
+    }
+
+    if (Object.keys(variables).length > 0) {
+      entry.variables = variables;
+    }
+
+    return entry;
+  });
+
+  return [{ from, to, content }];
 }
 
 module.exports = { buildPayloads, CHANNEL_MAP, bareAddress };
