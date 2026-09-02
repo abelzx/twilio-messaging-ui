@@ -102,8 +102,10 @@ function initializeApp() {
     setupPhoneNumberHandlers();
 
     // Sync everything else that depends on the mode (hidden groups, the
-    // Messenger option, help text) now that the toggle reflects it.
-    applySendMode();
+    // Messenger option, help text) now that the toggle reflects it. No sender
+    // refetch: showAppScreen() above already fetched with the toggle already
+    // restored to its saved value, so a second fetch here would be a duplicate.
+    applySendMode(false);
 }
 
 function setupPhoneNumberHandlers() {
@@ -147,8 +149,15 @@ function isBulkMode() {
  * Messenger channel at all, and the send note is inverted: in bulk mode the
  * campaign runs on Twilio, so the tab does not have to stay open. That note is
  * the most visible difference between the modes and must not go stale.
+ *
+ * `refetchSenders` defaults to true (the mode-toggle change listener wants
+ * it), but callers whose sender fetch already reflects the current mode pass
+ * false — see initializeApp(), which restores the toggle before showAppScreen()
+ * fires its own fetch, making a second one here redundant (and each one pays
+ * its own OAuth token exchange, the same reason showAppScreen() itself avoids
+ * a duplicate call — see the comment there).
  */
-function applySendMode() {
+function applySendMode(refetchSenders = true) {
     const bulk = isBulkMode();
     sessionStorage.setItem(MODE_KEY, getSendMode());
 
@@ -160,12 +169,18 @@ function applySendMode() {
     const messengerOption = channelSelect
         ? channelSelect.querySelector('option[value="messenger"]')
         : null;
+    // Set when the messenger-to-sms switch below dispatches a real "change"
+    // event: that event runs handleChannelChange(), which already calls
+    // loadPhoneNumbers() for the new channel. The explicit call further down
+    // must then be skipped, or the same request fires twice.
+    let channelChangeHandledFetch = false;
     if (messengerOption) {
         messengerOption.hidden = bulk;
         messengerOption.disabled = bulk;
         if (bulk && channelSelect.value === 'messenger') {
             channelSelect.value = 'sms';
             channelSelect.dispatchEvent(new Event('change'));
+            channelChangeHandledFetch = true;
         }
     }
 
@@ -187,8 +202,10 @@ function applySendMode() {
 
     // Senders differ by mode: bulk cannot use a Messaging Service, so the list
     // must be refetched rather than filtered client-side. loadPhoneNumbers takes
-    // the channel explicitly (assets/app.js:473).
-    if (channelSelect && channelSelect.value) {
+    // the channel explicitly (assets/app.js:473). Skipped when the channel-change
+    // dispatch above already triggered an equivalent fetch, or when the caller
+    // says one already happened elsewhere.
+    if (refetchSenders && !channelChangeHandledFetch && channelSelect && channelSelect.value) {
         loadPhoneNumbers(channelSelect.value);
     }
 }
@@ -273,7 +290,9 @@ function setupEventListeners() {
     const sendModeSelect = document.getElementById('send-mode');
     if (sendModeSelect) {
         sendModeSelect.value = sessionStorage.getItem(MODE_KEY) || 'classic';
-        sendModeSelect.addEventListener('change', applySendMode);
+        // Wrapped rather than passed directly: addEventListener would otherwise
+        // pass the Event object as applySendMode's refetchSenders argument.
+        sendModeSelect.addEventListener('change', () => applySendMode());
     }
 
     // Re-render the template list when the status filter changes
@@ -1404,9 +1423,14 @@ async function checkBulkCampaignStatus() {
 /**
  * Fetches every per-recipient row, following the cursor the Function returns
  * when one 9-second invocation cannot finish paging.
+ *
+ * Also returns the last `campaign` object seen. Every check-bulk-status
+ * response carries the current aggregate stats alongside the messages page,
+ * so the caller gets both without paying for a second request.
  */
 async function loadBulkMessages(campaignId) {
     const rows = [];
+    let campaign = null;
     let cursor = null;
 
     do {
@@ -1421,10 +1445,11 @@ async function loadBulkMessages(campaignId) {
         if (!response.ok) throw new Error(data.error || 'Failed to load recipients');
 
         rows.push(...(data.messages || []));
+        campaign = data.campaign || campaign;
         cursor = data.nextCursor;
     } while (cursor);
 
-    return rows;
+    return { rows, campaign };
 }
 
 /**
@@ -1436,9 +1461,43 @@ function normaliseBulkStatus(status) {
 }
 
 /**
+ * Maps a check-bulk-status `campaign` object's aggregate stats to the same
+ * five fields the classic path already supplies on its own campaign object
+ * (totalMessages, sent, delivered, read, failed) — displayMessageDetails's
+ * summary header reads those five and nothing else. Mirrors
+ * functions/list-campaigns.js's bulk mapping exactly (including `unaddressable`
+ * counting as failed, not pending); keep the two in sync if that mapping ever
+ * changes.
+ */
+function bulkCampaignAggregates(campaign) {
+    const stats = (campaign && campaign.stats) || {};
+    return {
+        totalMessages: (campaign && campaign.recipientCount) || 0,
+        sent: Number(stats.sent || 0) + Number(stats.delivered || 0) + Number(stats.read || 0),
+        delivered: Number(stats.delivered || 0) + Number(stats.read || 0),
+        read: Number(stats.read || 0),
+        failed: Number(stats.failed || 0) + Number(stats.undelivered || 0) + Number(stats.unaddressable || 0),
+    };
+}
+
+/**
  * Reshapes bulk rows into the `statuses` map the existing table and CSV export
  * already read, so neither needs a bulk-specific branch.
  */
+/**
+ * `to`'s exact shape on a bulk message row is unconfirmed — the Bulk
+ * Messaging API's Message resource schema was not settled by the docs pages
+ * checked for this. Tries every plausible shape: a bare string, `{ address }`,
+ * or an array whose first element is either of those. This is the one place
+ * that reads it; correct here once the live shape is confirmed.
+ */
+function bulkRecipientAddress(to) {
+    if (typeof to === 'string') return to;
+    if (Array.isArray(to)) return bulkRecipientAddress(to[0]);
+    if (to && typeof to.address === 'string') return to.address;
+    return '';
+}
+
 function bulkRowsToStatuses(rows) {
     const statuses = {};
 
@@ -1450,9 +1509,13 @@ function bulkRowsToStatuses(rows) {
 
         statuses[key] = {
             status,
-            to: (row.to && (row.to.address || row.to)) || '',
+            to: bulkRecipientAddress(row.to),
             sentAt: row.createdAt || row.updatedAt || null,
             dateSent: row.createdAt || null,
+            // Whether bulk errors live on the message row at all, or behind a
+            // separate endpoint, is also unconfirmed. Left as a direct read:
+            // if absent, this degrades to null, which the table and CSV
+            // export already render as "-".
             errorCode: row.errorCode == null ? null : row.errorCode,
             errorMessage: row.errorMessage == null ? null : row.errorMessage,
             delivered: status === 'delivered' || status === 'read',
@@ -1610,9 +1673,17 @@ function displayCampaigns(campaigns) {
         const isActive = campaign.campaignId === currentCampaignId;
         // Progress is how far through the recipient list we are, not a ratio of
         // send attempts — a resent chunk would otherwise push this past 100%.
-        const processed = Number.isFinite(campaign.startIndex)
-            ? campaign.startIndex
-            : (campaign.sent || 0);
+        // Bulk rows have no startIndex, and their `sent` deliberately excludes
+        // failed/unaddressable recipients while totalMessages counts everyone —
+        // so a finished bulk campaign with any failures would otherwise read
+        // under 100% next to a "Complete" badge. totalMessages - pending counts
+        // every terminal outcome, success or failure, and reaches 100% exactly
+        // when nothing is left pending.
+        const processed = campaign.mode === 'bulk'
+            ? (campaign.totalMessages || 0) - (campaign.pending || 0)
+            : Number.isFinite(campaign.startIndex)
+                ? campaign.startIndex
+                : (campaign.sent || 0);
         const progress = campaign.totalMessages > 0
             ? Math.min(100, (processed / campaign.totalMessages) * 100).toFixed(1)
             : 0;
@@ -1729,13 +1800,18 @@ async function fetchAndDisplayCampaignDetails(campaignId, mode) {
 
     if (bulk) {
         try {
-            const rows = await loadBulkMessages(campaignId);
+            const { rows, campaign } = await loadBulkMessages(campaignId);
             // displayMessageDetails reads campaign.statuses and stores the whole
-            // object in displayedCampaign, which is what CSV export exports.
+            // object in displayedCampaign, which is what CSV export exports. The
+            // summary header above the table reads totalMessages/sent/failed/
+            // delivered/read from this same object, so the aggregate fields are
+            // spread in too — without them the header renders zeroes even though
+            // the table beneath it is fully populated.
             displayMessageDetails({
                 campaignId,
                 mode: 'bulk',
                 statuses: bulkRowsToStatuses(rows),
+                ...bulkCampaignAggregates(campaign),
             });
         } catch (error) {
             console.error('Error loading bulk recipients:', error);
@@ -1845,7 +1921,13 @@ function displayMessageDetails(campaign) {
         // Rejected sends are keyed "failed-<n>" because Twilio never issued a
         // SID. Showing that internal key in a column headed "Message SID" would
         // read as a real identifier, so say what actually happened instead.
-        const sidLabel = MESSAGE_SID.test(sid) ? sid : 'not accepted';
+        // Bulk identifiers are not classic Twilio SIDs at all, so they always
+        // fail MESSAGE_SID — testing them against it would label every
+        // successfully delivered bulk message as rejected. Show the bulk
+        // identifier as-is instead; the regex only applies to classic rows.
+        const sidLabel = campaign.mode === 'bulk'
+            ? sid
+            : (MESSAGE_SID.test(sid) ? sid : 'not accepted');
 
         const formatDate = (dateValue) => {
             if (!dateValue) return 'N/A';
@@ -2141,8 +2223,11 @@ function exportMessageStatusCsv() {
         return new Date(dateB) - new Date(dateA);
     });
 
+    // Bulk identifiers are not classic Twilio SIDs — see the same check in
+    // displayMessageDetails for why they must not be tested against MESSAGE_SID.
+    const bulk = campaign.mode === 'bulk';
     const rows = entries.map(([sid, s]) => ({
-        'Message SID': MESSAGE_SID.test(sid) ? sid : 'not accepted',
+        'Message SID': bulk ? sid : (MESSAGE_SID.test(sid) ? sid : 'not accepted'),
         'To': s.to || '',
         'Status': s.status || '',
         'Delivered': s.delivered ? 'Yes' : 'No',
