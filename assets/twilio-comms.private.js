@@ -171,10 +171,15 @@ async function listMessages(
  * Both `senderPools` and `sender_pools` are accepted so a naming difference
  * degrades to an empty list rather than a crash.
  */
-async function listSenderPools(authString) {
-  const response = await request(authString, 'GET', '/SenderPools', {
-    query: { pageSize: 100 },
-  });
+async function listSenderPools(authString, retryOptions) {
+  // Wrapped like its three siblings above: a 429 here is otherwise
+  // indistinguishable from "this account has no pools" once it's caught by
+  // get-phone-numbers.js's poolListFailed handling, so it deserves the same
+  // backoff-and-retry chance before giving up.
+  const response = await withRateLimitRetry(
+    () => request(authString, 'GET', '/SenderPools', { query: { pageSize: 100 } }),
+    retryOptions
+  );
   const body = await response.json();
   const pools = body.senderPools || body.sender_pools || body.pools;
   return Array.isArray(pools) ? pools : [];

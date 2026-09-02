@@ -717,6 +717,17 @@ function renderSenderOptions(data) {
 
     select.innerHTML = '';
 
+    // poolListFailed is only ever set in bulk mode, and only when the pool
+    // lookup itself threw — an account with zero pools configured never sets
+    // it. Left unsurfaced, that failure reads identically to "no pools on this
+    // account", which is exactly the confusion the flag exists to prevent.
+    // Phone numbers are unaffected either way (they come from a separate,
+    // independent lookup), so this is appended as a warning rather than
+    // replacing whichever message follows.
+    const poolWarning = data.poolListFailed
+        ? ' Sender pool list could not be loaded — any pools on this account are missing from the list above.'
+        : '';
+
     if (!senders.length) {
         const opt = document.createElement('option');
         opt.value = '';
@@ -729,7 +740,7 @@ function renderSenderOptions(data) {
             ? `No usable ${noun}s — ${data.totalRegistered} registered but not online`
             : `No ${noun}s or Messaging Services registered on this account`;
         select.appendChild(opt);
-        setSenderHelp(opt.textContent, true);
+        setSenderHelp(opt.textContent + poolWarning, true);
         return;
     }
 
@@ -738,8 +749,14 @@ function renderSenderOptions(data) {
     placeholder.textContent = `Select ${article} ${noun}…`;
     select.appendChild(placeholder);
 
-    const direct = senders.filter((s) => s.kind !== 'service');
+    // kind is always exactly one of 'direct' | 'service' | 'pool' — see
+    // get-phone-numbers.js — so partitioning strictly by kind (rather than the
+    // previous "not service" catch-all) does not change who lands in `direct`.
+    // It does mean a pool sender gets its own bucket instead of falling into
+    // this one by default.
+    const direct = senders.filter((s) => s.kind === 'direct');
     const services = senders.filter((s) => s.kind === 'service');
+    const pools = senders.filter((s) => s.kind === 'pool');
 
     const addGroup = (labelText, items) => {
         if (!items.length) return;
@@ -756,14 +773,25 @@ function renderSenderOptions(data) {
 
     addGroup(`${noun.replace(/^./, (c) => c.toUpperCase())}s`, direct);
     addGroup('Messaging Services', services);
+    // Classic mode never carries a kind: 'pool' sender, so `pools` is always
+    // empty there and this group simply does not render — classic-mode output
+    // is unchanged.
+    addGroup('Sender Pools', pools);
 
+    // Counted from the partitioned arrays rather than data.directCount /
+    // data.serviceCount: those two names are generic over classic and bulk
+    // (serviceCount is actually a pool count in bulk mode), and reusing them
+    // here would mislabel pools as "Messaging Services". direct.length and
+    // services.length equal directCount/serviceCount exactly in every mode
+    // that has ever produced them, so classic-mode text is unaffected.
     const parts = [];
-    if (data.directCount) parts.push(`${data.directCount} ${noun}${data.directCount === 1 ? '' : 's'}`);
-    if (data.serviceCount) parts.push(`${data.serviceCount} Messaging Service${data.serviceCount === 1 ? '' : 's'}`);
+    if (direct.length) parts.push(`${direct.length} ${noun}${direct.length === 1 ? '' : 's'}`);
+    if (services.length) parts.push(`${services.length} Messaging Service${services.length === 1 ? '' : 's'}`);
+    if (pools.length) parts.push(`${pools.length} sender pool${pools.length === 1 ? '' : 's'}`);
     const hidden = (data.totalRegistered || 0) - (data.directCount || 0);
     setSenderHelp(
-        parts.join(' · ') + (hidden > 0 ? ` · ${hidden} not online` : ''),
-        false
+        parts.join(' · ') + (hidden > 0 ? ` · ${hidden} not online` : '') + poolWarning,
+        Boolean(data.poolListFailed)
     );
 }
 

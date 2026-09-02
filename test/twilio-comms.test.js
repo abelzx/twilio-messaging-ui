@@ -211,3 +211,18 @@ test('returns an empty array when no sender pools exist', async (t) => {
   stubFetch(t, () => jsonResponse(200, {}));
   assert.deepStrictEqual(await comms.listSenderPools(AUTH), []);
 });
+
+test('retries a 429 when listing sender pools', async (t) => {
+  let attempts = 0;
+  stubFetch(t, () => {
+    attempts += 1;
+    return attempts === 1
+      ? jsonResponse(429, { code: 20429, message: 'Too Many Requests' })
+      : jsonResponse(200, { senderPools: [{ id: 'SP1', friendlyName: 'Marketing' }] });
+  });
+
+  const pools = await comms.listSenderPools(AUTH, { baseDelay: 1 });
+
+  assert.strictEqual(attempts, 2);
+  assert.deepStrictEqual(pools, [{ id: 'SP1', friendlyName: 'Marketing' }]);
+});
