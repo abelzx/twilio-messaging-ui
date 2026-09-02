@@ -2680,6 +2680,15 @@ git commit -m "feat: submit bulk campaigns in a single request"
 
 **No new renderer.** The campaign card is drawn by `displayCampaigns` (`assets/app.js:1283`) from the fields `list-campaigns.js` returns, which Task 14 already populates from bulk stats — so refreshing the card is just `loadCampaigns()`. Likewise the delivery table and CSV export both read `campaign.statuses`, an object keyed by message identifier (`displayMessageDetails` at `assets/app.js:1430`, `exportMessageStatusCsv` at `1788`). Building a synthetic `statuses` map from the bulk rows reuses both unchanged.
 
+> **Four corrections found in code review of this task and Task 18.** The code below still shows the original; apply these:
+>
+> 1. **`refreshCurrentCampaign()` must not route on `isBulkMode()`.** The toggle says what the *next* campaign will use, not what the *open* one used, so opening a bulk campaign from history and then flipping the toggle sends the next poll to `check-status`, which answers 409. Track the open campaign's mode in a module-level variable instead — set from the toggle when a campaign is created, and from the row's own `mode` when one is opened.
+> 2. **The synthetic campaign passed to `displayMessageDetails` needs the aggregate fields too.** `{campaignId, mode, statuses}` alone leaves the panel's summary header reading "Total Messages: 0, Sent: 0, Failed: 0" above a correctly-populated table, because that header reads `campaign.totalMessages/sent/failed/delivered/read`. Derive them from the operation stats using the same mapping `list-campaigns.js` uses for bulk rows.
+> 3. **`displayCampaigns`' progress bar never reaches 100% for a bulk campaign with failures.** It falls back to `campaign.sent` when `startIndex` is absent, and bulk `sent` excludes failures while `totalMessages` counts every recipient — so a finished campaign shows a part-filled bar beside a "Complete" badge. For bulk, count everything terminal: `totalMessages - pending`.
+> 4. **A bulk identifier is not a classic SID**, so testing it against the `MESSAGE_SID` regex labels every delivered bulk message "not accepted" in both the table and the CSV. Display a bulk row's identifier as-is.
+>
+> Two field shapes in `bulkRowsToStatuses` remain **unconfirmed** and must not be guessed: whether `to` is a string, an object with `address`, or an array, and whether `errorCode`/`errorMessage` exist on the message at all or live behind a separate errors endpoint. The published docs settle only that the identifier is `messageId`. Handle the plausible shapes tolerantly and confirm in Task 19.
+
 - [ ] **Step 1: Add the bulk status poller and the row loader**
 
 Insert after `checkCampaignStatus` ends at `assets/app.js:1175`:
