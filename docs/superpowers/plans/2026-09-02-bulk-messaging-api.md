@@ -2058,6 +2058,11 @@ git commit -m "feat: submit campaigns through the Bulk Messaging API"
 
 Sums stats across the campaign's operations, and pages the per-recipient list only when asked. The paging loop is bounded by the same 9-second budget the classic path uses, returning a token so the browser can continue.
 
+> **Two corrections found in code review of this task**, both folded into the code below — if you are reading the original version elsewhere, these are missing from it:
+>
+> 1. **A `mode !== 'bulk'` guard is required immediately after the ownership check.** Without it, an owner passing a *classic* campaign's ID gets `operationIds: []`, all-zero stats written onto that classic document as new keys, and a response claiming `mode: 'bulk'`. The size consequence is the sharp edge: a classic document already holds the recipient list *and* the per-message status map, so it can sit near Sync's 16KiB cap, and the extra keys can push it over — turning an ordinary status check into an opaque 500. Task 14 adds the mirror guard to `check-status.js`; this one was originally missed.
+> 2. **A poll that reaches no operations must not overwrite stored stats.** Lines writing `stats`/`operationStatuses`/`isComplete` have to be skipped when `reachable.length === 0 && operationIds.length > 0`, or one transient `comms.twilio.com` failure persists a campaign that had delivered 8,000 messages as having delivered none. `check-status.js:98-103` sets the precedent, merging fetch errors into existing state rather than replacing it.
+
 - [ ] **Step 1: Write the Function**
 
 Create `functions/check-bulk-status.js`:
