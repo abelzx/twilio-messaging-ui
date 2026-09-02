@@ -155,3 +155,43 @@ test('tolerates a response with no messages array', async (t) => {
   const page = await comms.listMessages(AUTH, { operationId: 'op' });
   assert.deepStrictEqual(page, { messages: [], nextPageToken: null });
 });
+
+test('retries a 429 and succeeds', async (t) => {
+  let attempts = 0;
+  stubFetch(t, () => {
+    attempts += 1;
+    return attempts === 1
+      ? jsonResponse(429, { code: 20429, message: 'Too Many Requests' })
+      : jsonResponse(202, undefined, { operationId: 'comms_operation_ok' });
+  });
+
+  const result = await comms.createMessages(AUTH, {}, { baseDelay: 1 });
+
+  assert.strictEqual(attempts, 2);
+  assert.strictEqual(result.operationId, 'comms_operation_ok');
+});
+
+test('gives up after the retry budget and surfaces the 429', async (t) => {
+  let attempts = 0;
+  stubFetch(t, () => {
+    attempts += 1;
+    return jsonResponse(429, { code: 20429, message: 'Too Many Requests' });
+  });
+
+  await assert.rejects(
+    () => comms.createMessages(AUTH, {}, { maxRetries: 2, baseDelay: 1 }),
+    (err) => err.statusCode === 429
+  );
+  assert.strictEqual(attempts, 3);
+});
+
+test('does not retry a 400', async (t) => {
+  let attempts = 0;
+  stubFetch(t, () => {
+    attempts += 1;
+    return jsonResponse(400, { code: 21211, message: 'Invalid' });
+  });
+
+  await assert.rejects(() => comms.createMessages(AUTH, {}, { baseDelay: 1 }));
+  assert.strictEqual(attempts, 1);
+});

@@ -55,6 +55,32 @@ async function raiseFor(response) {
   throw httpError(response.status, detail, body && body.code);
 }
 
+/**
+ * Retries a 429 with exponential backoff and jitter.
+ *
+ * Deliberately not shared with the copy in send-messages.js. Extracting that one
+ * would mean editing the classic send path, which this branch leaves alone, and
+ * the two have different jobs: that retries up to 100 concurrent creates, this
+ * retries a single request. Jitter still matters — several browsers submitting
+ * campaigns at once would otherwise retry in lockstep.
+ */
+async function withRateLimitRetry(fn, { maxRetries = 3, baseDelay = 1000, maxDelay = 8000 } = {}) {
+  let lastError;
+  for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+      if (error.statusCode !== 429 || attempt === maxRetries) throw error;
+
+      const delay = Math.min(baseDelay * 2 ** attempt, maxDelay);
+      const jitter = Math.random() * 0.3 * delay;
+      await new Promise((resolve) => setTimeout(resolve, delay + jitter));
+    }
+  }
+  throw lastError;
+}
+
 async function request(authString, method, path, { body, query } = {}) {
   const url = new URL(`${BASE_URL}${path}`);
   for (const [key, value] of Object.entries(query || {})) {
@@ -82,8 +108,11 @@ async function request(authString, method, path, { body, query } = {}) {
  * arrives as a response header. A 202 without one leaves nothing to track, so
  * it is treated as a protocol failure rather than a success.
  */
-async function createMessages(authString, payload) {
-  const response = await request(authString, 'POST', '/Messages', { body: payload });
+async function createMessages(authString, payload, retryOptions) {
+  const response = await withRateLimitRetry(
+    () => request(authString, 'POST', '/Messages', { body: payload }),
+    retryOptions
+  );
   const operationId = response.headers.get('operationid');
   if (!operationId) {
     throw httpError(
@@ -95,11 +124,15 @@ async function createMessages(authString, payload) {
 }
 
 /** Aggregate status and stats for one operation. */
-async function fetchOperation(authString, operationId) {
-  const response = await request(
-    authString,
-    'GET',
-    `/Messages/Operations/${encodeURIComponent(operationId)}`
+async function fetchOperation(authString, operationId, retryOptions) {
+  const response = await withRateLimitRetry(
+    () =>
+      request(
+        authString,
+        'GET',
+        `/Messages/Operations/${encodeURIComponent(operationId)}`
+      ),
+    retryOptions
   );
   return response.json();
 }
@@ -112,10 +145,18 @@ async function fetchOperation(authString, operationId) {
  * hundred. `pagination.next` is opaque and is returned as-is for the caller to
  * pass back.
  */
-async function listMessages(authString, { operationId, pageToken, pageSize = 1000 } = {}) {
-  const response = await request(authString, 'GET', '/Messages', {
-    query: { operation_id: operationId, pageSize, pageToken },
-  });
+async function listMessages(
+  authString,
+  { operationId, pageToken, pageSize = 1000 } = {},
+  retryOptions
+) {
+  const response = await withRateLimitRetry(
+    () =>
+      request(authString, 'GET', '/Messages', {
+        query: { operation_id: operationId, pageSize, pageToken },
+      }),
+    retryOptions
+  );
   const body = await response.json();
   return {
     messages: Array.isArray(body.messages) ? body.messages : [],
