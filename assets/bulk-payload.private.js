@@ -81,6 +81,10 @@ const CONTENT_SID = /^HX[0-9a-f]{32}$/i;
  */
 function escapeLiquid(text) {
   const raw = String(text);
+  // No /i flag: Liquid tag names are case-sensitive, so "{% ENDRAW %}" does not
+  // close a raw block and cannot be used to break out of the wrapper. Matching
+  // case-insensitively here would reject harmless text that Liquid itself treats
+  // as inert.
   if (/\{%-?\s*endraw\s*-?%\}/.test(raw)) {
     throw httpError(
       400,
@@ -105,6 +109,12 @@ function resolveContent(request, recipients) {
     if (!CONTENT_SID.test(contentSid)) {
       throw httpError(400, `"${contentSid}" is not a content template SID.`);
     }
+    // Template wins outright: any per-recipient `body` values are silently
+    // discarded here (perRecipientBody stays false, so the recipient loop never
+    // reads recipient.body). This can't arise through the app — the CSV is
+    // either `Number,Body` with no template selected or `Number,{{1}}` with one,
+    // never both — but a caller that wires this module up differently should
+    // know a template always overrides a CSV body column.
     return { content: { contentId: contentSid }, perRecipientBody: false };
   }
 
@@ -114,6 +124,24 @@ function resolveContent(request, recipients) {
   );
 
   if (anyOwnBody) {
+    // Unlike the campaign-wide case below, a blank body here isn't necessarily
+    // fatal — it might still fall back to the campaign body per recipient, in
+    // the loop in buildPayloads. But a recipient with neither their own body
+    // nor a campaign body to fall back on would get `variables.body === ''`,
+    // i.e. a genuinely blank message sent to a real person. The classic path
+    // (interpretCsv in assets/app.js) skips such a row entirely; this module
+    // has no "skip a recipient" concept, and silently sending nothing is worse
+    // than a loud rejection, so it throws instead.
+    const missing = recipients.filter(
+      (recipient) =>
+        String(recipient.body == null ? '' : recipient.body).trim() === '' && !body.trim()
+    ).length;
+    if (missing > 0) {
+      throw httpError(
+        400,
+        `${missing} recipient(s) have no message text: their row's body is blank and no message body was typed to fall back on.`
+      );
+    }
     return { content: { text: '{{body}}' }, perRecipientBody: true };
   }
 
@@ -149,11 +177,24 @@ function buildPayloads(request) {
       channel: channelNames.to,
     };
 
+    // `variables.body` below is set unconditionally in perRecipientBody mode,
+    // clobbering any `variables.body` a caller supplied directly. This can't
+    // arise through the app — the CSV is either `Number,Body` (perRecipientBody,
+    // no template variables) or `Number,{{1}}` (template variables, no body
+    // column), never both — but a caller combining the two should know body
+    // wins.
     const variables = { ...(recipient.variables || {}) };
 
     if (perRecipientBody) {
-      // A blank cell falls back to the body typed above, matching the classic
-      // path. A blank *variable* does not fall back — see resolveContent.
+      // The fallback-to-campaign-body mechanic matches the classic path
+      // (interpretCsv in assets/app.js): a blank cell falls back to the body
+      // typed above rather than being treated as missing. It does NOT fully
+      // match that path's behaviour, though — interpretCsv skips a row outright
+      // when neither the cell nor the campaign body has text; this module has
+      // no way to skip one recipient out of a shared Bulk request, so
+      // resolveContent instead rejects the whole request up front when that
+      // would happen. A blank *variable* (as opposed to a blank body) does not
+      // fall back at all — see resolveContent.
       const own = String(recipient.body == null ? '' : recipient.body);
       variables.body = own.trim() === '' ? campaignBody : own;
     }

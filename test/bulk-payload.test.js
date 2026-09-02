@@ -196,3 +196,51 @@ test('a per-recipient body is not itself Liquid-escaped', () => {
   });
   assert.strictEqual(out.to[0].variables.body, 'Literal {{name}} stays');
 });
+
+test('rejects a recipient with no message text and no campaign body to fall back on', () => {
+  assert.throws(
+    () =>
+      payload.buildPayloads({
+        ...BASE,
+        body: '',
+        recipients: [
+          { to: '+15558675310', body: 'Has one' },
+          { to: '+15558675311' },
+        ],
+      }),
+    (err) =>
+      err.statusCode === 400 &&
+      /1 recipient\(s\) have no message text/i.test(err.message) &&
+      /blank/i.test(err.message)
+  );
+});
+
+test('counts every recipient missing message text in the rejection', () => {
+  assert.throws(
+    () =>
+      payload.buildPayloads({
+        ...BASE,
+        body: '',
+        recipients: [
+          { to: '+15558675310', body: 'Has one' },
+          { to: '+15558675311' },
+          { to: '+15558675312', body: '   ' },
+        ],
+      }),
+    (err) => err.statusCode === 400 && /2 recipient\(s\) have no message text/i.test(err.message)
+  );
+});
+
+test('a partially-filled body column still works when a campaign body is present', () => {
+  const [out] = payload.buildPayloads({
+    ...BASE,
+    body: 'Fallback body',
+    recipients: [
+      { to: '+15558675310', body: 'Own text' },
+      { to: '+15558675311' },
+    ],
+  });
+  assert.deepStrictEqual(out.content, { text: '{{body}}' });
+  assert.strictEqual(out.to[0].variables.body, 'Own text');
+  assert.strictEqual(out.to[1].variables.body, 'Fallback body');
+});
