@@ -70,6 +70,15 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 function initializeApp() {
+    // Restore the send-mode toggle before anything below can read it.
+    // showAppScreen() triggers a sender fetch keyed on the mode, so if this
+    // ran after that fetch started, a saved "bulk" mode could lose a race
+    // against a "classic" fetch fired with the toggle still at its default.
+    const sendModeSelect = document.getElementById('send-mode');
+    if (sendModeSelect) {
+        sendModeSelect.value = sessionStorage.getItem(MODE_KEY) || 'classic';
+    }
+
     // Restore the session if this tab already holds credentials. They are not
     // re-verified here, so a rotated secret surfaces on the first action rather
     // than at page load.
@@ -82,9 +91,13 @@ function initializeApp() {
 
     // Setup event listeners
     setupEventListeners();
-    
+
     // Setup phone number select handler
     setupPhoneNumberHandlers();
+
+    // Sync everything else that depends on the mode (hidden groups, the
+    // Messenger option, help text) now that the toggle reflects it.
+    applySendMode();
 }
 
 function setupPhoneNumberHandlers() {
@@ -104,6 +117,87 @@ function setupPhoneNumberHandlers() {
             }
         });
     }
+}
+
+// --- Send mode ---------------------------------------------------------
+// The chosen API mode, kept beside the credentials in sessionStorage so a
+// reload does not silently switch which API a campaign is sent through.
+const MODE_KEY = 'twilio_messaging_ui_mode';
+
+function getSendMode() {
+    const select = document.getElementById('send-mode');
+    if (select && select.value) return select.value;
+    return sessionStorage.getItem(MODE_KEY) || 'classic';
+}
+
+function isBulkMode() {
+    return getSendMode() === 'bulk';
+}
+
+/**
+ * Applies everything that differs between the two modes.
+ *
+ * Messenger is hidden rather than disabled because the Bulk API has no
+ * Messenger channel at all, and the send note is inverted: in bulk mode the
+ * campaign runs on Twilio, so the tab does not have to stay open. That note is
+ * the most visible difference between the modes and must not go stale.
+ */
+function applySendMode() {
+    const bulk = isBulkMode();
+    sessionStorage.setItem(MODE_KEY, getSendMode());
+
+    document.querySelectorAll('.bulk-only').forEach((el) => {
+        el.hidden = !bulk;
+    });
+
+    const channelSelect = document.getElementById('channel');
+    const messengerOption = channelSelect
+        ? channelSelect.querySelector('option[value="messenger"]')
+        : null;
+    if (messengerOption) {
+        messengerOption.hidden = bulk;
+        messengerOption.disabled = bulk;
+        if (bulk && channelSelect.value === 'messenger') {
+            channelSelect.value = 'sms';
+            channelSelect.dispatchEvent(new Event('change'));
+        }
+    }
+
+    const modeHelp = document.getElementById('send-mode-help');
+    if (modeHelp) {
+        modeHelp.textContent = bulk
+            ? 'One request for up to 10,000 recipients, processed on Twilio.'
+            : 'One message per recipient, driven from this tab.';
+    }
+
+    const sendNote = document.getElementById('send-note');
+    // Shared with setSendingState() below so the idle wording can never drift
+    // between the two call sites.
+    if (sendNote) {
+        sendNote.textContent = sendNoteIdleText();
+    }
+
+    updateFallbackAvailability();
+
+    // Senders differ by mode: bulk cannot use a Messaging Service, so the list
+    // must be refetched rather than filtered client-side. loadPhoneNumbers takes
+    // the channel explicitly (assets/app.js:473).
+    if (channelSelect && channelSelect.value) {
+        loadPhoneNumbers(channelSelect.value);
+    }
+}
+
+/** Fallback is WhatsApp-only; see the payload module for why RCS cannot use it. */
+function updateFallbackAvailability() {
+    const group = document.getElementById('fallback-group');
+    const checkbox = document.getElementById('fallback-to-sms');
+    if (!group || !checkbox) return;
+
+    const channel = document.getElementById('channel');
+    const available = isBulkMode() && channel && channel.value === 'whatsapp';
+
+    group.hidden = !available;
+    if (!available) checkbox.checked = false;
 }
 
 // --- Credentials -----------------------------------------------------------
@@ -168,6 +262,13 @@ function setupEventListeners() {
 
     // Channel change handler to load content templates
     document.getElementById('channel').addEventListener('change', handleChannelChange);
+
+    // Send-mode toggle: restore whatever was last chosen, then react to changes.
+    const sendModeSelect = document.getElementById('send-mode');
+    if (sendModeSelect) {
+        sendModeSelect.value = sessionStorage.getItem(MODE_KEY) || 'classic';
+        sendModeSelect.addEventListener('change', applySendMode);
+    }
 
     // Re-render the template list when the status filter changes
     document.getElementById('template-status-filter').addEventListener('change', renderTemplateOptions);
@@ -479,7 +580,10 @@ async function loadPhoneNumbers(channel) {
     select.innerHTML = '<option value="">Loading senders…</option>';
 
     try {
-        const response = await postToFunction('get-phone-numbers', { channel: ch });
+        const response = await postToFunction('get-phone-numbers', {
+            channel: ch,
+            mode: getSendMode(),
+        });
         const data = await response.json();
 
         if (!response.ok || !data.success) {
@@ -524,12 +628,26 @@ const CHANNEL_TEMPLATE_HELP = {
     mms: 'Only templates with a media type are listed — a text-only template has no media for MMS to send.',
 };
 
-// Idle copy lives in index.html so it renders as plain markup; captured on first
-// use so the two wordings never drift apart in two files.
-let sendNoteIdle = null;
+/**
+ * Idle copy differs by mode. applySendMode() writes this same text into the
+ * DOM whenever the mode changes; setSendingState() below recomputes it from
+ * the mode rather than caching the DOM text the way it used to, because a
+ * cached value would go stale the first time a campaign is sent in one mode,
+ * the mode is switched, and a second campaign is sent in the other — the
+ * cache would still hold the first mode's wording.
+ */
+function sendNoteIdleText() {
+    return isBulkMode()
+        ? 'Sending continues on Twilio once submitted — you can close this tab.'
+        : 'Keep this tab open while sending — the campaign is driven from your browser, not from Twilio.';
+}
 
 const SEND_NOTE_ACTIVE = 'Sending — keep this tab open. Closing it stops the campaign, '
     + 'though progress is saved and you can resume from Campaigns.';
+
+// Bulk has no chunk loop and no client-driven checkpoint to lose, so the
+// in-flight note only needs to cover the brief window of the single request.
+const SEND_NOTE_ACTIVE_BULK = 'Submitting to Twilio…';
 
 /**
  * Single owner of the Send button's state, and of the advisory beneath it.
@@ -539,6 +657,9 @@ const SEND_NOTE_ACTIVE = 'Sending — keep this tab open. Closing it stops the c
  * browser initiates the next. Credentials live only in sessionStorage, so
  * nothing server-side could continue the campaign on its own. Closing the tab
  * therefore halts sending — hence the promotion to a warning while in flight.
+ *
+ * In bulk mode there is no such risk — Twilio owns the campaign once
+ * submitted — so the active note is the short "submitting" message instead.
  */
 function setSendingState(sending) {
     const btn = document.getElementById('send-btn');
@@ -549,8 +670,9 @@ function setSendingState(sending) {
 
     const note = document.getElementById('send-note');
     if (!note) return;
-    if (sendNoteIdle === null) sendNoteIdle = note.textContent;
-    note.textContent = sending ? SEND_NOTE_ACTIVE : sendNoteIdle;
+    note.textContent = sending
+        ? (isBulkMode() ? SEND_NOTE_ACTIVE_BULK : SEND_NOTE_ACTIVE)
+        : sendNoteIdleText();
     note.classList.toggle('send-note--active', sending);
 }
 
@@ -625,6 +747,10 @@ async function handleChannelChange() {
     const channel = document.getElementById('channel').value;
     // The sender list is channel-specific — a WhatsApp sender is not a phone number.
     loadPhoneNumbers(channel);
+    // The fallback checkbox is WhatsApp-only in bulk mode; re-evaluate on every
+    // channel switch so it does not stay visible (or checked) for a channel it
+    // no longer applies to.
+    updateFallbackAvailability();
     const contentTemplateGroup = document.getElementById('content-template-group');
     const contentTemplateSelect = document.getElementById('content-template');
     const contentTemplateHelp = document.getElementById('content-template-help');

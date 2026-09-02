@@ -83,6 +83,15 @@
                                 <h2>Message Details</h2>
                                 <form id="message-form">
                                     <div class="form-group">
+                                        <label for="send-mode">API</label>
+                                        <select id="send-mode">
+                                            <option value="classic" selected>Programmable Messaging</option>
+                                            <option value="bulk">Bulk Messaging (beta)</option>
+                                        </select>
+                                        <small id="send-mode-help" class="field-help">One message per recipient, driven from this tab.</small>
+                                    </div>
+
+                                    <div class="form-group">
                                         <label for="channel">Messaging Channel</label>
                                         <select id="channel" required>
                                             <option value="sms">SMS</option>
@@ -164,6 +173,20 @@
                                         <textarea id="recipients" rows="6" required
                                                   placeholder="+6512345678&#10;+6598765432&#10;+6587654321"></textarea>
                                         <small id="recipients-help">Enter numbers in E.164 format (+6512345678), one per line or comma-separated</small>
+                                    </div>
+
+                                    <div class="form-group bulk-only" id="schedule-group" hidden>
+                                        <label for="send-at">Schedule (optional)</label>
+                                        <input type="datetime-local" id="send-at">
+                                        <small class="field-help">Leave empty to send now. Up to 7 days ahead.</small>
+                                    </div>
+
+                                    <div class="form-group bulk-only" id="fallback-group" hidden>
+                                        <label class="checkbox-label">
+                                            <input type="checkbox" id="fallback-to-sms">
+                                            Fall back to SMS if WhatsApp fails
+                                        </label>
+                                        <small class="field-help">WhatsApp only. RCS fallback needs a sender pool.</small>
                                     </div>
 
                                     <button type="submit" class="btn btn-primary" id="send-btn">Send Messages</button>

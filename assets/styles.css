@@ -1484,3 +1484,36 @@ input::placeholder, textarea::placeholder { color: var(--text-muted); }
     * { transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; }
 }
 
+.checkbox-label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-weight: 400;
+    cursor: pointer;
+}
+
+.checkbox-label input[type="checkbox"] {
+    width: auto;
+    margin: 0;
+}
+
+.mode-badge {
+    display: inline-block;
+    padding: 1px 7px;
+    border-radius: 10px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    vertical-align: middle;
+}
+
+.mode-badge--bulk {
+    background: #e8f0fe;
+    color: #1a56b8;
+}
+
+.mode-badge--classic {
+    background: #eef0f2;
+    color: #55606b;
+}
+
