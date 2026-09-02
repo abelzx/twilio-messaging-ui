@@ -244,3 +244,79 @@ test('a partially-filled body column still works when a campaign body is present
   assert.strictEqual(out.to[0].variables.body, 'Own text');
   assert.strictEqual(out.to[1].variables.body, 'Fallback body');
 });
+
+test('attaches media on MMS', () => {
+  const [out] = payload.buildPayloads({
+    ...BASE,
+    channel: 'mms',
+    mediaUrl: 'https://example.com/a.jpg',
+  });
+  assert.deepStrictEqual(out.content, {
+    text: '{% raw %}Hello{% endraw %}',
+    media: ['https://example.com/a.jpg'],
+  });
+});
+
+test('accepts an array of media URLs', () => {
+  const [out] = payload.buildPayloads({
+    ...BASE,
+    channel: 'mms',
+    mediaUrl: ['https://example.com/a.jpg', 'https://example.com/b.jpg'],
+  });
+  assert.deepStrictEqual(out.content.media, [
+    'https://example.com/a.jpg',
+    'https://example.com/b.jpg',
+  ]);
+});
+
+test('ignores media on SMS, which cannot carry it', () => {
+  const [out] = payload.buildPayloads({ ...BASE, mediaUrl: 'https://example.com/a.jpg' });
+  assert.strictEqual('media' in out.content, false);
+});
+
+test('does not attach media to a content template', () => {
+  const [out] = payload.buildPayloads({
+    ...BASE,
+    channel: 'mms',
+    body: '',
+    contentSid: 'HXb0bb2f2f0f4d4a1e8f2b1c3d4e5f6a7b',
+    mediaUrl: 'https://example.com/a.jpg',
+  });
+  assert.deepStrictEqual(out.content, { contentId: 'HXb0bb2f2f0f4d4a1e8f2b1c3d4e5f6a7b' });
+});
+
+test('tags the operation with campaign name, channel and mode', () => {
+  const [out] = payload.buildPayloads({ ...BASE, campaignName: 'Spring sale' });
+  assert.deepStrictEqual(out.tags, {
+    campaign: 'Spring sale',
+    channel: 'sms',
+    mode: 'bulk',
+  });
+});
+
+test('omits the campaign tag when there is no name', () => {
+  const [out] = payload.buildPayloads(BASE);
+  assert.deepStrictEqual(out.tags, { channel: 'sms', mode: 'bulk' });
+});
+
+test('truncates an over-long tag value to 256 characters', () => {
+  const [out] = payload.buildPayloads({ ...BASE, campaignName: 'x'.repeat(300) });
+  assert.strictEqual(out.tags.campaign.length, 256);
+});
+
+test('omits schedule when no sendAt is given', () => {
+  const [out] = payload.buildPayloads(BASE);
+  assert.strictEqual('schedule' in out, false);
+});
+
+test('passes sendAt through as a schedule', () => {
+  const [out] = payload.buildPayloads({ ...BASE, sendAt: '2026-09-10T09:30:00Z' });
+  assert.deepStrictEqual(out.schedule, { sendAt: '2026-09-10T09:30:00Z' });
+});
+
+test('rejects a sendAt that is not RFC 3339', () => {
+  assert.throws(
+    () => payload.buildPayloads({ ...BASE, sendAt: 'next tuesday' }),
+    (err) => err.statusCode === 400 && /date/i.test(err.message)
+  );
+});

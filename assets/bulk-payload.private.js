@@ -123,6 +123,10 @@ function resolveContent(request, recipients) {
     (recipient) => String(recipient.body == null ? '' : recipient.body).trim() !== ''
   );
 
+  const media = MEDIA_CHANNELS.has(String(request.channel).toLowerCase())
+    ? [].concat(request.mediaUrl || []).filter(Boolean)
+    : [];
+
   if (anyOwnBody) {
     // Unlike the campaign-wide case below, a blank body here isn't necessarily
     // fatal — it might still fall back to the campaign body per recipient, in
@@ -142,14 +146,56 @@ function resolveContent(request, recipients) {
         `${missing} recipient(s) have no message text: their row's body is blank and no message body was typed to fall back on.`
       );
     }
-    return { content: { text: '{{body}}' }, perRecipientBody: true };
+    const content = { text: '{{body}}' };
+    if (media.length) content.media = media;
+    return { content, perRecipientBody: true };
   }
 
   if (!body.trim()) {
     throw httpError(400, 'A message body or a content template is required.');
   }
 
-  return { content: { text: escapeLiquid(body) }, perRecipientBody: false };
+  const content = { text: escapeLiquid(body) };
+  if (media.length) content.media = media;
+  return { content, perRecipientBody: false };
+}
+
+const MEDIA_CHANNELS = new Set(['mms', 'rcs']);
+const MAX_TAGS = 10;
+const MAX_TAG_KEY = 128;
+const MAX_TAG_VALUE = 256;
+
+/** Tags carry at most 10 pairs, with bounded key and value lengths. */
+function buildTags(request, channel) {
+  const candidates = {
+    ...(request.campaignName ? { campaign: String(request.campaignName) } : {}),
+    channel,
+    mode: 'bulk',
+  };
+
+  const tags = {};
+  for (const [key, value] of Object.entries(candidates)) {
+    if (Object.keys(tags).length >= MAX_TAGS) break;
+    tags[String(key).slice(0, MAX_TAG_KEY)] = String(value).slice(0, MAX_TAG_VALUE);
+  }
+  return tags;
+}
+
+/**
+ * Validates `sendAt` without normalising it.
+ *
+ * Passed through exactly as received: the API reference renders the field as
+ * `{sendAt: [RFC 3339 date-time]}` while the scheduling guide shows a literal
+ * array, so the shape is confirmed against a live call rather than guessed. If
+ * it turns out to want an array, this function is the only thing that changes.
+ */
+function resolveSchedule(sendAt) {
+  if (sendAt == null || String(sendAt).trim() === '') return null;
+  const value = String(sendAt).trim();
+  if (Number.isNaN(Date.parse(value))) {
+    throw httpError(400, `"${value}" is not a valid RFC 3339 date and time.`);
+  }
+  return { sendAt: value };
 }
 
 function buildPayloads(request) {
@@ -206,7 +252,12 @@ function buildPayloads(request) {
     return entry;
   });
 
-  return [{ from, to, content }];
+  const payload = { from, to, content, tags: buildTags(request, channel) };
+
+  const schedule = resolveSchedule(request.sendAt);
+  if (schedule) payload.schedule = schedule;
+
+  return [payload];
 }
 
 module.exports = { buildPayloads, CHANNEL_MAP, bareAddress };
