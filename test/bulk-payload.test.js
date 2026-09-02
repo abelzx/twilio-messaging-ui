@@ -153,3 +153,46 @@ test('rejects a request with neither body nor content template', () => {
     (err) => err.statusCode === 400 && /message body|content template/i.test(err.message)
   );
 });
+
+test('routes per-recipient bodies through a single Liquid variable', () => {
+  const [out] = payload.buildPayloads({
+    ...BASE,
+    body: '',
+    recipients: [
+      { to: '+15558675310', body: 'Your table is at 7pm' },
+      { to: '+15558675311', body: 'Your table is at 8pm' },
+    ],
+  });
+
+  // One content object for the whole request; the text differs per recipient
+  // only because each supplies its own `body` variable.
+  assert.deepStrictEqual(out.content, { text: '{{body}}' });
+  assert.strictEqual(out.to[0].variables.body, 'Your table is at 7pm');
+  assert.strictEqual(out.to[1].variables.body, 'Your table is at 8pm');
+});
+
+test('a blank per-recipient body falls back to the typed body', () => {
+  const [out] = payload.buildPayloads({
+    ...BASE,
+    body: 'Default message',
+    recipients: [
+      { to: '+15558675310', body: 'Custom' },
+      { to: '+15558675311', body: '   ' },
+      { to: '+15558675312' },
+    ],
+  });
+  assert.strictEqual(out.to[0].variables.body, 'Custom');
+  assert.strictEqual(out.to[1].variables.body, 'Default message');
+  assert.strictEqual(out.to[2].variables.body, 'Default message');
+});
+
+test('a per-recipient body is not itself Liquid-escaped', () => {
+  // The body arrives as a variable value, and Liquid substitutes in one pass,
+  // so `{{` inside it is inert. Wrapping it would send the wrapper as text.
+  const [out] = payload.buildPayloads({
+    ...BASE,
+    body: '',
+    recipients: [{ to: '+15558675310', body: 'Literal {{name}} stays' }],
+  });
+  assert.strictEqual(out.to[0].variables.body, 'Literal {{name}} stays');
+});
