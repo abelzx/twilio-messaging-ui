@@ -647,6 +647,8 @@ git add test/bulk-payload.test.js
 git commit -m "test: pin the CSV per-recipient body mapping"
 ```
 
+> **Every expected test count from here on is 3 lower than reality.** Code review of Tasks 3-4 found that a recipient with neither its own body nor a campaign body to fall back on was sent a *blank message*, where the classic path's `interpretCsv` skips the row (`assets/app.js:1725-1728`). The fix — reject with a 400, since the front end already filters those rows and `send-bulk.js` is a public endpoint — added three tests, taking the total to 24 rather than 21. Add 3 to each count below: Task 5 ends at 34, Task 6 at 38, Task 7 at 44, Task 8 at 50, Task 9 at 56, Task 11 at 58.
+
 ---
 
 ## Task 5: Media, tags and scheduling
