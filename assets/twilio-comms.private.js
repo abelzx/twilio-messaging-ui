@@ -33,6 +33,35 @@ function httpError(statusCode, message, code) {
  * return HTML, and letting `response.json()` throw would replace Twilio's real
  * status with a JSON syntax error.
  */
+/** Pulls one human-readable string out of an error entry of unknown shape. */
+function describeEntry(entry) {
+  if (!entry) return '';
+  if (typeof entry === 'string') return entry;
+  if (typeof entry !== 'object') return String(entry);
+
+  const parts = [entry.message, entry.detail, entry.title, entry.description, entry.reason]
+    .filter((part) => typeof part === 'string' && part.trim());
+
+  // A field-level validation error is only useful with the field named.
+  const field = entry.field || entry.path || entry.property || entry.parameter;
+  const text = parts.join(' — ');
+  return field && text ? `${field}: ${text}` : text || '';
+}
+
+/**
+ * Turns a non-2xx response into a thrown Error carrying the API's real complaint.
+ *
+ * Every plausible error envelope is tried, because a single `body.message` read
+ * is not enough: this API has returned a 400 whose body used none of it, and the
+ * fallback to `response.statusText` produced a bare "Bad Request" that said
+ * nothing about what was actually rejected. An opaque error is nearly as bad as
+ * no error, so when no recognised field is found the raw body is included
+ * verbatim (truncated) rather than discarded.
+ *
+ * The body is read as text first and parsed defensively: a gateway error can
+ * return HTML, and letting `response.json()` throw would replace Twilio's real
+ * status with a JSON syntax error.
+ */
 async function raiseFor(response) {
   const text = await response.text().catch(() => '');
   let body = null;
@@ -42,7 +71,43 @@ async function raiseFor(response) {
     body = null;
   }
 
-  const detail = (body && body.message) || response.statusText || 'Unknown error';
+  let detail = '';
+
+  if (body && typeof body === 'object') {
+    detail = describeEntry(body);
+
+    // Some envelopes nest the real message one level down.
+    if (!detail) detail = describeEntry(body.error);
+
+    // A list of field-level failures is the most useful shape of all, so it wins
+    // over a generic top-level summary when both are present.
+    const list = [body.errors, body.details, body.violations].find(Array.isArray);
+    if (list && list.length) {
+      const described = list.map(describeEntry).filter(Boolean);
+      if (described.length) {
+        const shown = described.slice(0, 5).join('; ');
+        detail = described.length > 5
+          ? `${shown} (and ${described.length - 5} more)`
+          : shown;
+      }
+    }
+  }
+
+  // Nothing recognised: show what actually came back. Better an ugly raw body
+  // than "Bad Request" with the cause thrown away.
+  if (!detail) {
+    const raw = text.trim().replace(/\s+/g, ' ').slice(0, 400);
+    detail = raw
+      ? `${response.status} ${response.statusText || ''}`.trim() + ` — Twilio returned: ${raw}`
+      : `${response.status} ${response.statusText || 'Unknown error'} with an empty body`;
+  }
+
+  // Keys and status only, never values: an error body can echo recipient
+  // numbers, and this deployment does not write those to its logs.
+  console.error(
+    `Bulk API ${response.status} on ${response.url || 'comms request'}. ` +
+      `Body keys: ${body && typeof body === 'object' ? Object.keys(body).join(', ') || '(empty object)' : '(non-JSON body)'}.`
+  );
 
   if (response.status === 401 || response.status === 403) {
     throw httpError(

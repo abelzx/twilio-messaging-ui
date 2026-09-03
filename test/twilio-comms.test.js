@@ -120,6 +120,50 @@ test('surfaces a 400 message verbatim', async (t) => {
   );
 });
 
+test('surfaces a 400 that uses detail or title instead of message', async (t) => {
+  stubFetch(t, () => jsonResponse(400, { title: 'Invalid content', detail: 'contentId not found' }));
+  await assert.rejects(
+    () => comms.createMessages(AUTH, {}),
+    (err) => err.statusCode === 400 && /contentId not found/.test(err.message)
+  );
+});
+
+test('surfaces field-level errors in preference to a generic summary', async (t) => {
+  stubFetch(t, () =>
+    jsonResponse(400, {
+      message: 'Validation failed',
+      errors: [
+        { field: 'content.contentId', message: 'must be a valid template' },
+        { field: 'to[0].channel', message: 'unsupported channel' },
+      ],
+    })
+  );
+  await assert.rejects(
+    () => comms.createMessages(AUTH, {}),
+    (err) =>
+      /content\.contentId: must be a valid template/.test(err.message) &&
+      /to\[0\]\.channel: unsupported channel/.test(err.message)
+  );
+});
+
+test('includes the raw body when no field is recognised', async (t) => {
+  // The failure that motivated this: a 400 whose body used none of the known
+  // keys, reported as a bare "Bad Request" with the cause discarded.
+  stubFetch(t, () => jsonResponse(400, { unexpected: 'shape', code: 12345 }));
+  await assert.rejects(
+    () => comms.createMessages(AUTH, {}),
+    (err) => err.statusCode === 400 && /unexpected/.test(err.message) && /shape/.test(err.message)
+  );
+});
+
+test('reports an empty error body as empty rather than inventing a reason', async (t) => {
+  stubFetch(t, () => new Response('', { status: 400, statusText: 'Bad Request' }));
+  await assert.rejects(
+    () => comms.createMessages(AUTH, {}),
+    (err) => err.statusCode === 400 && /empty body/i.test(err.message)
+  );
+});
+
 test('adds a scope hint to a 401', async (t) => {
   stubFetch(t, () => jsonResponse(401, { code: 20003, message: 'Authentication Error' }));
   await assert.rejects(

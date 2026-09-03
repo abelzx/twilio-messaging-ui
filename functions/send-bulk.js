@@ -77,6 +77,27 @@ exports.handler = async function (context, event, callback) {
     // the campaign is still recorded below with the IDs that succeeded.
     // Dropping them would leave traffic in flight that nothing can track.
     submitError = error;
+
+    // The shape of what was rejected, to pair with the API's own complaint in
+    // the log line above it. Structure only — no addresses, no variable values,
+    // no message text: this deployment does not log recipient data.
+    const sample = payloads[0] || {};
+    const content = sample.content || {};
+    const recipient = (sample.to && sample.to[0]) || {};
+    console.error(
+      'Bulk create rejected. Request shape: ' +
+        [
+          `channel=${String(event.channel || '').toLowerCase() || '(none)'}`,
+          `from=${Object.keys(sample.from || {}).join('+') || '(none)'}`,
+          `content=${Object.keys(content).join('+') || '(none)'}`,
+          `recipientKeys=${Object.keys(recipient).join('+') || '(none)'}`,
+          `variableCount=${Object.keys(recipient.variables || {}).length}`,
+          `tags=${Object.keys(sample.tags || {}).join('+') || '(none)'}`,
+          `schedule=${sample.schedule ? 'yes' : 'no'}`,
+          `operations=${payloads.length}`,
+          `recipients=${recipientCount}`,
+        ].join(' ')
+    );
   }
 
   if (acceptedOperations === 0) {
