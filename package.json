@@ -4,7 +4,8 @@
   "description": "Twilio Messaging UI with resumable execution",
   "scripts": {
     "deploy": "twilio serverless:deploy",
-    "start": "twilio serverless:start"
+    "start": "twilio serverless:start",
+    "test": "node --test test/*.js"
   },
   "dependencies": {
     "twilio": "^5.10.6",

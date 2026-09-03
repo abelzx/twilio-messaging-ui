@@ -69,6 +69,18 @@ exports.handler = async function(context, event, callback) {
       return callback(null, response);
     }
 
+    // A bulk campaign has no per-message SID map to re-fetch — its progress
+    // lives in the operation, not in Sync. Pointing the caller at the right
+    // endpoint beats returning a campaign with every counter at zero.
+    if (campaignData.mode === 'bulk') {
+      response.setStatusCode(409);
+      response.setBody({
+        error: 'This is a Bulk Messaging campaign. Use check-bulk-status instead.',
+        mode: 'bulk',
+      });
+      return callback(null, response);
+    }
+
     // Update message statuses from Twilio
     // Merge with existing webhook data to preserve delivered/read flags
     const statusUpdates = {};

@@ -59,6 +59,38 @@ exports.handler = async function(context, event, callback) {
         continue;
       }
 
+      // Bulk campaigns keep aggregate stats rather than a per-message map, so
+      // the counter arithmetic below would report zeroes for all of them.
+      // `unaddressable` counts as a failure: Twilio could not reach the
+      // recipient at all, which is not a pending state and never will be.
+      if (campaignData.mode === 'bulk') {
+        const stats = campaignData.stats || {};
+        campaigns.push({
+          campaignId: doc.uniqueName,
+          mode: 'bulk',
+          campaignName: campaignData.campaignName || null,
+          channel: campaignData.channel || null,
+          recipientCount: campaignData.recipientCount || 0,
+          totalMessages: campaignData.recipientCount || 0,
+          sent:
+            Number(stats.sent || 0) +
+            Number(stats.delivered || 0) +
+            Number(stats.read || 0),
+          delivered: Number(stats.delivered || 0) + Number(stats.read || 0),
+          read: Number(stats.read || 0),
+          failed:
+            Number(stats.failed || 0) +
+            Number(stats.undelivered || 0) +
+            Number(stats.unaddressable || 0),
+          pending: Number(stats.queued || 0) + Number(stats.scheduled || 0),
+          isComplete: Boolean(campaignData.isComplete),
+          scheduledFor: campaignData.scheduledFor || null,
+          createdAt: campaignData.createdAt,
+          lastUpdated: campaignData.lastUpdated,
+        });
+        continue;
+      }
+
       let delivered = 0;
       let read = 0;
       const statuses = campaignData.statuses || {};
@@ -74,6 +106,7 @@ exports.handler = async function(context, event, callback) {
 
       campaigns.push({
         campaignId: doc.uniqueName,
+        mode: 'classic',
         accountSid: campaignData.accountSid,
         totalMessages: campaignData.totalMessages || 0,
         sent: campaignData.sent || 0,

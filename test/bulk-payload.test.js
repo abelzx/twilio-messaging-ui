@@ -1,0 +1,447 @@
+'use strict';
+
+const test = require('node:test');
+const assert = require('node:assert');
+
+const payload = require('../assets/bulk-payload.private.js');
+
+test('the module exports buildPayloads', () => {
+  assert.strictEqual(typeof payload.buildPayloads, 'function');
+});
+
+const BASE = {
+  channel: 'sms',
+  from: '+15017122661',
+  body: 'Hello',
+  recipients: [{ to: '+15558675310' }],
+};
+
+test('maps SMS to a PHONE recipient', () => {
+  const [out] = payload.buildPayloads(BASE);
+  assert.deepStrictEqual(out.from, { address: '+15017122661', channel: 'SMS' });
+  assert.deepStrictEqual(out.to, [{ address: '+15558675310', channel: 'PHONE' }]);
+});
+
+test('maps MMS and RCS senders to their own channel, recipients to PHONE', () => {
+  const mms = payload.buildPayloads({ ...BASE, channel: 'mms' })[0];
+  assert.strictEqual(mms.from.channel, 'MMS');
+  assert.strictEqual(mms.to[0].channel, 'PHONE');
+
+  const rcs = payload.buildPayloads({ ...BASE, channel: 'rcs' })[0];
+  assert.strictEqual(rcs.from.channel, 'RCS');
+  assert.strictEqual(rcs.to[0].channel, 'PHONE');
+});
+
+test('maps WhatsApp on both sides and strips the whatsapp: prefix', () => {
+  const [out] = payload.buildPayloads({
+    ...BASE,
+    channel: 'whatsapp',
+    from: 'whatsapp:+15017122661',
+    recipients: [{ to: 'whatsapp:+15558675310' }],
+  });
+  assert.deepStrictEqual(out.from, { address: '+15017122661', channel: 'WHATSAPP' });
+  assert.deepStrictEqual(out.to, [{ address: '+15558675310', channel: 'WHATSAPP' }]);
+});
+
+test('rejects a Messaging Service SID as a sender', () => {
+  assert.throws(
+    () => payload.buildPayloads({ ...BASE, from: 'MG7f6b1c4e9a2d8f0b3c5e7a9d1f2b4c6e' }),
+    (err) => err.statusCode === 400 && /Messaging Service/i.test(err.message)
+  );
+});
+
+test('accepts a sender pool SID as senderPoolId', () => {
+  const [out] = payload.buildPayloads({ ...BASE, from: 'SP7f6b1c4e9a2d8f0b3c5e7a9d1f2b4c6e' });
+  assert.deepStrictEqual(out.from, { senderPoolId: 'SP7f6b1c4e9a2d8f0b3c5e7a9d1f2b4c6e' });
+});
+
+test('rejects an unsupported channel', () => {
+  assert.throws(
+    () => payload.buildPayloads({ ...BASE, channel: 'messenger' }),
+    (err) => err.statusCode === 400 && /messenger/i.test(err.message)
+  );
+});
+
+test('rejects an empty recipient list', () => {
+  assert.throws(
+    () => payload.buildPayloads({ ...BASE, recipients: [] }),
+    (err) => err.statusCode === 400
+  );
+});
+
+test('sends a plain body exactly as typed', () => {
+  // It used to be wrapped in {% raw %}…{% endraw %}. The API delivers that
+  // wrapper as literal text, so recipients received the tags in their message.
+  const [out] = payload.buildPayloads({ ...BASE, body: 'Hi there, I am Ane' });
+  assert.deepStrictEqual(out.content, { text: 'Hi there, I am Ane' });
+  assert.strictEqual('variables' in out.to[0], false);
+});
+
+test('leaves a body containing a percent sign or braces-free punctuation alone', () => {
+  const [out] = payload.buildPayloads({ ...BASE, body: '50% off — today only!' });
+  assert.strictEqual(out.content.text, '50% off — today only!');
+});
+
+test('routes a body containing Liquid through a variable so it stays literal', () => {
+  // Variable values are substituted in, not re-rendered, so this is a real
+  // escape. Sending it as text would let Liquid interpret {{name}}.
+  const [out] = payload.buildPayloads({ ...BASE, body: 'Hi {{name}}, 50% off' });
+  assert.deepStrictEqual(out.content, { text: '{{ body | default: "" }}' });
+  assert.strictEqual(out.to[0].variables.body, 'Hi {{name}}, 50% off');
+});
+
+test('gives every recipient the same body variable when the campaign body has Liquid', () => {
+  const [out] = payload.buildPayloads({
+    ...BASE,
+    body: 'Order {{id}} shipped',
+    recipients: [{ to: '+15558675310' }, { to: '+15558675311' }],
+  });
+  assert.strictEqual(out.to[0].variables.body, 'Order {{id}} shipped');
+  assert.strictEqual(out.to[1].variables.body, 'Order {{id}} shipped');
+});
+
+test('a body containing an endraw tag is no longer refused', () => {
+  // Previously rejected outright, because it could close the raw wrapper early.
+  // With no wrapper, it is just text that goes through the variable route.
+  const [out] = payload.buildPayloads({ ...BASE, body: 'a {% endraw %} b' });
+  assert.strictEqual(out.content.text, '{{ body | default: "" }}');
+  assert.strictEqual(out.to[0].variables.body, 'a {% endraw %} b');
+});
+
+test('sends a content template by id with no text', () => {
+  const [out] = payload.buildPayloads({
+    ...BASE,
+    body: '',
+    contentSid: 'HXb0bb2f2f0f4d4a1e8f2b1c3d4e5f6a7b',
+  });
+  assert.deepStrictEqual(out.content, { contentId: 'HXb0bb2f2f0f4d4a1e8f2b1c3d4e5f6a7b' });
+});
+
+test('a content template wins over a typed body', () => {
+  const [out] = payload.buildPayloads({
+    ...BASE,
+    body: 'ignored',
+    contentSid: 'HXb0bb2f2f0f4d4a1e8f2b1c3d4e5f6a7b',
+  });
+  assert.deepStrictEqual(out.content, { contentId: 'HXb0bb2f2f0f4d4a1e8f2b1c3d4e5f6a7b' });
+});
+
+test('carries positional template variables per recipient', () => {
+  const [out] = payload.buildPayloads({
+    ...BASE,
+    body: '',
+    contentSid: 'HXb0bb2f2f0f4d4a1e8f2b1c3d4e5f6a7b',
+    recipients: [
+      { to: '+15558675310', variables: { 1: 'Sarah', 2: '10am' } },
+      { to: '+15558675311', variables: { 1: 'Ravi', 2: '2pm' } },
+    ],
+  });
+  assert.deepStrictEqual(out.to, [
+    { address: '+15558675310', channel: 'PHONE', variables: { 1: 'Sarah', 2: '10am' } },
+    { address: '+15558675311', channel: 'PHONE', variables: { 1: 'Ravi', 2: '2pm' } },
+  ]);
+});
+
+test('carries named template variables unchanged', () => {
+  const [out] = payload.buildPayloads({
+    ...BASE,
+    body: '',
+    contentSid: 'HXb0bb2f2f0f4d4a1e8f2b1c3d4e5f6a7b',
+    recipients: [{ to: '+15558675310', variables: { name: 'Sarah' } }],
+  });
+  assert.deepStrictEqual(out.to[0].variables, { name: 'Sarah' });
+});
+
+test('omits variables entirely when a recipient has none', () => {
+  const [out] = payload.buildPayloads(BASE);
+  assert.strictEqual('variables' in out.to[0], false);
+});
+
+test('sends an empty variable as empty text, not a fallback', () => {
+  const [out] = payload.buildPayloads({
+    ...BASE,
+    body: '',
+    contentSid: 'HXb0bb2f2f0f4d4a1e8f2b1c3d4e5f6a7b',
+    recipients: [{ to: '+15558675310', variables: { 1: '' } }],
+  });
+  assert.deepStrictEqual(out.to[0].variables, { 1: '' });
+});
+
+test('rejects a request with neither body nor content template', () => {
+  assert.throws(
+    () => payload.buildPayloads({ ...BASE, body: '' }),
+    (err) => err.statusCode === 400 && /message body|content template/i.test(err.message)
+  );
+});
+
+test('routes per-recipient bodies through a single Liquid variable', () => {
+  const [out] = payload.buildPayloads({
+    ...BASE,
+    body: '',
+    recipients: [
+      { to: '+15558675310', body: 'Your table is at 7pm' },
+      { to: '+15558675311', body: 'Your table is at 8pm' },
+    ],
+  });
+
+  // One content object for the whole request; the text differs per recipient
+  // only because each supplies its own `body` variable.
+  assert.deepStrictEqual(out.content, { text: '{{ body | default: "" }}' });
+  assert.strictEqual(out.to[0].variables.body, 'Your table is at 7pm');
+  assert.strictEqual(out.to[1].variables.body, 'Your table is at 8pm');
+});
+
+test('a blank per-recipient body falls back to the typed body', () => {
+  const [out] = payload.buildPayloads({
+    ...BASE,
+    body: 'Default message',
+    recipients: [
+      { to: '+15558675310', body: 'Custom' },
+      { to: '+15558675311', body: '   ' },
+      { to: '+15558675312' },
+    ],
+  });
+  assert.strictEqual(out.to[0].variables.body, 'Custom');
+  assert.strictEqual(out.to[1].variables.body, 'Default message');
+  assert.strictEqual(out.to[2].variables.body, 'Default message');
+});
+
+test('a per-recipient body is not itself Liquid-escaped', () => {
+  // The body arrives as a variable value, and Liquid substitutes in one pass,
+  // so `{{` inside it is inert. Wrapping it would send the wrapper as text.
+  const [out] = payload.buildPayloads({
+    ...BASE,
+    body: '',
+    recipients: [{ to: '+15558675310', body: 'Literal {{name}} stays' }],
+  });
+  assert.strictEqual(out.to[0].variables.body, 'Literal {{name}} stays');
+});
+
+test('rejects a recipient with no message text and no campaign body to fall back on', () => {
+  assert.throws(
+    () =>
+      payload.buildPayloads({
+        ...BASE,
+        body: '',
+        recipients: [
+          { to: '+15558675310', body: 'Has one' },
+          { to: '+15558675311' },
+        ],
+      }),
+    (err) =>
+      err.statusCode === 400 &&
+      /1 recipient\(s\) have no message text/i.test(err.message) &&
+      /blank/i.test(err.message)
+  );
+});
+
+test('counts every recipient missing message text in the rejection', () => {
+  assert.throws(
+    () =>
+      payload.buildPayloads({
+        ...BASE,
+        body: '',
+        recipients: [
+          { to: '+15558675310', body: 'Has one' },
+          { to: '+15558675311' },
+          { to: '+15558675312', body: '   ' },
+        ],
+      }),
+    (err) => err.statusCode === 400 && /2 recipient\(s\) have no message text/i.test(err.message)
+  );
+});
+
+test('a partially-filled body column still works when a campaign body is present', () => {
+  const [out] = payload.buildPayloads({
+    ...BASE,
+    body: 'Fallback body',
+    recipients: [
+      { to: '+15558675310', body: 'Own text' },
+      { to: '+15558675311' },
+    ],
+  });
+  assert.deepStrictEqual(out.content, { text: '{{ body | default: "" }}' });
+  assert.strictEqual(out.to[0].variables.body, 'Own text');
+  assert.strictEqual(out.to[1].variables.body, 'Fallback body');
+});
+
+test('attaches media on MMS', () => {
+  const [out] = payload.buildPayloads({
+    ...BASE,
+    channel: 'mms',
+    mediaUrl: 'https://example.com/a.jpg',
+  });
+  assert.deepStrictEqual(out.content, {
+    text: 'Hello',
+    media: ['https://example.com/a.jpg'],
+  });
+});
+
+test('accepts an array of media URLs', () => {
+  const [out] = payload.buildPayloads({
+    ...BASE,
+    channel: 'mms',
+    mediaUrl: ['https://example.com/a.jpg', 'https://example.com/b.jpg'],
+  });
+  assert.deepStrictEqual(out.content.media, [
+    'https://example.com/a.jpg',
+    'https://example.com/b.jpg',
+  ]);
+});
+
+test('ignores media on SMS, which cannot carry it', () => {
+  const [out] = payload.buildPayloads({ ...BASE, mediaUrl: 'https://example.com/a.jpg' });
+  assert.strictEqual('media' in out.content, false);
+});
+
+test('does not attach media to a content template', () => {
+  const [out] = payload.buildPayloads({
+    ...BASE,
+    channel: 'mms',
+    body: '',
+    contentSid: 'HXb0bb2f2f0f4d4a1e8f2b1c3d4e5f6a7b',
+    mediaUrl: 'https://example.com/a.jpg',
+  });
+  assert.deepStrictEqual(out.content, { contentId: 'HXb0bb2f2f0f4d4a1e8f2b1c3d4e5f6a7b' });
+});
+
+test('tags the operation with campaign name, channel and mode', () => {
+  const [out] = payload.buildPayloads({ ...BASE, campaignName: 'Spring sale' });
+  assert.deepStrictEqual(out.tags, {
+    campaign: 'Spring sale',
+    channel: 'sms',
+    mode: 'bulk',
+  });
+});
+
+test('omits the campaign tag when there is no name', () => {
+  const [out] = payload.buildPayloads(BASE);
+  assert.deepStrictEqual(out.tags, { channel: 'sms', mode: 'bulk' });
+});
+
+test('truncates an over-long tag value to 256 characters', () => {
+  const [out] = payload.buildPayloads({ ...BASE, campaignName: 'x'.repeat(300) });
+  assert.strictEqual(out.tags.campaign.length, 256);
+});
+
+test('omits schedule when no sendAt is given', () => {
+  const [out] = payload.buildPayloads(BASE);
+  assert.strictEqual('schedule' in out, false);
+});
+
+test('passes sendAt through as a schedule', () => {
+  const [out] = payload.buildPayloads({ ...BASE, sendAt: '2026-09-10T09:30:00Z' });
+  assert.deepStrictEqual(out.schedule, { sendAt: '2026-09-10T09:30:00Z' });
+});
+
+test('rejects a sendAt that is not RFC 3339', () => {
+  assert.throws(
+    () => payload.buildPayloads({ ...BASE, sendAt: 'next tuesday' }),
+    (err) => err.statusCode === 400 && /date/i.test(err.message)
+  );
+});
+
+test('expresses WhatsApp fallback as an ordered addresses array', () => {
+  const [out] = payload.buildPayloads({
+    ...BASE,
+    channel: 'whatsapp',
+    from: '+15017122661',
+    fallbackToSms: true,
+    recipients: [{ to: '+15558675310' }],
+  });
+  assert.deepStrictEqual(out.to, [
+    {
+      addresses: [
+        { address: '+15558675310', channel: 'WHATSAPP' },
+        { address: '+15558675310', channel: 'PHONE' },
+      ],
+    },
+  ]);
+});
+
+test('keeps variables alongside a fallback addresses array', () => {
+  const [out] = payload.buildPayloads({
+    ...BASE,
+    channel: 'whatsapp',
+    from: '+15017122661',
+    fallbackToSms: true,
+    body: '',
+    contentSid: 'HXb0bb2f2f0f4d4a1e8f2b1c3d4e5f6a7b',
+    recipients: [{ to: '+15558675310', variables: { 1: 'Sarah' } }],
+  });
+  assert.deepStrictEqual(out.to[0].variables, { 1: 'Sarah' });
+  assert.strictEqual(out.to[0].addresses.length, 2);
+  assert.strictEqual('address' in out.to[0], false);
+});
+
+test('rejects fallback on RCS, where addresses[] cannot express it', () => {
+  assert.throws(
+    () => payload.buildPayloads({ ...BASE, channel: 'rcs', fallbackToSms: true }),
+    (err) => err.statusCode === 400 && /WhatsApp/i.test(err.message)
+  );
+});
+
+test('rejects fallback on SMS, which is already the fallback', () => {
+  assert.throws(
+    () => payload.buildPayloads({ ...BASE, fallbackToSms: true }),
+    (err) => err.statusCode === 400 && /WhatsApp/i.test(err.message)
+  );
+});
+
+function manyRecipients(count) {
+  return Array.from({ length: count }, (_, i) => ({
+    to: `+1555${String(1000000 + i).slice(-7)}`,
+  }));
+}
+
+test('returns one payload at exactly the 10,000 limit', () => {
+  const out = payload.buildPayloads({ ...BASE, recipients: manyRecipients(10000) });
+  assert.strictEqual(out.length, 1);
+  assert.strictEqual(out[0].to.length, 10000);
+});
+
+test('splits into consecutive operations above the limit', () => {
+  const out = payload.buildPayloads({ ...BASE, recipients: manyRecipients(25000) });
+  assert.strictEqual(out.length, 3);
+  assert.deepStrictEqual(out.map((p) => p.to.length), [10000, 10000, 5000]);
+});
+
+test('every split payload carries identical sender, content and tags', () => {
+  const out = payload.buildPayloads({
+    ...BASE,
+    campaignName: 'Big',
+    recipients: manyRecipients(15000),
+  });
+  assert.deepStrictEqual(out[0].from, out[1].from);
+  assert.deepStrictEqual(out[0].content, out[1].content);
+  assert.deepStrictEqual(out[0].tags, out[1].tags);
+});
+
+test('splits preserve recipient order across the boundary', () => {
+  const recipients = manyRecipients(10002);
+  const out = payload.buildPayloads({ ...BASE, recipients });
+  assert.strictEqual(out[0].to[0].address, recipients[0].to);
+  assert.strictEqual(out[0].to[9999].address, recipients[9999].to);
+  assert.strictEqual(out[1].to[0].address, recipients[10000].to);
+  assert.strictEqual(out[1].to[1].address, recipients[10001].to);
+});
+
+test('rejects a single payload over 10MB', () => {
+  const fat = Array.from({ length: 2000 }, (_, i) => ({
+    to: `+1555${String(1000000 + i).slice(-7)}`,
+    variables: { 1: 'y'.repeat(6000) },
+  }));
+  assert.throws(
+    () => payload.buildPayloads({
+      ...BASE,
+      body: '',
+      contentSid: 'HXb0bb2f2f0f4d4a1e8f2b1c3d4e5f6a7b',
+      recipients: fat,
+    }),
+    (err) => err.statusCode === 400 && /10MB/i.test(err.message)
+  );
+});
+
+test('exposes the recipient limit so callers need not hard-code it', () => {
+  assert.strictEqual(payload.MAX_RECIPIENTS_PER_OPERATION, 10000);
+});

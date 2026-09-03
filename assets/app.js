@@ -11,6 +11,12 @@ const CREDS_KEY = 'twilio_messaging_oauth';
  */
 let creds = null;
 let currentCampaignId = null;
+// The mode of currentCampaignId specifically — set wherever currentCampaignId
+// is set, and read by refreshCurrentCampaign(). Deliberately not the send-mode
+// toggle: history shows both kinds of campaign at once, so a bulk campaign
+// opened while the toggle reads "classic" must still be polled as bulk, or its
+// auto-refresh timer would call check-status and get a 409 every 5 seconds.
+let currentCampaignMode = 'classic';
 let resumeInterval = null;
 let statusRefreshInterval = null;
 // Content templates loaded for the current channel (full objects from the API)
@@ -29,6 +35,7 @@ let csvUpload = null;  // { fileName, raw, ...interpretCsv() result }
 // The Recipients placeholder as authored in index.html, captured before the CSV
 // state overwrites it so manual mode can be restored verbatim.
 let recipientsPlaceholder = null;
+let messageBodyPlaceholder = null;
 
 // The campaign currently rendered in the delivery panel, so Export CSV can use it.
 let displayedCampaign = null;
@@ -70,6 +77,15 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 function initializeApp() {
+    // Restore the send-mode toggle before anything below can read it.
+    // showAppScreen() triggers a sender fetch keyed on the mode, so if this
+    // ran after that fetch started, a saved "bulk" mode could lose a race
+    // against a "classic" fetch fired with the toggle still at its default.
+    const sendModeSelect = document.getElementById('send-mode');
+    if (sendModeSelect) {
+        sendModeSelect.value = sessionStorage.getItem(MODE_KEY) || 'classic';
+    }
+
     // Restore the session if this tab already holds credentials. They are not
     // re-verified here, so a rotated secret surfaces on the first action rather
     // than at page load.
@@ -82,9 +98,15 @@ function initializeApp() {
 
     // Setup event listeners
     setupEventListeners();
-    
+
     // Setup phone number select handler
     setupPhoneNumberHandlers();
+
+    // Sync everything else that depends on the mode (hidden groups, the
+    // Messenger option, help text) now that the toggle reflects it. No sender
+    // refetch: showAppScreen() above already fetched with the toggle already
+    // restored to its saved value, so a second fetch here would be a duplicate.
+    applySendMode(false);
 }
 
 function setupPhoneNumberHandlers() {
@@ -104,6 +126,102 @@ function setupPhoneNumberHandlers() {
             }
         });
     }
+}
+
+// --- Send mode ---------------------------------------------------------
+// The chosen API mode, kept beside the credentials in sessionStorage so a
+// reload does not silently switch which API a campaign is sent through.
+const MODE_KEY = 'twilio_messaging_ui_mode';
+
+function getSendMode() {
+    const select = document.getElementById('send-mode');
+    if (select && select.value) return select.value;
+    return sessionStorage.getItem(MODE_KEY) || 'classic';
+}
+
+function isBulkMode() {
+    return getSendMode() === 'bulk';
+}
+
+/**
+ * Applies everything that differs between the two modes.
+ *
+ * Messenger is hidden rather than disabled because the Bulk API has no
+ * Messenger channel at all, and the send note is inverted: in bulk mode the
+ * campaign runs on Twilio, so the tab does not have to stay open. That note is
+ * the most visible difference between the modes and must not go stale.
+ *
+ * `refetchSenders` defaults to true (the mode-toggle change listener wants
+ * it), but callers whose sender fetch already reflects the current mode pass
+ * false — see initializeApp(), which restores the toggle before showAppScreen()
+ * fires its own fetch, making a second one here redundant (and each one pays
+ * its own OAuth token exchange, the same reason showAppScreen() itself avoids
+ * a duplicate call — see the comment there).
+ */
+function applySendMode(refetchSenders = true) {
+    const bulk = isBulkMode();
+    sessionStorage.setItem(MODE_KEY, getSendMode());
+
+    document.querySelectorAll('.bulk-only').forEach((el) => {
+        el.hidden = !bulk;
+    });
+
+    const channelSelect = document.getElementById('channel');
+    const messengerOption = channelSelect
+        ? channelSelect.querySelector('option[value="messenger"]')
+        : null;
+    // Set when the messenger-to-sms switch below dispatches a real "change"
+    // event: that event runs handleChannelChange(), which already calls
+    // loadPhoneNumbers() for the new channel. The explicit call further down
+    // must then be skipped, or the same request fires twice.
+    let channelChangeHandledFetch = false;
+    if (messengerOption) {
+        messengerOption.hidden = bulk;
+        messengerOption.disabled = bulk;
+        if (bulk && channelSelect.value === 'messenger') {
+            channelSelect.value = 'sms';
+            channelSelect.dispatchEvent(new Event('change'));
+            channelChangeHandledFetch = true;
+        }
+    }
+
+    const modeHelp = document.getElementById('send-mode-help');
+    if (modeHelp) {
+        modeHelp.textContent = bulk
+            ? 'One request for up to 10,000 recipients, processed on Twilio.'
+            : 'One message per recipient, driven from this tab.';
+    }
+
+    const sendNote = document.getElementById('send-note');
+    // Shared with setSendingState() below so the idle wording can never drift
+    // between the two call sites.
+    if (sendNote) {
+        sendNote.textContent = sendNoteIdleText();
+    }
+
+    updateFallbackAvailability();
+
+    // Senders differ by mode: bulk cannot use a Messaging Service, so the list
+    // must be refetched rather than filtered client-side. loadPhoneNumbers takes
+    // the channel explicitly (assets/app.js:473). Skipped when the channel-change
+    // dispatch above already triggered an equivalent fetch, or when the caller
+    // says one already happened elsewhere.
+    if (refetchSenders && !channelChangeHandledFetch && channelSelect && channelSelect.value) {
+        loadPhoneNumbers(channelSelect.value);
+    }
+}
+
+/** Fallback is WhatsApp-only; see the payload module for why RCS cannot use it. */
+function updateFallbackAvailability() {
+    const group = document.getElementById('fallback-group');
+    const checkbox = document.getElementById('fallback-to-sms');
+    if (!group || !checkbox) return;
+
+    const channel = document.getElementById('channel');
+    const available = isBulkMode() && channel && channel.value === 'whatsapp';
+
+    group.hidden = !available;
+    if (!available) checkbox.checked = false;
 }
 
 // --- Credentials -----------------------------------------------------------
@@ -168,6 +286,15 @@ function setupEventListeners() {
 
     // Channel change handler to load content templates
     document.getElementById('channel').addEventListener('change', handleChannelChange);
+
+    // Send-mode toggle: restore whatever was last chosen, then react to changes.
+    const sendModeSelect = document.getElementById('send-mode');
+    if (sendModeSelect) {
+        sendModeSelect.value = sessionStorage.getItem(MODE_KEY) || 'classic';
+        // Wrapped rather than passed directly: addEventListener would otherwise
+        // pass the Event object as applySendMode's refetchSenders argument.
+        sendModeSelect.addEventListener('change', () => applySendMode());
+    }
 
     // Re-render the template list when the status filter changes
     document.getElementById('template-status-filter').addEventListener('change', renderTemplateOptions);
@@ -432,6 +559,7 @@ async function handleLogin(e) {
 function handleLogout() {
     clearCreds();
     currentCampaignId = null;
+    currentCampaignMode = 'classic';
     if (resumeInterval) {
         clearInterval(resumeInterval);
         resumeInterval = null;
@@ -479,7 +607,10 @@ async function loadPhoneNumbers(channel) {
     select.innerHTML = '<option value="">Loading senders…</option>';
 
     try {
-        const response = await postToFunction('get-phone-numbers', { channel: ch });
+        const response = await postToFunction('get-phone-numbers', {
+            channel: ch,
+            mode: getSendMode(),
+        });
         const data = await response.json();
 
         if (!response.ok || !data.success) {
@@ -524,12 +655,26 @@ const CHANNEL_TEMPLATE_HELP = {
     mms: 'Only templates with a media type are listed — a text-only template has no media for MMS to send.',
 };
 
-// Idle copy lives in index.html so it renders as plain markup; captured on first
-// use so the two wordings never drift apart in two files.
-let sendNoteIdle = null;
+/**
+ * Idle copy differs by mode. applySendMode() writes this same text into the
+ * DOM whenever the mode changes; setSendingState() below recomputes it from
+ * the mode rather than caching the DOM text the way it used to, because a
+ * cached value would go stale the first time a campaign is sent in one mode,
+ * the mode is switched, and a second campaign is sent in the other — the
+ * cache would still hold the first mode's wording.
+ */
+function sendNoteIdleText() {
+    return isBulkMode()
+        ? 'Sending continues on Twilio once submitted — you can close this tab.'
+        : 'Keep this tab open while sending — the campaign is driven from your browser, not from Twilio.';
+}
 
 const SEND_NOTE_ACTIVE = 'Sending — keep this tab open. Closing it stops the campaign, '
     + 'though progress is saved and you can resume from Campaigns.';
+
+// Bulk has no chunk loop and no client-driven checkpoint to lose, so the
+// in-flight note only needs to cover the brief window of the single request.
+const SEND_NOTE_ACTIVE_BULK = 'Submitting to Twilio…';
 
 /**
  * Single owner of the Send button's state, and of the advisory beneath it.
@@ -539,6 +684,9 @@ const SEND_NOTE_ACTIVE = 'Sending — keep this tab open. Closing it stops the c
  * browser initiates the next. Credentials live only in sessionStorage, so
  * nothing server-side could continue the campaign on its own. Closing the tab
  * therefore halts sending — hence the promotion to a warning while in flight.
+ *
+ * In bulk mode there is no such risk — Twilio owns the campaign once
+ * submitted — so the active note is the short "submitting" message instead.
  */
 function setSendingState(sending) {
     const btn = document.getElementById('send-btn');
@@ -549,8 +697,9 @@ function setSendingState(sending) {
 
     const note = document.getElementById('send-note');
     if (!note) return;
-    if (sendNoteIdle === null) sendNoteIdle = note.textContent;
-    note.textContent = sending ? SEND_NOTE_ACTIVE : sendNoteIdle;
+    note.textContent = sending
+        ? (isBulkMode() ? SEND_NOTE_ACTIVE_BULK : SEND_NOTE_ACTIVE)
+        : sendNoteIdleText();
     note.classList.toggle('send-note--active', sending);
 }
 
@@ -569,6 +718,17 @@ function renderSenderOptions(data) {
 
     select.innerHTML = '';
 
+    // poolListFailed is only ever set in bulk mode, and only when the pool
+    // lookup itself threw — an account with zero pools configured never sets
+    // it. Left unsurfaced, that failure reads identically to "no pools on this
+    // account", which is exactly the confusion the flag exists to prevent.
+    // Phone numbers are unaffected either way (they come from a separate,
+    // independent lookup), so this is appended as a warning rather than
+    // replacing whichever message follows.
+    const poolWarning = data.poolListFailed
+        ? ' Sender pool list could not be loaded — any pools on this account are missing from the list above.'
+        : '';
+
     if (!senders.length) {
         const opt = document.createElement('option');
         opt.value = '';
@@ -581,7 +741,7 @@ function renderSenderOptions(data) {
             ? `No usable ${noun}s — ${data.totalRegistered} registered but not online`
             : `No ${noun}s or Messaging Services registered on this account`;
         select.appendChild(opt);
-        setSenderHelp(opt.textContent, true);
+        setSenderHelp(opt.textContent + poolWarning, true);
         return;
     }
 
@@ -590,8 +750,14 @@ function renderSenderOptions(data) {
     placeholder.textContent = `Select ${article} ${noun}…`;
     select.appendChild(placeholder);
 
-    const direct = senders.filter((s) => s.kind !== 'service');
+    // kind is always exactly one of 'direct' | 'service' | 'pool' — see
+    // get-phone-numbers.js — so partitioning strictly by kind (rather than the
+    // previous "not service" catch-all) does not change who lands in `direct`.
+    // It does mean a pool sender gets its own bucket instead of falling into
+    // this one by default.
+    const direct = senders.filter((s) => s.kind === 'direct');
     const services = senders.filter((s) => s.kind === 'service');
+    const pools = senders.filter((s) => s.kind === 'pool');
 
     const addGroup = (labelText, items) => {
         if (!items.length) return;
@@ -608,14 +774,25 @@ function renderSenderOptions(data) {
 
     addGroup(`${noun.replace(/^./, (c) => c.toUpperCase())}s`, direct);
     addGroup('Messaging Services', services);
+    // Classic mode never carries a kind: 'pool' sender, so `pools` is always
+    // empty there and this group simply does not render — classic-mode output
+    // is unchanged.
+    addGroup('Sender Pools', pools);
 
+    // Counted from the partitioned arrays rather than data.directCount /
+    // data.serviceCount: those two names are generic over classic and bulk
+    // (serviceCount is actually a pool count in bulk mode), and reusing them
+    // here would mislabel pools as "Messaging Services". direct.length and
+    // services.length equal directCount/serviceCount exactly in every mode
+    // that has ever produced them, so classic-mode text is unaffected.
     const parts = [];
-    if (data.directCount) parts.push(`${data.directCount} ${noun}${data.directCount === 1 ? '' : 's'}`);
-    if (data.serviceCount) parts.push(`${data.serviceCount} Messaging Service${data.serviceCount === 1 ? '' : 's'}`);
+    if (direct.length) parts.push(`${direct.length} ${noun}${direct.length === 1 ? '' : 's'}`);
+    if (services.length) parts.push(`${services.length} Messaging Service${services.length === 1 ? '' : 's'}`);
+    if (pools.length) parts.push(`${pools.length} sender pool${pools.length === 1 ? '' : 's'}`);
     const hidden = (data.totalRegistered || 0) - (data.directCount || 0);
     setSenderHelp(
-        parts.join(' · ') + (hidden > 0 ? ` · ${hidden} not online` : ''),
-        false
+        parts.join(' · ') + (hidden > 0 ? ` · ${hidden} not online` : '') + poolWarning,
+        Boolean(data.poolListFailed)
     );
 }
 
@@ -625,6 +802,10 @@ async function handleChannelChange() {
     const channel = document.getElementById('channel').value;
     // The sender list is channel-specific — a WhatsApp sender is not a phone number.
     loadPhoneNumbers(channel);
+    // The fallback checkbox is WhatsApp-only in bulk mode; re-evaluate on every
+    // channel switch so it does not stay visible (or checked) for a channel it
+    // no longer applies to.
+    updateFallbackAvailability();
     const contentTemplateGroup = document.getElementById('content-template-group');
     const contentTemplateSelect = document.getElementById('content-template');
     const contentTemplateHelp = document.getElementById('content-template-help');
@@ -768,9 +949,26 @@ function updateMessageBodyRequirement() {
     // then only a fallback for rows whose own cell is blank.
     const csvSuppliesBody = csvIsActive() && csvUpload.mode === 'body';
 
+    // Stashed on first use so the original is restorable, matching how the
+    // recipients box handles being superseded by a CSV.
+    if (messageBodyPlaceholder === null) messageBodyPlaceholder = messageBody.placeholder;
+
+    // A selected template does not merely make this field optional — it makes it
+    // unused. Both send paths ignore it: bulk-payload's resolveContent returns
+    // `{contentId}` and never reads the body, and Programmable Messaging drops
+    // `body` whenever `contentSid` is set. Leaving it editable invited someone to
+    // type a message that would silently never be sent, so it is disabled and
+    // dimmed, and the placeholder says what is standing in for it rather than
+    // leaving a greyed-out empty box that reads as broken.
+    messageBody.disabled = templateSelected;
+    messageBody.classList.toggle('field-superseded', templateSelected);
+    messageBody.placeholder = templateSelected
+        ? 'The template supplies the message — clear it to type your own'
+        : messageBodyPlaceholder;
+
     if (templateSelected) {
         messageBody.removeAttribute('required');
-        messageBodyHelp.textContent = 'Optional when using a content template';
+        messageBodyHelp.textContent = 'Not used while a content template is selected — the template supplies the message';
     } else if (csvSuppliesBody) {
         messageBody.removeAttribute('required');
         messageBodyHelp.textContent = 'Taken per recipient from the CSV; used as a fallback for blank cells';
@@ -1089,9 +1287,14 @@ async function handleSendMessages(e) {
 
     // Generate campaign ID
     currentCampaignId = `campaign_${Date.now()}`;
+    currentCampaignMode = isBulkMode() ? 'bulk' : 'classic';
 
     try {
-        await sendMessagesBatch(messages, channel, from, campaignName);
+        if (isBulkMode()) {
+            await sendBulkCampaign(messages, channel, from, campaignName);
+        } else {
+            await sendMessagesBatch(messages, channel, from, campaignName);
+        }
     } catch (error) {
         alert('Error: ' + error.message);
         setSendingState(false);
@@ -1123,7 +1326,7 @@ async function sendMessagesBatch(messages, channel, from, campaignName) {
             isComplete = data.isComplete;
 
             // Update UI - fetch full campaign status to get delivery/read info
-            await checkCampaignStatus();
+            await refreshCurrentCampaign();
 
             if (!isComplete) {
                 // Wait a bit before resuming (to avoid hitting rate limits)
@@ -1131,7 +1334,7 @@ async function sendMessagesBatch(messages, channel, from, campaignName) {
             }
         } catch (error) {
             console.error('Error sending messages:', error);
-            
+
             // Show error but allow manual resume
             showResumeOption();
             throw error;
@@ -1139,8 +1342,8 @@ async function sendMessagesBatch(messages, channel, from, campaignName) {
     }
 
     // Final status check
-    await checkCampaignStatus();
-    
+    await refreshCurrentCampaign();
+
     // Reload campaigns list
     await loadCampaigns();
     
@@ -1148,6 +1351,81 @@ async function sendMessagesBatch(messages, channel, from, campaignName) {
     startStatusAutoRefresh();
     
     setSendingState(false);
+}
+
+/**
+ * Submits a bulk campaign in a single request.
+ *
+ * No loop, and deliberately so: one operation covers 10,000 recipients and
+ * Twilio processes it server-side, which is the whole reason this mode exists.
+ * The `messages` array the classic path builds is reused as-is — each entry
+ * already carries `to`, and optionally `body` and `variables`.
+ */
+async function sendBulkCampaign(messages, channel, from, campaignName) {
+    const sendAtInput = document.getElementById('send-at');
+    const fallbackInput = document.getElementById('fallback-to-sms');
+
+    // datetime-local yields a value with no timezone ("2026-09-10T09:30"), which
+    // the API would read as UTC. Converting through Date attaches the browser's
+    // offset, so the user gets the time they actually picked.
+    const sendAt = sendAtInput && sendAtInput.value
+        ? new Date(sendAtInput.value).toISOString()
+        : null;
+
+    const first = messages[0] || {};
+
+    // Only a Body-mode CSV gives each recipient its own message text. Every
+    // other route — typed body, or a content template with variables — shares
+    // one message across the whole campaign.
+    const perRecipientBodies = csvIsActive() && csvUpload.mode === 'body';
+
+    const response = await postToFunction('send-bulk', {
+        channel,
+        from,
+        body: document.getElementById('message-body').value || '',
+        contentSid: first.contentSid || null,
+        mediaUrl: first.mediaUrl || null,
+        // A per-recipient `body` is only sent when a Body-mode CSV is genuinely
+        // supplying different text per row. buildMessage copies the typed
+        // campaign body onto every message, so forwarding it unconditionally
+        // made every send look like per-recipient personalisation: the payload
+        // module then routed a single shared message through a `{{body}}`
+        // variable, and the API rejected the whole request for a Liquid
+        // variable with no default. The typed body belongs in `content.text`,
+        // which is what omitting this lets the payload module do.
+        recipients: messages.map((message) => ({
+            to: message.to,
+            ...(perRecipientBodies && message.body ? { body: message.body } : {}),
+            ...(message.contentVariables
+                ? { variables: typeof message.contentVariables === 'string'
+                    ? JSON.parse(message.contentVariables)
+                    : message.contentVariables }
+                : {}),
+        })),
+        campaignName: campaignName || null,
+        sendAt,
+        fallbackToSms: Boolean(fallbackInput && fallbackInput.checked),
+    });
+
+    const data = await response.json();
+
+    if (!response.ok) {
+        throw new Error(data.error || 'Failed to submit the bulk campaign');
+    }
+
+    currentCampaignId = data.campaignId;
+
+    if (data.warning) alert(data.warning);
+    if (data.partial) alert(data.error);
+
+    if (currentCampaignId) {
+        await checkBulkCampaignStatus();
+        await loadCampaigns();
+        startStatusAutoRefresh();
+    }
+
+    setSendingState(false);
+    return data;
 }
 
 async function checkCampaignStatus() {
@@ -1172,6 +1450,152 @@ async function checkCampaignStatus() {
     }
 }
 
+/**
+ * Polls a bulk campaign's aggregate stats.
+ *
+ * Only the cheap endpoint runs on the timer. Per-recipient rows come from
+ * loadBulkMessages, called when the delivery panel is opened, because a
+ * 10,000-recipient operation is ten pages of API reads.
+ *
+ * The campaign card itself is redrawn by loadCampaigns() — check-bulk-status
+ * writes the stats into the campaign document, and list-campaigns.js turns them
+ * into the same counters the classic path renders.
+ */
+async function checkBulkCampaignStatus() {
+    if (!currentCampaignId || !creds) return;
+
+    try {
+        const response = await postToFunction('check-bulk-status', {
+            campaignId: currentCampaignId,
+        });
+        const data = await response.json();
+        if (!response.ok || !data.campaign) return;
+
+        // Once every operation is terminal nothing will change again, so stop
+        // polling rather than re-reading the same numbers every 5 seconds.
+        if (data.campaign.isComplete) stopStatusAutoRefresh();
+    } catch (error) {
+        console.error('Bulk status check failed:', error);
+    }
+}
+
+/**
+ * Fetches every per-recipient row, following the cursor the Function returns
+ * when one 9-second invocation cannot finish paging.
+ *
+ * Also returns the last `campaign` object seen. Every check-bulk-status
+ * response carries the current aggregate stats alongside the messages page,
+ * so the caller gets both without paying for a second request.
+ */
+async function loadBulkMessages(campaignId) {
+    const rows = [];
+    let campaign = null;
+    let cursor = null;
+
+    do {
+        const response = await postToFunction('check-bulk-status', {
+            campaignId,
+            includeMessages: true,
+            ...(cursor
+                ? { pageToken: cursor.pageToken, operationIndex: cursor.operationIndex }
+                : {}),
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Failed to load recipients');
+
+        rows.push(...(data.messages || []));
+        campaign = data.campaign || campaign;
+        cursor = data.nextCursor;
+    } while (cursor);
+
+    return { rows, campaign };
+}
+
+/**
+ * Bulk statuses are SCREAMING_CASE; the delivery table and CSV export were
+ * written against Programmable Messaging's lowercase vocabulary.
+ */
+function normaliseBulkStatus(status) {
+    return String(status || 'unknown').toLowerCase();
+}
+
+/**
+ * Maps a check-bulk-status `campaign` object's aggregate stats to the same
+ * five fields the classic path already supplies on its own campaign object
+ * (totalMessages, sent, delivered, read, failed) — displayMessageDetails's
+ * summary header reads those five and nothing else. Mirrors
+ * functions/list-campaigns.js's bulk mapping exactly (including `unaddressable`
+ * counting as failed, not pending); keep the two in sync if that mapping ever
+ * changes.
+ */
+function bulkCampaignAggregates(campaign) {
+    const stats = (campaign && campaign.stats) || {};
+    return {
+        totalMessages: (campaign && campaign.recipientCount) || 0,
+        sent: Number(stats.sent || 0) + Number(stats.delivered || 0) + Number(stats.read || 0),
+        delivered: Number(stats.delivered || 0) + Number(stats.read || 0),
+        read: Number(stats.read || 0),
+        failed: Number(stats.failed || 0) + Number(stats.undelivered || 0) + Number(stats.unaddressable || 0),
+    };
+}
+
+/**
+ * Reshapes bulk rows into the `statuses` map the existing table and CSV export
+ * already read, so neither needs a bulk-specific branch.
+ */
+/**
+ * `to`'s exact shape on a bulk message row is unconfirmed — the Bulk
+ * Messaging API's Message resource schema was not settled by the docs pages
+ * checked for this. Tries every plausible shape: a bare string, `{ address }`,
+ * or an array whose first element is either of those. This is the one place
+ * that reads it; correct here once the live shape is confirmed.
+ */
+function bulkRecipientAddress(to) {
+    if (typeof to === 'string') return to;
+    if (Array.isArray(to)) return bulkRecipientAddress(to[0]);
+    if (to && typeof to.address === 'string') return to.address;
+    return '';
+}
+
+function bulkRowsToStatuses(rows) {
+    const statuses = {};
+
+    rows.forEach((row, index) => {
+        const status = normaliseBulkStatus(row.status);
+        // Fall back to the index so two rows can never collide and silently
+        // drop one from the table.
+        const key = row.id || row.messageId || `bulk-${index}`;
+
+        statuses[key] = {
+            status,
+            to: bulkRecipientAddress(row.to),
+            sentAt: row.createdAt || row.updatedAt || null,
+            dateSent: row.createdAt || null,
+            // Whether bulk errors live on the message row at all, or behind a
+            // separate endpoint, is also unconfirmed. Left as a direct read:
+            // if absent, this degrades to null, which the table and CSV
+            // export already render as "-".
+            errorCode: row.errorCode == null ? null : row.errorCode,
+            errorMessage: row.errorMessage == null ? null : row.errorMessage,
+            delivered: status === 'delivered' || status === 'read',
+            read: status === 'read',
+        };
+    });
+
+    return statuses;
+}
+
+/**
+ * Routes the status poll by the campaign's own mode rather than the toggle:
+ * this only ever fires for currentCampaignId, whose mode was fixed the moment
+ * it was created or opened. check-status now returns 409 for a bulk campaign,
+ * and check-bulk-status returns 404 for a classic one, so calling the wrong
+ * one is never harmless.
+ */
+async function refreshCurrentCampaign() {
+    if (currentCampaignMode === 'bulk') return checkBulkCampaignStatus();
+    return checkCampaignStatus();
+}
 
 async function resumeCampaignById(campaignId, event) {
     if (!creds) {
@@ -1202,8 +1626,10 @@ async function resumeCampaignById(campaignId, event) {
             throw new Error('Campaign data is missing. Cannot resume this campaign.');
         }
 
-        // Set current campaign ID
+        // Set current campaign ID. Resume only ever reaches a classic campaign
+        // — the Resume button is not offered for bulk (see displayCampaigns).
         currentCampaignId = campaignId;
+        currentCampaignMode = 'classic';
 
         // Continue resuming until complete
         let isComplete = false;
@@ -1306,9 +1732,17 @@ function displayCampaigns(campaigns) {
         const isActive = campaign.campaignId === currentCampaignId;
         // Progress is how far through the recipient list we are, not a ratio of
         // send attempts — a resent chunk would otherwise push this past 100%.
-        const processed = Number.isFinite(campaign.startIndex)
-            ? campaign.startIndex
-            : (campaign.sent || 0);
+        // Bulk rows have no startIndex, and their `sent` deliberately excludes
+        // failed/unaddressable recipients while totalMessages counts everyone —
+        // so a finished bulk campaign with any failures would otherwise read
+        // under 100% next to a "Complete" badge. totalMessages - pending counts
+        // every terminal outcome, success or failure, and reaches 100% exactly
+        // when nothing is left pending.
+        const processed = campaign.mode === 'bulk'
+            ? (campaign.totalMessages || 0) - (campaign.pending || 0)
+            : Number.isFinite(campaign.startIndex)
+                ? campaign.startIndex
+                : (campaign.sent || 0);
         const progress = campaign.totalMessages > 0
             ? Math.min(100, (processed / campaign.totalMessages) * 100).toFixed(1)
             : 0;
@@ -1326,17 +1760,24 @@ function displayCampaigns(campaigns) {
             ? new Date(campaign.lastUpdated).toLocaleString() 
             : 'Unknown';
 
-        const canResume = !campaign.isComplete && campaign.startIndex < campaign.totalMessages;
-        
+        // Bulk campaigns cannot be resumed: Twilio owns the processing, and no
+        // recipient list is stored to resume from. An operation continues on its
+        // own or has already finished.
+        const canResume = campaign.mode !== 'bulk' && !campaign.isComplete && campaign.startIndex < campaign.totalMessages;
+
         // Use campaign name if available, otherwise fall back to formatted timestamp
-        const displayName = campaign.campaignName || 
-            (campaign.createdAt ? new Date(campaign.createdAt).toLocaleString() : 
+        const displayName = campaign.campaignName ||
+            (campaign.createdAt ? new Date(campaign.createdAt).toLocaleString() :
             campaign.campaignId.replace('campaign_', ''));
-        
+
+        const modeBadge = campaign.mode === 'bulk'
+            ? '<span class="mode-badge mode-badge--bulk">Bulk</span> '
+            : '<span class="mode-badge mode-badge--classic">Classic</span> ';
+
         html += `
-            <div class="campaign-item ${isActive ? 'active' : ''}" onclick="viewCampaign('${campaign.campaignId}')">
+            <div class="campaign-item ${isActive ? 'active' : ''}" onclick="viewCampaign('${campaign.campaignId}', '${campaign.mode || 'classic'}')">
                 <div class="campaign-header">
-                    <div class="campaign-id">${displayName}</div>
+                    <div class="campaign-id">${modeBadge}${displayName}</div>
                     <div style="display: flex; gap: 8px; align-items: center;">
                         <div class="campaign-status-badge ${campaign.isComplete ? 'complete' : 'in-progress'}">
                             ${campaign.isComplete ? 'Complete' : 'In Progress'}
@@ -1390,24 +1831,54 @@ function displayCampaigns(campaigns) {
     });
 }
 
-async function viewCampaign(campaignId) {
+async function viewCampaign(campaignId, mode) {
     currentCampaignId = campaignId;
-    
+    // The row's own mode, not the toggle: history shows both kinds at once, and
+    // this drives both the immediate detail fetch below and every subsequent
+    // auto-refresh tick via refreshCurrentCampaign().
+    currentCampaignMode = mode === 'bulk' ? 'bulk' : 'classic';
+
     // Show message details section
     const messageDetailsSection = document.getElementById('message-details-section');
     if (messageDetailsSection) {
         messageDetailsSection.style.display = 'block';
         document.getElementById('message-details-content').innerHTML = '<p style="color: #666; text-align: center; padding: 20px;">Loading message details...</p>';
     }
-    
+
     // Fetch and display detailed campaign status
-    await fetchAndDisplayCampaignDetails(campaignId);
+    await fetchAndDisplayCampaignDetails(campaignId, mode);
     await loadCampaigns(); // Refresh list to highlight active campaign
     startStatusAutoRefresh();
 }
 
-async function fetchAndDisplayCampaignDetails(campaignId) {
+async function fetchAndDisplayCampaignDetails(campaignId, mode) {
     if (!creds) return;
+
+    // The row's own mode, not the toggle: history shows both kinds at once.
+    const bulk = (mode || (isBulkMode() ? 'bulk' : 'classic')) === 'bulk';
+
+    if (bulk) {
+        try {
+            const { rows, campaign } = await loadBulkMessages(campaignId);
+            // displayMessageDetails reads campaign.statuses and stores the whole
+            // object in displayedCampaign, which is what CSV export exports. The
+            // summary header above the table reads totalMessages/sent/failed/
+            // delivered/read from this same object, so the aggregate fields are
+            // spread in too — without them the header renders zeroes even though
+            // the table beneath it is fully populated.
+            displayMessageDetails({
+                campaignId,
+                mode: 'bulk',
+                statuses: bulkRowsToStatuses(rows),
+                ...bulkCampaignAggregates(campaign),
+            });
+        } catch (error) {
+            console.error('Error loading bulk recipients:', error);
+            document.getElementById('message-details-content').innerHTML =
+                '<p style="color: #d32f2f; text-align: center; padding: 20px;">Error loading message details</p>';
+        }
+        return;
+    }
 
     try {
         const response = await postToFunction('check-status', { campaignId });
@@ -1509,7 +1980,13 @@ function displayMessageDetails(campaign) {
         // Rejected sends are keyed "failed-<n>" because Twilio never issued a
         // SID. Showing that internal key in a column headed "Message SID" would
         // read as a real identifier, so say what actually happened instead.
-        const sidLabel = MESSAGE_SID.test(sid) ? sid : 'not accepted';
+        // Bulk identifiers are not classic Twilio SIDs at all, so they always
+        // fail MESSAGE_SID — testing them against it would label every
+        // successfully delivered bulk message as rejected. Show the bulk
+        // identifier as-is instead; the regex only applies to classic rows.
+        const sidLabel = campaign.mode === 'bulk'
+            ? sid
+            : (MESSAGE_SID.test(sid) ? sid : 'not accepted');
 
         const formatDate = (dateValue) => {
             if (!dateValue) return 'N/A';
@@ -1805,8 +2282,11 @@ function exportMessageStatusCsv() {
         return new Date(dateB) - new Date(dateA);
     });
 
+    // Bulk identifiers are not classic Twilio SIDs — see the same check in
+    // displayMessageDetails for why they must not be tested against MESSAGE_SID.
+    const bulk = campaign.mode === 'bulk';
     const rows = entries.map(([sid, s]) => ({
-        'Message SID': MESSAGE_SID.test(sid) ? sid : 'not accepted',
+        'Message SID': bulk ? sid : (MESSAGE_SID.test(sid) ? sid : 'not accepted'),
         'To': s.to || '',
         'Status': s.status || '',
         'Delivered': s.delivered ? 'Yes' : 'No',
@@ -1837,9 +2317,16 @@ function startStatusAutoRefresh() {
     if (currentCampaignId && creds) {
         // Refresh every 5 seconds
         statusRefreshInterval = setInterval(async () => {
-            await checkCampaignStatus();
+            await refreshCurrentCampaign();
             await loadCampaigns(); // Also refresh the campaigns list
         }, 5000);
+    }
+}
+
+function stopStatusAutoRefresh() {
+    if (statusRefreshInterval) {
+        clearInterval(statusRefreshInterval);
+        statusRefreshInterval = null;
     }
 }
 

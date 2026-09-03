@@ -3,6 +3,7 @@
  */
 
 const oauth = require(Runtime.getAssets()['/twilio-oauth.js'].path);
+const comms = require(Runtime.getAssets()['/twilio-comms.js'].path);
 
 exports.handler = async function(context, event, callback) {
   const response = new Twilio.Response();
@@ -16,8 +17,11 @@ exports.handler = async function(context, event, callback) {
   }
 
   let client;
+  let authString;
   try {
-    client = await oauth.authenticate(oauth.credsFrom(event));
+    const authed = await oauth.authenticateWithToken(oauth.credsFrom(event));
+    client = authed.client;
+    authString = authed.authString;
   } catch (error) {
     response.setStatusCode(error.statusCode || 401);
     response.setBody({ error: error.message });
@@ -27,10 +31,51 @@ exports.handler = async function(context, event, callback) {
   try {
     const channel = String(event.channel || 'sms').toLowerCase();
 
-    // A Messaging Service can send on any channel, so it is offered everywhere.
-    // Fetched concurrently with the channel-specific list: this is a second network
-    // call inside a 10s Function budget, and serialising them wastes headroom.
-    const servicesPromise = client.messaging.v1.services.list({ limit: 50 });
+    const mode = String(event.mode || 'classic').toLowerCase();
+
+    // In bulk mode a Messaging Service is not a valid sender — the Bulk API's
+    // `from` takes an address/channel pair, a senderId or a senderPoolId, and an
+    // MG SID is none of them. Sender pools take its place in the dropdown.
+    //
+    // Either way, this list is fetched concurrently with the channel-specific
+    // list: it's a second network call inside a 10s Function budget, and
+    // serialising them wastes headroom.
+    //
+    // A pool listing that fails must not fail the whole request: phone numbers
+    // are the common case and are still perfectly usable without pools. When it
+    // does fail, `poolListFailed` is set so the response can say so.
+    let poolListFailed = false;
+    const secondaryPromise = mode === 'bulk'
+      ? comms
+          .listSenderPools(authString)
+          .then((pools) => pools
+            // The response shape is unconfirmed — mirror listSenderPools' own
+            // tolerance and accept either field. A pool with neither is not
+            // selectable, so it is dropped rather than offered as an option
+            // that fails later at send time.
+            .filter((pool) => pool.id || pool.sid)
+            .map((pool) => {
+              const value = pool.id || pool.sid;
+              return {
+                value,
+                label: `${pool.friendlyName || value} · pool`,
+                status: 'ONLINE',
+                kind: 'pool',
+              };
+            }))
+          .catch((error) => {
+            console.error('Sender pool list failed:', error.message);
+            poolListFailed = true;
+            return [];
+          })
+      : client.messaging.v1.services.list({ limit: 50 }).then((services) =>
+          services.map((s) => ({
+            value: s.sid,
+            label: `${s.friendlyName} · ${s.sid.slice(0, 10)}…`,
+            status: 'ONLINE',
+            kind: 'service',
+          }))
+        );
 
     let directPromise;
     if (channel === 'whatsapp' || channel === 'rcs') {
@@ -82,19 +127,13 @@ exports.handler = async function(context, event, callback) {
       });
     }
 
-    const [direct, services] = await Promise.all([directPromise, servicesPromise]);
-
-    const serviceSenders = services.map((s) => ({
-      value: s.sid,
-      label: `${s.friendlyName} · ${s.sid.slice(0, 10)}…`,
-      status: 'ONLINE',
-      kind: 'service',
-    }));
+    const [direct, serviceSenders] = await Promise.all([directPromise, secondaryPromise]);
 
     response.setStatusCode(200);
     response.setBody({
       success: true,
       channel,
+      mode,
       senders: [...direct.senders, ...serviceSenders],
       directCount: direct.senders.length,
       serviceCount: serviceSenders.length,
@@ -102,6 +141,11 @@ exports.handler = async function(context, event, callback) {
       // "some registered but none usable" — two different things to say.
       usableCount: direct.senders.length + serviceSenders.length,
       totalRegistered: direct.total,
+      // Only meaningful in bulk mode, where serviceSenders is actually the pool
+      // list — without this, a failed pool lookup is indistinguishable from an
+      // account with no pools configured, and both collapse usableCount the
+      // same way. Absent in classic mode, where it would mean nothing.
+      ...(mode === 'bulk' ? { poolListFailed } : {}),
       // Kept so nothing that still reads `phoneNumbers` breaks silently.
       phoneNumbers: direct.senders.map((s) => ({ phoneNumber: s.value })),
     });

@@ -1370,8 +1370,31 @@ input::placeholder, textarea::placeholder { color: var(--text-muted); }
 .csv-upload {
     display: flex;
     flex-wrap: wrap;
+    /* Without this, a taller control stretches its shorter siblings to match
+       instead of sitting beside them, which is what made the row look ragged. */
+    align-items: center;
     gap: 8px;
     margin-bottom: 10px;
+}
+
+/* Download sample is a sibling action, not a next step, so it sits at the far
+   right with Upload/Clear grouped on the left. `auto` rather than a fixed gap so
+   it stays right-aligned on its own line if the row wraps.
+
+   Its height is taken FROM the row rather than declared, because Upload CSV is
+   the reference and must not be restyled to accommodate this one: Upload CSV is a
+   <label> driving the hidden file input, and a <label> and a <button> with the
+   same padding do not resolve to the same height. Dropping this button's vertical
+   padding stops it setting the row's height, and stretching makes it adopt the
+   height the label already establishes — so the two match without .csv-btn, and
+   therefore Upload CSV, being touched at all. The floor only matters if the row
+   wraps and this ends up alone on its line, where there is no sibling to match. */
+#csv-sample-btn {
+    margin-left: auto;
+    align-self: stretch;
+    padding-top: 0;
+    padding-bottom: 0;
+    min-height: 31px;
 }
 
 /* The native control is unstyleable, so a label drives it. Clipped rather than
@@ -1447,7 +1470,11 @@ input::placeholder, textarea::placeholder { color: var(--text-muted); }
 
 /* Inputs the loaded CSV has taken over. Dimmed and non-interactive, but still
    legible, so it reads as "superseded" rather than "broken". */
-.csv-overridden {
+/* One visual for "a field whose value is being supplied from somewhere else":
+   a CSV column standing in for the recipients box, or a content template
+   standing in for the message body. Same meaning, so the same treatment. */
+.csv-overridden,
+.field-superseded {
     opacity: 0.55;
     pointer-events: none;
 }
@@ -1482,5 +1509,38 @@ input::placeholder, textarea::placeholder { color: var(--text-muted); }
 
 @media (prefers-reduced-motion: reduce) {
     * { transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; }
+}
+
+.checkbox-label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-weight: 400;
+    cursor: pointer;
+}
+
+.checkbox-label input[type="checkbox"] {
+    width: auto;
+    margin: 0;
+}
+
+.mode-badge {
+    display: inline-block;
+    padding: 1px 7px;
+    border-radius: 10px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    vertical-align: middle;
+}
+
+.mode-badge--bulk {
+    background: #e8f0fe;
+    color: #1a56b8;
+}
+
+.mode-badge--classic {
+    background: #eef0f2;
+    color: #55606b;
 }
 

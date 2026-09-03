@@ -155,7 +155,7 @@ function withDeadline(promise, ms, message) {
  * Bounding it here rather than in each Function is deliberate: all six callers
  * inherit the protection, including any added later.
  */
-async function authenticate(creds, timeoutMs = TOKEN_DEADLINE_MS) {
+async function authenticateWithToken(creds, timeoutMs = TOKEN_DEADLINE_MS) {
   const { client, authStrategy } = createOAuthClient(creds);
   let authString;
   try {
@@ -184,6 +184,18 @@ async function authenticate(creds, timeoutMs = TOKEN_DEADLINE_MS) {
   }
   client.setAccountSid(accountSid);
 
+  return { client, authString, accountSid };
+}
+
+/**
+ * The client alone, for the six callers that only ever needed that.
+ *
+ * `authString` is deliberately not attached to the client: the Bulk path asks
+ * for it explicitly through `authenticateWithToken`, so a bearer token cannot
+ * travel somewhere by accident just because a client was passed along.
+ */
+async function authenticate(creds, timeoutMs = TOKEN_DEADLINE_MS) {
+  const { client } = await authenticateWithToken(creds, timeoutMs);
   return client;
 }
 
@@ -244,6 +256,7 @@ module.exports = {
   credsFrom,
   createOAuthClient,
   authenticate,
+  authenticateWithToken,
   accountSidFromAuthString,
   ownerKeyFor,
   getOrCreateSyncService,
