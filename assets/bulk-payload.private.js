@@ -149,7 +149,16 @@ function resolveContent(request, recipients) {
         `${missing} recipient(s) have no message text: their row's body is blank and no message body was typed to fall back on.`
       );
     }
-    const content = { text: '{{body}}' };
+    // The `default` filter is not decoration — the API validates inline Liquid
+    // up front and rejects the entire request with "all template variable
+    // occurrences must have default values using the 'default' filter" when any
+    // variable lacks one. A bare `{{body}}` fails that check outright.
+    //
+    // The empty default never actually renders: the loop in buildPayloads gives
+    // every recipient a `body` variable, falling back to the campaign body, and
+    // the guard above rejects any recipient that would have neither. It exists
+    // to satisfy the validator, not to paper over missing text.
+    const content = { text: '{{ body | default: "" }}' };
     if (media.length) content.media = media;
     return { content, perRecipientBody: true };
   }

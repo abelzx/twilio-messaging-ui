@@ -166,7 +166,7 @@ test('routes per-recipient bodies through a single Liquid variable', () => {
 
   // One content object for the whole request; the text differs per recipient
   // only because each supplies its own `body` variable.
-  assert.deepStrictEqual(out.content, { text: '{{body}}' });
+  assert.deepStrictEqual(out.content, { text: '{{ body | default: "" }}' });
   assert.strictEqual(out.to[0].variables.body, 'Your table is at 7pm');
   assert.strictEqual(out.to[1].variables.body, 'Your table is at 8pm');
 });
@@ -240,7 +240,7 @@ test('a partially-filled body column still works when a campaign body is present
       { to: '+15558675311' },
     ],
   });
-  assert.deepStrictEqual(out.content, { text: '{{body}}' });
+  assert.deepStrictEqual(out.content, { text: '{{ body | default: "" }}' });
   assert.strictEqual(out.to[0].variables.body, 'Own text');
   assert.strictEqual(out.to[1].variables.body, 'Fallback body');
 });

@@ -1374,15 +1374,28 @@ async function sendBulkCampaign(messages, channel, from, campaignName) {
 
     const first = messages[0] || {};
 
+    // Only a Body-mode CSV gives each recipient its own message text. Every
+    // other route — typed body, or a content template with variables — shares
+    // one message across the whole campaign.
+    const perRecipientBodies = csvIsActive() && csvUpload.mode === 'body';
+
     const response = await postToFunction('send-bulk', {
         channel,
         from,
         body: document.getElementById('message-body').value || '',
         contentSid: first.contentSid || null,
         mediaUrl: first.mediaUrl || null,
+        // A per-recipient `body` is only sent when a Body-mode CSV is genuinely
+        // supplying different text per row. buildMessage copies the typed
+        // campaign body onto every message, so forwarding it unconditionally
+        // made every send look like per-recipient personalisation: the payload
+        // module then routed a single shared message through a `{{body}}`
+        // variable, and the API rejected the whole request for a Liquid
+        // variable with no default. The typed body belongs in `content.text`,
+        // which is what omitting this lets the payload module do.
         recipients: messages.map((message) => ({
             to: message.to,
-            ...(message.body ? { body: message.body } : {}),
+            ...(perRecipientBodies && message.body ? { body: message.body } : {}),
             ...(message.contentVariables
                 ? { variables: typeof message.contentVariables === 'string'
                     ? JSON.parse(message.contentVariables)
