@@ -1379,9 +1379,22 @@ input::placeholder, textarea::placeholder { color: var(--text-muted); }
 
 /* Download sample is a sibling action, not a next step, so it sits at the far
    right with Upload/Clear grouped on the left. `auto` rather than a fixed gap so
-   it stays right-aligned on its own line if the row wraps. */
+   it stays right-aligned on its own line if the row wraps.
+
+   Its height is taken FROM the row rather than declared, because Upload CSV is
+   the reference and must not be restyled to accommodate this one: Upload CSV is a
+   <label> driving the hidden file input, and a <label> and a <button> with the
+   same padding do not resolve to the same height. Dropping this button's vertical
+   padding stops it setting the row's height, and stretching makes it adopt the
+   height the label already establishes — so the two match without .csv-btn, and
+   therefore Upload CSV, being touched at all. The floor only matters if the row
+   wraps and this ends up alone on its line, where there is no sibling to match. */
 #csv-sample-btn {
     margin-left: auto;
+    align-self: stretch;
+    padding-top: 0;
+    padding-bottom: 0;
+    min-height: 31px;
 }
 
 /* The native control is unstyleable, so a label drives it. Clipped rather than
@@ -1399,17 +1412,9 @@ input::placeholder, textarea::placeholder { color: var(--text-muted); }
     border: 0;
 }
 
-/* One of these three is a <label> driving the hidden file input and the other two
-   are <button>s. Identical padding and font-size are not enough to make those
-   agree on height — the label rendered shorter than the buttons beside it — so the
-   box is pinned explicitly and every contributing property is stated rather than
-   inherited from .btn. */
 .csv-btn {
-    box-sizing: border-box;
-    min-height: 34px;
-    padding: 0 14px;
+    padding: 7px 14px;
     font-size: 13px;
-    line-height: 1.2;
 }
 
 .csv-file-input:focus-visible + .csv-btn {
