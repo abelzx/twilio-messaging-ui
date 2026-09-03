@@ -73,29 +73,21 @@ const MAX_PAYLOAD_BYTES = 10 * 1024 * 1024;
 const CONTENT_SID = /^HX[0-9a-f]{32}$/i;
 
 /**
- * Wraps text so Liquid renders it verbatim.
+ * Detects whether a body needs protecting from Liquid at all.
  *
- * `content.text` is Liquid-templated, so an unwrapped `{{name}}` in a body typed
- * by a user would be interpreted and almost certainly render empty. The classic
- * path sends bodies literally, and the two modes must not differ on this.
+ * `content.text` is Liquid-templated, so `{{name}}` typed by a user would be
+ * interpreted and almost certainly render empty. This used to be handled by
+ * wrapping every body in `{% raw %}…{% endraw %}`, which was wrong twice over:
+ * the API delivers that wrapper as literal text, so recipients received
+ * "{% raw %}Hi there{% endraw %}", and a body containing `{% endraw %}` had to
+ * be refused outright because it could close the wrapper early.
  *
- * `{% endraw %}` in the text would close the wrapper early and expose the rest
- * to interpretation. Liquid offers no way to escape it, so it is refused.
+ * Bodies are now sent verbatim when there is nothing to interpret, and routed
+ * through a variable when there is — see resolveContent. So this only has to
+ * answer "does Liquid care about this string", and a body containing
+ * `{% endraw %}` is no longer a special case at all.
  */
-function escapeLiquid(text) {
-  const raw = String(text);
-  // No /i flag: Liquid tag names are case-sensitive, so "{% ENDRAW %}" does not
-  // close a raw block and cannot be used to break out of the wrapper. Matching
-  // case-insensitively here would reject harmless text that Liquid itself treats
-  // as inert.
-  if (/\{%-?\s*endraw\s*-?%\}/.test(raw)) {
-    throw httpError(
-      400,
-      'The message body contains the literal text "{% endraw %}", which cannot be sent safely on this mode. Remove it, or switch to Programmable Messaging.'
-    );
-  }
-  return `{% raw %}${raw}{% endraw %}`;
-}
+const LIQUID_SYNTAX = /\{\{|\{%/;
 
 /**
  * Resolves the single `content` object shared by every recipient in the request.
@@ -167,9 +159,29 @@ function resolveContent(request, recipients) {
     throw httpError(400, 'A message body or a content template is required.');
   }
 
-  const content = { text: escapeLiquid(body) };
+  // A body with no Liquid syntax in it is sent exactly as typed. It used to be
+  // wrapped in `{% raw %}…{% endraw %}` to stop Liquid interpreting it, but the
+  // API delivers that wrapper as literal text — recipients received
+  // "{% raw %}Hi there{% endraw %}" — so the wrapper protected nothing and
+  // corrupted every message. There is nothing to escape here anyway.
+  if (!LIQUID_SYNTAX.test(body)) {
+    const content = { text: body };
+    if (media.length) content.media = media;
+    return { content, perRecipientBody: false };
+  }
+
+  // A body that does contain `{{` or `{%` cannot be sent as text: Liquid would
+  // interpret it, and the raw wrapper is not available. So it goes through the
+  // same variable route the CSV case uses. A variable's *value* is substituted
+  // in, not re-rendered, which makes this a genuine escape rather than a dodge —
+  // and it is a route the API demonstrably accepts.
+  //
+  // perRecipientBody is true so the loop in buildPayloads assigns each recipient
+  // a `body` variable; none of them has an own body here, so every one falls
+  // back to this campaign body and receives identical, literal text.
+  const content = { text: '{{ body | default: "" }}' };
   if (media.length) content.media = media;
-  return { content, perRecipientBody: false };
+  return { content, perRecipientBody: true };
 }
 
 const MEDIA_CHANNELS = new Set(['mms', 'rcs']);
@@ -320,6 +332,5 @@ module.exports = {
   buildPayloads,
   CHANNEL_MAP,
   bareAddress,
-  escapeLiquid,
   MAX_RECIPIENTS_PER_OPERATION,
 };

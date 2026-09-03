@@ -69,23 +69,43 @@ test('rejects an empty recipient list', () => {
   );
 });
 
-test('wraps a literal body so Liquid cannot interpret it', () => {
+test('sends a plain body exactly as typed', () => {
+  // It used to be wrapped in {% raw %}…{% endraw %}. The API delivers that
+  // wrapper as literal text, so recipients received the tags in their message.
+  const [out] = payload.buildPayloads({ ...BASE, body: 'Hi there, I am Ane' });
+  assert.deepStrictEqual(out.content, { text: 'Hi there, I am Ane' });
+  assert.strictEqual('variables' in out.to[0], false);
+});
+
+test('leaves a body containing a percent sign or braces-free punctuation alone', () => {
+  const [out] = payload.buildPayloads({ ...BASE, body: '50% off — today only!' });
+  assert.strictEqual(out.content.text, '50% off — today only!');
+});
+
+test('routes a body containing Liquid through a variable so it stays literal', () => {
+  // Variable values are substituted in, not re-rendered, so this is a real
+  // escape. Sending it as text would let Liquid interpret {{name}}.
   const [out] = payload.buildPayloads({ ...BASE, body: 'Hi {{name}}, 50% off' });
-  assert.deepStrictEqual(out.content, {
-    text: '{% raw %}Hi {{name}}, 50% off{% endraw %}',
+  assert.deepStrictEqual(out.content, { text: '{{ body | default: "" }}' });
+  assert.strictEqual(out.to[0].variables.body, 'Hi {{name}}, 50% off');
+});
+
+test('gives every recipient the same body variable when the campaign body has Liquid', () => {
+  const [out] = payload.buildPayloads({
+    ...BASE,
+    body: 'Order {{id}} shipped',
+    recipients: [{ to: '+15558675310' }, { to: '+15558675311' }],
   });
+  assert.strictEqual(out.to[0].variables.body, 'Order {{id}} shipped');
+  assert.strictEqual(out.to[1].variables.body, 'Order {{id}} shipped');
 });
 
-test('wraps a body with no Liquid syntax too, so behaviour does not vary', () => {
-  const [out] = payload.buildPayloads({ ...BASE, body: 'Hello' });
-  assert.strictEqual(out.content.text, '{% raw %}Hello{% endraw %}');
-});
-
-test('rejects a body that would break out of the raw wrapper', () => {
-  assert.throws(
-    () => payload.buildPayloads({ ...BASE, body: 'a {% endraw %} b' }),
-    (err) => err.statusCode === 400 && /endraw/i.test(err.message)
-  );
+test('a body containing an endraw tag is no longer refused', () => {
+  // Previously rejected outright, because it could close the raw wrapper early.
+  // With no wrapper, it is just text that goes through the variable route.
+  const [out] = payload.buildPayloads({ ...BASE, body: 'a {% endraw %} b' });
+  assert.strictEqual(out.content.text, '{{ body | default: "" }}');
+  assert.strictEqual(out.to[0].variables.body, 'a {% endraw %} b');
 });
 
 test('sends a content template by id with no text', () => {
@@ -252,7 +272,7 @@ test('attaches media on MMS', () => {
     mediaUrl: 'https://example.com/a.jpg',
   });
   assert.deepStrictEqual(out.content, {
-    text: '{% raw %}Hello{% endraw %}',
+    text: 'Hello',
     media: ['https://example.com/a.jpg'],
   });
 });

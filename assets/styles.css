@@ -1370,8 +1370,18 @@ input::placeholder, textarea::placeholder { color: var(--text-muted); }
 .csv-upload {
     display: flex;
     flex-wrap: wrap;
+    /* Without this, a taller control stretches its shorter siblings to match
+       instead of sitting beside them, which is what made the row look ragged. */
+    align-items: center;
     gap: 8px;
     margin-bottom: 10px;
+}
+
+/* Download sample is a sibling action, not a next step, so it sits at the far
+   right with Upload/Clear grouped on the left. `auto` rather than a fixed gap so
+   it stays right-aligned on its own line if the row wraps. */
+#csv-sample-btn {
+    margin-left: auto;
 }
 
 /* The native control is unstyleable, so a label drives it. Clipped rather than
@@ -1389,9 +1399,17 @@ input::placeholder, textarea::placeholder { color: var(--text-muted); }
     border: 0;
 }
 
+/* One of these three is a <label> driving the hidden file input and the other two
+   are <button>s. Identical padding and font-size are not enough to make those
+   agree on height — the label rendered shorter than the buttons beside it — so the
+   box is pinned explicitly and every contributing property is stated rather than
+   inherited from .btn. */
 .csv-btn {
-    padding: 7px 14px;
+    box-sizing: border-box;
+    min-height: 34px;
+    padding: 0 14px;
     font-size: 13px;
+    line-height: 1.2;
 }
 
 .csv-file-input:focus-visible + .csv-btn {

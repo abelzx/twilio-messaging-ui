@@ -285,6 +285,51 @@ async function fetchOperation(authString, operationId, retryOptions) {
  * hundred. `pagination.next` is opaque and is returned as-is for the caller to
  * pass back.
  */
+/**
+ * Drops messages that demonstrably belong to a different operation.
+ *
+ * Defence in depth behind the query filter, not a replacement for it. Sending an
+ * unrecognised filter name gets the whole account's messages back, and showing a
+ * previous campaign's recipients under the current campaign is worse than showing
+ * none — so anything that names a different operation is discarded here.
+ *
+ * A row that carries no recognisable operation field is KEPT: the field name is
+ * unconfirmed, and silently dropping every row because we cannot read it would
+ * turn a wrong list into an empty one. If the whole page survives untouched, the
+ * caller logs it, because that means neither the filter nor this guard is working.
+ */
+function onlyFromOperation(messages, operationId) {
+  const wanted = String(operationId);
+
+  const belongsElsewhere = (message) => {
+    const candidates = [
+      message.operationId,
+      message.operation_id,
+      message.operationSid,
+      message.operation && message.operation.id,
+    ].filter((value) => value != null && value !== '');
+
+    return candidates.length > 0 && !candidates.some((value) => String(value) === wanted);
+  };
+
+  const kept = messages.filter((message) => !belongsElsewhere(message));
+
+  if (messages.length && kept.length === messages.length) {
+    const sample = messages[0];
+    const identifiable = ['operationId', 'operation_id', 'operationSid', 'operation'].some(
+      (key) => sample && sample[key] != null
+    );
+    if (!identifiable) {
+      console.error(
+        'Bulk message rows carry no recognisable operation field, so they cannot be ' +
+          `verified as belonging to ${wanted}. Row keys: ${Object.keys(sample || {}).join(', ') || '(none)'}.`
+      );
+    }
+  }
+
+  return kept;
+}
+
 async function listMessages(
   authString,
   { operationId, pageToken, pageSize = 1000 } = {},
@@ -293,13 +338,20 @@ async function listMessages(
   const response = await withRateLimitRetry(
     () =>
       request(authString, 'GET', '/Messages', {
-        query: { operation_id: operationId, pageSize, pageToken },
+        // Both spellings, because the wrong one is silently ignored rather than
+        // rejected — and an ignored filter returns every message on the account,
+        // which showed every past campaign's messages in the delivery panel. The
+        // tracking guide documents `operation_id`; every other parameter this API
+        // takes is camelCase, so `operationId` is at least as likely.
+        query: { operation_id: operationId, operationId, pageSize, pageToken },
       }),
     retryOptions
   );
   const body = await response.json();
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+
   return {
-    messages: Array.isArray(body.messages) ? body.messages : [],
+    messages: operationId ? onlyFromOperation(messages, operationId) : messages,
     nextPageToken: (body.pagination && body.pagination.next) || null,
   };
 }
