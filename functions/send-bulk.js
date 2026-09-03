@@ -60,11 +60,17 @@ exports.handler = async function (context, event, callback) {
   const recipientCount = payloads.reduce((total, p) => total + p.to.length, 0);
 
   const operationIds = [];
+  // Counted separately from operationIds, because Twilio can accept a request
+  // without returning an ID for it. Such an operation still sends every message;
+  // it just cannot be polled. Conflating the two counts would either report a
+  // successful send as a failure or claim tracking that does not exist.
+  let acceptedOperations = 0;
   let submitError = null;
   try {
     for (const payload of payloads) {
       const { operationId } = await comms.createMessages(authString, payload);
-      operationIds.push(operationId);
+      acceptedOperations += 1;
+      if (operationId) operationIds.push(operationId);
     }
   } catch (error) {
     // Any operation already accepted will send regardless of this failure, so
@@ -73,13 +79,15 @@ exports.handler = async function (context, event, callback) {
     submitError = error;
   }
 
-  if (operationIds.length === 0) {
+  if (acceptedOperations === 0) {
     response.setStatusCode((submitError && submitError.statusCode) || 502);
     response.setBody({
       error: (submitError && submitError.message) || 'Twilio accepted no operations.',
     });
     return callback(null, response);
   }
+
+  const untrackedOperations = acceptedOperations - operationIds.length;
 
   const campaignDocName = event.campaignId || `campaign_${Date.now()}`;
 
@@ -95,6 +103,10 @@ exports.handler = async function (context, event, callback) {
         ownerKey: oauth.ownerKeyFor(creds),
         accountSid, // display only; never an authorization key
         operationIds,
+        // Accepted but unpollable. Recorded so check-bulk-status can stop
+        // polling a campaign it will never learn anything about, and say why,
+        // rather than reporting zeroes for messages that did send.
+        untrackedOperations,
         recipientCount,
         // No recipient list and no per-message statuses: there is nothing to
         // resume, so there is nothing to checkpoint — and a Sync Document holds
@@ -145,6 +157,16 @@ exports.handler = async function (context, event, callback) {
     // "accepted", not "sent": a 202 means Twilio took the request. Delivery is
     // what the stats block reports later.
     accepted: recipientCount,
+    // Every message was accepted, but nothing came back to poll with. Said
+    // plainly so the UI can explain why the delivery stats stay empty instead
+    // of leaving the user to conclude the send failed.
+    ...(untrackedOperations > 0 && operationIds.length === 0
+      ? {
+          trackingUnavailable: true,
+          warning:
+            'Twilio accepted every message, but returned no operation ID, so delivery progress cannot be tracked for this campaign. The messages are sending — check the Twilio Console message logs to confirm delivery.',
+        }
+      : {}),
     ...(submitError
       ? {
           partial: true,

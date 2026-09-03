@@ -1447,7 +1447,11 @@ input::placeholder, textarea::placeholder { color: var(--text-muted); }
 
 /* Inputs the loaded CSV has taken over. Dimmed and non-interactive, but still
    legible, so it reads as "superseded" rather than "broken". */
-.csv-overridden {
+/* One visual for "a field whose value is being supplied from somewhere else":
+   a CSV column standing in for the recipients box, or a content template
+   standing in for the message body. Same meaning, so the same treatment. */
+.csv-overridden,
+.field-superseded {
     opacity: 0.55;
     pointer-events: none;
 }

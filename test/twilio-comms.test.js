@@ -57,12 +57,57 @@ test('reads the operationId header case-insensitively', async (t) => {
   assert.strictEqual(result.operationId, 'comms_operation_x');
 });
 
-test('fails loudly when a 202 carries no operationId', async (t) => {
+test('returns a null operationId rather than throwing when none is present', async (t) => {
+  // Observed against the live API: a 202 with no operation-ID header, whose
+  // messages all sent anyway. Throwing here reported a fully successful send as
+  // a 502, so a missing ID costs tracking only — never delivery.
   stubFetch(t, () => jsonResponse(202, undefined));
-  await assert.rejects(
-    () => comms.createMessages(AUTH, {}),
-    (err) => err.statusCode === 502 && /operationId/i.test(err.message)
+  const result = await comms.createMessages(AUTH, {});
+  assert.deepStrictEqual(result, { operationId: null });
+});
+
+test('accepts the operation ID under alternative header spellings', async (t) => {
+  for (const header of ['operation-id', 'x-operation-id', 'x-twilio-operation-id']) {
+    const original = globalThis.fetch;
+    globalThis.fetch = async () => jsonResponse(202, undefined, { [header]: 'comms_operation_alt' });
+    const result = await comms.createMessages(AUTH, {});
+    globalThis.fetch = original;
+    assert.strictEqual(result.operationId, 'comms_operation_alt', `header ${header}`);
+  }
+});
+
+test('falls back to the last segment of a Location header', async (t) => {
+  stubFetch(t, () =>
+    jsonResponse(202, undefined, {
+      location: 'https://comms.twilio.com/v1/Messages/Operations/comms_operation_loc',
+    })
   );
+  const result = await comms.createMessages(AUTH, {});
+  assert.strictEqual(result.operationId, 'comms_operation_loc');
+});
+
+test('falls back to the response body when the ID is not a header', async (t) => {
+  stubFetch(t, () => jsonResponse(202, { operationId: 'comms_operation_body' }));
+  const result = await comms.createMessages(AUTH, {});
+  assert.strictEqual(result.operationId, 'comms_operation_body');
+});
+
+test('reads a body id nested under operation', async (t) => {
+  stubFetch(t, () => jsonResponse(200, { operation: { id: 'comms_operation_nested' } }));
+  const result = await comms.createMessages(AUTH, {});
+  assert.strictEqual(result.operationId, 'comms_operation_nested');
+});
+
+test('prefers the documented header over every fallback', async (t) => {
+  stubFetch(t, () =>
+    jsonResponse(
+      202,
+      { operationId: 'from_body' },
+      { operationId: 'from_header', location: '/v1/Messages/Operations/from_location' }
+    )
+  );
+  const result = await comms.createMessages(AUTH, {});
+  assert.strictEqual(result.operationId, 'from_header');
 });
 
 test('surfaces a 400 message verbatim', async (t) => {

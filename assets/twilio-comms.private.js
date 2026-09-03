@@ -102,24 +102,99 @@ async function request(authString, method, path, { body, query } = {}) {
 }
 
 /**
+ * Header names an operation ID has been seen or documented under. `Headers.get`
+ * is case-insensitive, so these only need to differ in shape, not in casing.
+ */
+const OPERATION_ID_HEADERS = [
+  'operationid',
+  'operation-id',
+  'x-operation-id',
+  'x-twilio-operation-id',
+];
+
+/** Body keys an operation ID may arrive under when it is not a header at all. */
+const OPERATION_ID_BODY_KEYS = ['operationId', 'operation_id', 'id', 'sid'];
+
+/**
+ * Finds the operation ID wherever this response happens to carry it.
+ *
+ * The documentation says it is an `operationId` response header. Against the
+ * live API that is not always true — a 202 has been observed carrying no such
+ * header while still sending every message. So each plausible carrier is tried:
+ * the documented header, obvious variants, a `Location` URL's last segment, and
+ * finally the body, which may return the operation inline.
+ *
+ * Returns null when nothing is found, and that is deliberately not an error —
+ * see createMessages.
+ */
+function findOperationId(response, body) {
+  for (const name of OPERATION_ID_HEADERS) {
+    const value = response.headers.get(name);
+    if (value) return String(value).trim();
+  }
+
+  // A 202 commonly points at the created resource rather than naming it.
+  const location = response.headers.get('location');
+  if (location) {
+    const tail = String(location).split('?')[0].replace(/\/+$/, '').split('/').pop();
+    if (tail) return tail;
+  }
+
+  if (body && typeof body === 'object') {
+    const nested = body.operation && typeof body.operation === 'object' ? body.operation : null;
+    for (const source of [body, body.meta, nested]) {
+      if (!source || typeof source !== 'object') continue;
+      for (const key of OPERATION_ID_BODY_KEYS) {
+        if (source[key]) return String(source[key]).trim();
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
  * Submits one operation of up to 10,000 recipients.
  *
- * Returns only the operation ID: the 202 body is empty by design, and the ID
- * arrives as a response header. A 202 without one leaves nothing to track, so
- * it is treated as a protocol failure rather than a success.
+ * `operationId` may be null, and callers MUST tolerate that rather than treating
+ * it as a failure. By the time this function returns, Twilio has accepted the
+ * request and the messages are on their way — an earlier version threw here when
+ * the header was missing, which reported a completely successful send as a 502.
+ * What a missing ID costs is progress tracking, not delivery, and those are not
+ * the same thing.
+ *
+ * The miss is logged with the header names actually present, so the real carrier
+ * can be identified from the Function logs and added above. Names only: a header
+ * value could carry something we should not write to a log.
  */
 async function createMessages(authString, payload, retryOptions) {
   const response = await withRateLimitRetry(
     () => request(authString, 'POST', '/Messages', { body: payload }),
     retryOptions
   );
-  const operationId = response.headers.get('operationid');
+
+  // Read defensively: a 202 is documented to have an empty body, so absence is
+  // normal and must not turn a successful send into a parse error.
+  let body = null;
+  try {
+    const text = await response.text();
+    body = text ? JSON.parse(text) : null;
+  } catch {
+    body = null;
+  }
+
+  const operationId = findOperationId(response, body);
+
   if (!operationId) {
-    throw httpError(
-      502,
-      'Twilio accepted the request but returned no operationId, so its progress cannot be tracked.'
+    const present = [];
+    response.headers.forEach((_value, name) => present.push(name));
+    console.error(
+      `Bulk create returned ${response.status} with no recognisable operation ID. ` +
+        `Headers present: ${present.sort().join(', ') || '(none)'}. ` +
+        `Body keys: ${body && typeof body === 'object' ? Object.keys(body).join(', ') || '(empty object)' : '(no body)'}.`
     );
   }
+
   return { operationId };
 }
 

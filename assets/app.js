@@ -35,6 +35,7 @@ let csvUpload = null;  // { fileName, raw, ...interpretCsv() result }
 // The Recipients placeholder as authored in index.html, captured before the CSV
 // state overwrites it so manual mode can be restored verbatim.
 let recipientsPlaceholder = null;
+let messageBodyPlaceholder = null;
 
 // The campaign currently rendered in the delivery panel, so Export CSV can use it.
 let displayedCampaign = null;
@@ -948,9 +949,26 @@ function updateMessageBodyRequirement() {
     // then only a fallback for rows whose own cell is blank.
     const csvSuppliesBody = csvIsActive() && csvUpload.mode === 'body';
 
+    // Stashed on first use so the original is restorable, matching how the
+    // recipients box handles being superseded by a CSV.
+    if (messageBodyPlaceholder === null) messageBodyPlaceholder = messageBody.placeholder;
+
+    // A selected template does not merely make this field optional — it makes it
+    // unused. Both send paths ignore it: bulk-payload's resolveContent returns
+    // `{contentId}` and never reads the body, and Programmable Messaging drops
+    // `body` whenever `contentSid` is set. Leaving it editable invited someone to
+    // type a message that would silently never be sent, so it is disabled and
+    // dimmed, and the placeholder says what is standing in for it rather than
+    // leaving a greyed-out empty box that reads as broken.
+    messageBody.disabled = templateSelected;
+    messageBody.classList.toggle('field-superseded', templateSelected);
+    messageBody.placeholder = templateSelected
+        ? 'The template supplies the message — clear it to type your own'
+        : messageBodyPlaceholder;
+
     if (templateSelected) {
         messageBody.removeAttribute('required');
-        messageBodyHelp.textContent = 'Optional when using a content template';
+        messageBodyHelp.textContent = 'Not used while a content template is selected — the template supplies the message';
     } else if (csvSuppliesBody) {
         messageBody.removeAttribute('required');
         messageBodyHelp.textContent = 'Taken per recipient from the CSV; used as a fallback for blank cells';

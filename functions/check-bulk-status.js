@@ -100,6 +100,40 @@ exports.handler = async function (context, event, callback) {
       ? campaignData.operationIds
       : [];
 
+    // Accepted by Twilio but with no operation ID returned, so there is nothing
+    // to poll — ever. Reported as terminal rather than perpetually in progress:
+    // `isComplete` below requires at least one reachable operation, so without
+    // this the browser would poll this campaign every 5 seconds forever and the
+    // card would sit at "in progress" for messages that already delivered.
+    const trackingUnavailable =
+      operationIds.length === 0 && Number(campaignData.untrackedOperations || 0) > 0;
+
+    if (trackingUnavailable) {
+      response.setStatusCode(200);
+      response.setBody({
+        success: true,
+        campaign: {
+          campaignId,
+          mode: 'bulk',
+          channel: campaignData.channel,
+          from: campaignData.from,
+          campaignName: campaignData.campaignName,
+          scheduledFor: campaignData.scheduledFor || null,
+          recipientCount: campaignData.recipientCount || 0,
+          operationIds: [],
+          operationStatuses: [],
+          stats: null,
+          isComplete: true,
+          trackingUnavailable: true,
+          unreachableOperations: 0,
+          createdAt: campaignData.createdAt,
+          lastUpdated: campaignData.lastUpdated,
+        },
+        ...(event.includeMessages ? { messages: [], nextCursor: null } : {}),
+      });
+      return callback(null, response);
+    }
+
     const operations = await Promise.all(
       operationIds.map((id) =>
         comms.fetchOperation(authString, id).catch((error) => {
