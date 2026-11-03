@@ -1486,18 +1486,28 @@ async function checkBulkCampaignStatus() {
  * Also returns the last `campaign` object seen. Every check-bulk-status
  * response carries the current aggregate stats alongside the messages page,
  * so the caller gets both without paying for a second request.
+ *
+ * `source` says where the rows came from: 'live' from Twilio, 'saved' from
+ * the copy kept in Sync after Twilio expired them, or 'expired' when Twilio
+ * has expired them and no copy was ever saved.
  */
 async function loadBulkMessages(campaignId) {
     const rows = [];
     let campaign = null;
     let cursor = null;
+    let source = 'live';
+    let savedAt = null;
 
     do {
         const response = await postToFunction('check-bulk-status', {
             campaignId,
             includeMessages: true,
             ...(cursor
-                ? { pageToken: cursor.pageToken, operationIndex: cursor.operationIndex }
+                ? {
+                    pageToken: cursor.pageToken,
+                    operationIndex: cursor.operationIndex,
+                    pageIndex: cursor.pageIndex,
+                }
                 : {}),
         });
         const data = await response.json();
@@ -1506,9 +1516,15 @@ async function loadBulkMessages(campaignId) {
         rows.push(...(data.messages || []));
         campaign = data.campaign || campaign;
         cursor = data.nextCursor;
+        if (data.detailsSource === 'saved') {
+            source = 'saved';
+            savedAt = data.savedAt || null;
+        } else if (data.detailsExpired) {
+            source = 'expired';
+        }
     } while (cursor);
 
-    return { rows, campaign };
+    return { rows, campaign, source, savedAt };
 }
 
 /**
@@ -1555,6 +1571,22 @@ function bulkRecipientAddress(to) {
     if (Array.isArray(to)) return bulkRecipientAddress(to[0]);
     if (to && typeof to.address === 'string') return to.address;
     return '';
+}
+
+/**
+ * The line shown above the delivery table when the rows did not come live from
+ * Twilio. The Bulk Messaging API expires operations and messages after a
+ * period it does not document.
+ */
+function bulkDetailsNote(source, savedAt) {
+    if (source === 'saved') {
+        const when = savedAt ? new Date(savedAt).toLocaleString() : 'an earlier visit';
+        return `Twilio no longer has live delivery data for this campaign. Showing the statuses saved on ${when}.`;
+    }
+    if (source === 'expired') {
+        return 'Twilio no longer has per-recipient delivery data for this campaign, and none was saved before it expired. The totals above were recorded while it was available.';
+    }
+    return null;
 }
 
 function bulkRowsToStatuses(rows) {
@@ -1859,7 +1891,7 @@ async function fetchAndDisplayCampaignDetails(campaignId, mode) {
 
     if (bulk) {
         try {
-            const { rows, campaign } = await loadBulkMessages(campaignId);
+            const { rows, campaign, source, savedAt } = await loadBulkMessages(campaignId);
             // displayMessageDetails reads campaign.statuses and stores the whole
             // object in displayedCampaign, which is what CSV export exports. The
             // summary header above the table reads totalMessages/sent/failed/
@@ -1871,6 +1903,7 @@ async function fetchAndDisplayCampaignDetails(campaignId, mode) {
                 mode: 'bulk',
                 statuses: bulkRowsToStatuses(rows),
                 ...bulkCampaignAggregates(campaign),
+                detailsNote: bulkDetailsNote(source, savedAt),
             });
         } catch (error) {
             console.error('Error loading bulk recipients:', error);
@@ -1909,8 +1942,24 @@ function displayMessageDetails(campaign) {
     const statuses = campaign.statuses || {};
     const statusEntries = Object.entries(statuses);
 
+    const summary = `
+        <div style="margin-bottom: 15px; padding: 12px; background: var(--twilio-gray-50); border-radius: 6px;">
+            <div style="display: flex; gap: 20px; flex-wrap: wrap;">
+                <div><strong>Total Messages:</strong> ${Math.max(campaign.totalMessages || 0, campaign.sent || 0)}</div>
+                <div><strong>Sent:</strong> <span style="color: var(--twilio-success);">${campaign.sent || 0}</span></div>
+                <div><strong>Failed:</strong> <span style="color: var(--twilio-error);">${campaign.failed || 0}</span></div>
+                <div><strong>Delivered:</strong> <span style="color: var(--twilio-success);">${campaign.delivered || 0}</span></div>
+                <div><strong>Read:</strong> ${campaign.read || 0}</div>
+            </div>
+        </div>
+    `;
+    const note = campaign.detailsNote ? `<p class="details-note">${campaign.detailsNote}</p>` : '';
+
     if (statusEntries.length === 0) {
-        messageDetailsContent.innerHTML = '<p style="color: #666; text-align: center; padding: 20px;">No messages sent yet. Messages will appear here once they are successfully sent.</p>';
+        // A bulk campaign's totals are kept in Sync and outlast Twilio's
+        // per-recipient rows, so they are shown even when there are no rows.
+        messageDetailsContent.innerHTML = (campaign.mode === 'bulk' ? summary : '') +
+            (note || '<p style="color: #666; text-align: center; padding: 20px;">No messages sent yet. Messages will appear here once they are successfully sent.</p>');
         return;
     }
 
@@ -1926,23 +1975,14 @@ function displayMessageDetails(campaign) {
 
     const signature = JSON.stringify([
         campaign.campaignId, campaign.sent, campaign.failed, campaign.delivered,
-        campaign.read, campaign.totalMessages,
+        campaign.read, campaign.totalMessages, campaign.detailsNote,
         statusEntries.map(([sid, s]) => [sid, s.status, s.delivered, s.read, s.errorCode, s.dateUpdated]),
     ]);
     if (renderUnchanged('details', signature, Boolean(messageDetailsContent.querySelector('.message-status-scroll')))) {
         return;
     }
 
-    let html = `
-        <div style="margin-bottom: 15px; padding: 12px; background: var(--twilio-gray-50); border-radius: 6px;">
-            <div style="display: flex; gap: 20px; flex-wrap: wrap;">
-                <div><strong>Total Messages:</strong> ${Math.max(campaign.totalMessages || 0, campaign.sent || 0)}</div>
-                <div><strong>Sent:</strong> <span style="color: var(--twilio-success);">${campaign.sent || 0}</span></div>
-                <div><strong>Failed:</strong> <span style="color: var(--twilio-error);">${campaign.failed || 0}</span></div>
-                <div><strong>Delivered:</strong> <span style="color: var(--twilio-success);">${campaign.delivered || 0}</span></div>
-                <div><strong>Read:</strong> ${campaign.read || 0}</div>
-            </div>
-        </div>
+    let html = summary + note + `
         <div class="message-status-scroll">
             <table class="message-status-table">
                 <thead>

@@ -1502,6 +1502,19 @@ input::placeholder, textarea::placeholder { color: var(--text-muted); }
     font-weight: 500;
 }
 
+/* Above the delivery table when its rows are not live from Twilio. The same
+   tinted box as .send-note--active, for the same contrast reason. */
+.details-note {
+    margin: 0 0 15px;
+    padding: 10px 12px;
+    border-radius: var(--radius);
+    border: 1px solid rgba(228, 98, 22, 0.35);
+    background: rgba(228, 98, 22, 0.08);
+    color: var(--text);
+    font-size: 12px;
+    line-height: 1.5;
+}
+
 /* Message SIDs are data, not prose — set them in the mono face so they can be
    compared column-wise. */
 .results-table td:first-child,

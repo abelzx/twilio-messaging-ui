@@ -1,6 +1,7 @@
 const twilio = require('twilio');
 const oauth = require(Runtime.getAssets()['/twilio-oauth.js'].path);
 const comms = require(Runtime.getAssets()['/twilio-comms.js'].path);
+const snapshot = require(Runtime.getAssets()['/bulk-snapshot.js'].path);
 
 /**
  * POST /check-bulk-status — aggregate progress for a bulk campaign, and
@@ -9,7 +10,16 @@ const comms = require(Runtime.getAssets()['/twilio-comms.js'].path);
  * Operation stats are cheap and polled on a timer. The per-message list is not,
  * so it is fetched only when `includeMessages` is set — when the delivery panel
  * is opened or a CSV export is requested.
+ *
+ * Twilio expires bulk operations and their messages after an undocumented
+ * period, so every page read live is also saved to Sync (bulk-snapshot.js), and
+ * the saved rows are returned when the live list comes back empty.
  */
+
+/** Time left in the budget, for Sync work that must not outlive the Function. */
+function remaining(startTime, budget) {
+  return Math.max(0, budget - (Date.now() - startTime));
+}
 
 const STAT_KEYS = [
   'total', 'recipients', 'attempts', 'unaddressable', 'queued', 'sent',
@@ -134,9 +144,13 @@ exports.handler = async function (context, event, callback) {
       return callback(null, response);
     }
 
+    // A 404 is counted apart from other failures: it means Twilio has expired
+    // the operation, which will not recover the way a network error might.
+    let expiredOperations = 0;
     const operations = await Promise.all(
       operationIds.map((id) =>
         comms.fetchOperation(authString, id).catch((error) => {
+          if (error.statusCode === 404) expiredOperations += 1;
           console.error(`Operation ${id} fetch failed:`, error.message);
           return null;
         })
@@ -174,10 +188,13 @@ exports.handler = async function (context, event, callback) {
 
     let messages;
     let nextCursor = null;
+    let details = {};
     if (event.includeMessages) {
       messages = [];
       let token = event.pageToken || null;
       let operationIndex = Number(event.operationIndex || 0);
+      let pageIndex = Number(event.pageIndex || 0);
+      const fromStart = !token && operationIndex === 0 && pageIndex === 0;
 
       // Pages until the budget runs low, then hands the caller a token. A
       // 10,000-recipient operation is ten pages, which will not always fit.
@@ -188,20 +205,60 @@ exports.handler = async function (context, event, callback) {
         });
         messages.push(...page.messages);
 
+        // Best effort: a failed save costs the copy, never the live answer.
+        if (page.messages.length) {
+          try {
+            await oauth.withDeadline(
+              snapshot.saveRows(syncClient, campaignId, page.messages, { operationIndex, pageIndex }),
+              remaining(startTime, MAX_EXECUTION_TIME),
+              'Saving delivery rows ran out of time'
+            );
+          } catch (error) {
+            console.error('Saving delivery rows failed:', error.message);
+          }
+        }
+
         if (page.nextPageToken) {
           token = page.nextPageToken;
+          pageIndex += 1;
         } else {
           operationIndex += 1;
           token = null;
+          pageIndex = 0;
         }
 
         if (Date.now() - startTime > MAX_EXECUTION_TIME) break;
       }
 
       const exhausted = operationIndex >= operationIds.length;
-      // Named a cursor, not a token: it carries both the opaque page token and
-      // which operation that token belongs to, which a bare token cannot.
-      nextCursor = exhausted ? null : { pageToken: token, operationIndex };
+      // Named a cursor, not a token: it carries the opaque page token, which
+      // operation that token belongs to, and which page of it comes next. The
+      // page number keys the saved rows; Twilio's token does not provide one.
+      nextCursor = exhausted ? null : { pageToken: token, operationIndex, pageIndex };
+
+      // Only a full read from the start can say the live list is empty. A
+      // later page being empty says nothing about the pages before it.
+      if (fromStart && exhausted && messages.length === 0) {
+        let saved = null;
+        try {
+          saved = await oauth.withDeadline(
+            snapshot.readRows(syncClient, campaignId),
+            remaining(startTime, MAX_EXECUTION_TIME),
+            'Reading saved delivery rows ran out of time'
+          );
+        } catch (error) {
+          console.error('Reading saved delivery rows failed:', error.message);
+        }
+
+        if (saved && saved.rows.length) {
+          messages = saved.rows;
+          details = { detailsSource: 'saved', savedAt: saved.savedAt };
+        }
+      }
+
+      if (messages.length === 0 && operationIds.length > 0 && expiredOperations === operationIds.length) {
+        details = { detailsExpired: true };
+      }
     }
 
     response.setStatusCode(200);
@@ -220,10 +277,11 @@ exports.handler = async function (context, event, callback) {
         stats,
         isComplete,
         unreachableOperations: operationIds.length - reachable.length,
+        expiredOperations,
         createdAt: campaignData.createdAt,
         lastUpdated: campaignData.lastUpdated,
       },
-      ...(messages ? { messages, nextCursor } : {}),
+      ...(messages ? { messages, nextCursor, ...details } : {}),
     });
     return callback(null, response);
   } catch (error) {
