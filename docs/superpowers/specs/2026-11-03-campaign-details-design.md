@@ -37,7 +37,7 @@ details: {
   template:   { sid, name, language } | null,
   message:    { body, perRecipient },          // perRecipient: true when a Body-mode CSV supplied the text
   variables:  { values, perRecipient } | null, // values: { "1": "Sarah", ... } shared across recipients
-  media:      { urls } | null,                 // the template's media entries with shared variables filled in
+  media:      { urls, perRecipient } | null,   // the template's media entries with shared variables filled in
   recipients: { source, fileName, count },     // source: 'typed' | 'csv'
   fallbackToSms: boolean | null,               // bulk only
 }
