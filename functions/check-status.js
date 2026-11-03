@@ -5,6 +5,7 @@
 
 const twilio = require('twilio');
 const oauth = require(Runtime.getAssets()['/twilio-oauth.js'].path);
+const campaignDetails = require(Runtime.getAssets()['/campaign-details.js'].path);
 
 /**
  * A real Twilio message SID: two-letter prefix (SM, MM) plus 32 hex. Used to
@@ -161,6 +162,7 @@ exports.handler = async function(context, event, callback) {
       success: true,
       campaign: {
         campaignId,
+        mode: 'classic',
         totalMessages: campaignData.totalMessages,
         sent: campaignData.sent,
         failed: campaignData.failed,
@@ -175,7 +177,8 @@ exports.handler = async function(context, event, callback) {
         // Include resume data if available
         messages: campaignData.messages || null,
         channel: campaignData.channel || null,
-        from: campaignData.from || null
+        from: campaignData.from || null,
+        details: campaignDetails.resolveDetails(campaignData)
       }
     });
 

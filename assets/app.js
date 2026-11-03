@@ -767,6 +767,8 @@ function renderSenderOptions(data) {
             const opt = document.createElement('option');
             opt.value = sender.value;
             opt.textContent = sender.label;
+            // Recorded with the campaign, so its details can name the kind.
+            opt.dataset.kind = sender.kind;
             group.appendChild(opt);
         }
         select.appendChild(group);
@@ -1226,6 +1228,68 @@ function buildMessage(row, { channel, from, contentSid, body, contentVariables }
     return message;
 }
 
+/**
+ * The selected template's media as recipients receive it: each `media` entry
+ * with the shared variable values filled in. An entry whose placeholder a CSV
+ * fills row by row has no single URL, so it is reported as per-recipient.
+ */
+function templateMediaDetails(template, sharedVariables, usingCsv) {
+    const entries = [];
+    collectMediaStrings(template.types || {}, entries);
+
+    const placeholder = /\{\{\s*([\w.-]+)\s*\}\}/g;
+    const urls = [];
+    let perRecipient = false;
+    for (const entry of entries) {
+        if (!entry.match(placeholder)) {
+            urls.push(entry);
+        } else if (usingCsv) {
+            perRecipient = true;
+        } else {
+            urls.push(entry.replace(placeholder, (match, key) =>
+                (sharedVariables && sharedVariables[key]) || match));
+        }
+    }
+    return urls.length || perRecipient ? { urls, perRecipient } : null;
+}
+
+/**
+ * What only this page knows about the campaign being sent: what the sender and
+ * template are called, where the recipients came from, and the template's
+ * media. The send Function stores it beside the facts it actually sent (see
+ * campaign-details.private.js), so a campaign still says what it was sent with
+ * after these dropdowns have moved on to another channel.
+ */
+function collectCampaignDetails() {
+    const fromSelect = document.getElementById('from-number-select');
+    const option = fromSelect.value ? fromSelect.selectedOptions[0] : null;
+    const template = selectedTemplate();
+    const usingCsv = csvIsActive();
+    const sharedVariables = template && !usingCsv ? getSelectedContentVariables() : null;
+    const rows = usingCsv ? csvUpload.rows : [];
+    const typedBody = document.getElementById('message-body').value.trim();
+    // True only when the CSV really varied the content, not merely when one is loaded.
+    const bodyVaries = usingCsv && csvUpload.mode === 'body' &&
+        rows.some(row => String(row.body == null ? '' : row.body).trim() !== typedBody);
+    const variablesVary = usingCsv && csvUpload.mode === 'variables' &&
+        rows.some(row => row.contentVariables && Object.keys(row.contentVariables).length > 0);
+
+    return {
+        sender: option
+            ? { label: option.textContent, kind: option.dataset.kind || null }
+            : { label: null, kind: 'typed' },
+        template: template ? { name: template.friendlyName, language: template.language } : null,
+        message: { perRecipient: bodyVaries },
+        variables: template
+            ? { values: sharedVariables, perRecipient: variablesVary }
+            : null,
+        media: template ? templateMediaDetails(template, sharedVariables, usingCsv) : null,
+        recipients: usingCsv
+            ? { source: 'csv', fileName: csvUpload.fileName }
+            : { source: 'typed' },
+    };
+}
+
 async function handleSendMessages(e) {
     e.preventDefault();
     
@@ -1289,11 +1353,20 @@ async function handleSendMessages(e) {
     currentCampaignId = `campaign_${Date.now()}`;
     currentCampaignMode = isBulkMode() ? 'bulk' : 'classic';
 
+    // Display data only: if collecting it fails, send without it rather than
+    // not at all. buildDetails() on the server copes with a missing object.
+    let details = null;
+    try {
+        details = collectCampaignDetails();
+    } catch (error) {
+        console.error('Could not collect campaign details:', error);
+    }
+
     try {
         if (isBulkMode()) {
-            await sendBulkCampaign(messages, channel, from, campaignName);
+            await sendBulkCampaign(messages, channel, from, campaignName, details);
         } else {
-            await sendMessagesBatch(messages, channel, from, campaignName);
+            await sendMessagesBatch(messages, channel, from, campaignName, details);
         }
     } catch (error) {
         alert('Error: ' + error.message);
@@ -1301,7 +1374,7 @@ async function handleSendMessages(e) {
     }
 }
 
-async function sendMessagesBatch(messages, channel, from, campaignName) {
+async function sendMessagesBatch(messages, channel, from, campaignName, details) {
     let resumeFrom = 0;
     let isComplete = false;
 
@@ -1313,7 +1386,9 @@ async function sendMessagesBatch(messages, channel, from, campaignName) {
                 channel,
                 from,
                 resumeFrom,
-                campaignName: campaignName || null
+                campaignName: campaignName || null,
+                // Stored only when the first call creates the campaign.
+                ...(resumeFrom === 0 ? { details } : {})
             });
 
             const data = await response.json();
@@ -1361,7 +1436,7 @@ async function sendMessagesBatch(messages, channel, from, campaignName) {
  * The `messages` array the classic path builds is reused as-is — each entry
  * already carries `to`, and optionally `body` and `variables`.
  */
-async function sendBulkCampaign(messages, channel, from, campaignName) {
+async function sendBulkCampaign(messages, channel, from, campaignName, details) {
     const sendAtInput = document.getElementById('send-at');
     const fallbackInput = document.getElementById('fallback-to-sms');
 
@@ -1405,6 +1480,7 @@ async function sendBulkCampaign(messages, channel, from, campaignName) {
         campaignName: campaignName || null,
         sendAt,
         fallbackToSms: Boolean(fallbackInput && fallbackInput.checked),
+        details,
     });
 
     const data = await response.json();
@@ -1486,18 +1562,28 @@ async function checkBulkCampaignStatus() {
  * Also returns the last `campaign` object seen. Every check-bulk-status
  * response carries the current aggregate stats alongside the messages page,
  * so the caller gets both without paying for a second request.
+ *
+ * `source` says where the rows came from: 'live' from Twilio, 'saved' from
+ * the copy kept in Sync after Twilio expired them, or 'expired' when Twilio
+ * has expired them and no copy was ever saved.
  */
 async function loadBulkMessages(campaignId) {
     const rows = [];
     let campaign = null;
     let cursor = null;
+    let source = 'live';
+    let savedAt = null;
 
     do {
         const response = await postToFunction('check-bulk-status', {
             campaignId,
             includeMessages: true,
             ...(cursor
-                ? { pageToken: cursor.pageToken, operationIndex: cursor.operationIndex }
+                ? {
+                    pageToken: cursor.pageToken,
+                    operationIndex: cursor.operationIndex,
+                    pageIndex: cursor.pageIndex,
+                }
                 : {}),
         });
         const data = await response.json();
@@ -1506,9 +1592,15 @@ async function loadBulkMessages(campaignId) {
         rows.push(...(data.messages || []));
         campaign = data.campaign || campaign;
         cursor = data.nextCursor;
+        if (data.detailsSource === 'saved') {
+            source = 'saved';
+            savedAt = data.savedAt || null;
+        } else if (data.detailsExpired) {
+            source = 'expired';
+        }
     } while (cursor);
 
-    return { rows, campaign };
+    return { rows, campaign, source, savedAt };
 }
 
 /**
@@ -1555,6 +1647,22 @@ function bulkRecipientAddress(to) {
     if (Array.isArray(to)) return bulkRecipientAddress(to[0]);
     if (to && typeof to.address === 'string') return to.address;
     return '';
+}
+
+/**
+ * The line shown above the delivery table when the rows did not come live from
+ * Twilio. The Bulk Messaging API expires operations and messages after a
+ * period it does not document.
+ */
+function bulkDetailsNote(source, savedAt) {
+    if (source === 'saved') {
+        const when = savedAt ? new Date(savedAt).toLocaleString() : 'an earlier visit';
+        return `Twilio no longer has live delivery data for this campaign. Showing the statuses saved on ${when}.`;
+    }
+    if (source === 'expired') {
+        return 'Twilio no longer has per-recipient delivery data for this campaign, and none was saved before it expired. The totals above were recorded while it was available.';
+    }
+    return null;
 }
 
 function bulkRowsToStatuses(rows) {
@@ -1706,6 +1814,121 @@ async function loadCampaigns() {
     }
 }
 
+/** The channel's name as the Messaging Channel dropdown shows it. */
+function channelLabel(channel) {
+    if (!channel) return '';
+    const option = document.querySelector(`#channel option[value="${CSS.escape(channel)}"]`);
+    return option ? option.textContent : channel;
+}
+
+/** The card's "WhatsApp · Acme Service · promo_v2" line, escaped; '' when nothing is known. */
+function campaignSummaryText(summary) {
+    if (!summary) return '';
+    return [channelLabel(summary.channel), summary.sender, summary.template]
+        .filter(Boolean)
+        .map(escapeHtml)
+        .join(' · ');
+}
+
+const SENDER_KIND_LABEL = {
+    service: 'Messaging Service',
+    pool: 'Sender pool',
+    typed: 'Typed sender',
+};
+
+/**
+ * The "Campaign details" block above the delivery totals. `details` is
+ * resolveDetails() output from campaign-details.private.js. A row with nothing
+ * to say is left out. Every value is escaped: all of it was typed by someone.
+ */
+function renderCampaignDetails(details) {
+    if (!details) return '';
+
+    const rows = [];
+    const add = (label, html) => {
+        if (html) rows.push(`<dt>${label}</dt><dd>${html}</dd>`);
+    };
+    const muted = (text) => `<span class="campaign-details__muted">${text}</span>`;
+    const code = (text) => `<code>${escapeHtml(text)}</code>`;
+
+    add('API', details.mode === 'bulk' ? 'Bulk Messaging' : 'Programmable Messaging');
+    add('Channel', escapeHtml(channelLabel(details.channel)));
+
+    const sender = details.sender || {};
+    if (sender.label || sender.address) {
+        const kind = SENDER_KIND_LABEL[sender.kind];
+        add('Sender', escapeHtml(sender.label || sender.address) + (kind ? ` ${muted(kind)}` : ''));
+    }
+
+    const template = details.template;
+    if (template && template.notRecorded) {
+        add('Template', muted('Not recorded'));
+    } else if (template) {
+        // Campaigns sent before names were recorded carry only the SID. The
+        // name is filled in when the loaded template list still has it.
+        const known = template.name ? null : loadedTemplates.find((t) => t.sid === template.sid);
+        const name = template.name || (known && known.friendlyName);
+        const language = template.language || (known && known.language);
+        const title = name ? `${escapeHtml(name)}${language ? ` (${escapeHtml(language)})` : ''} ` : '';
+        add('Template', title + code(template.sid));
+    }
+
+    const message = details.message;
+    if (message && message.notRecorded) {
+        add('Message', muted('Not recorded'));
+    } else if (message && message.perRecipient) {
+        add('Message', 'Per-recipient text from CSV');
+    } else if (message && message.body) {
+        add('Message', `<span class="campaign-details__body" title="${escapeHtml(message.body)}">${escapeHtml(message.body)}</span>`);
+    }
+
+    const variables = details.variables;
+    if (variables && variables.perRecipient) {
+        add('Variables', 'Per-recipient from CSV');
+    } else if (variables && variables.values) {
+        add('Variables', Object.entries(variables.values)
+            .map(([key, value]) => `${code(`{{${key}}}`)} ${escapeHtml(value)}`)
+            .join(' · '));
+    }
+
+    const media = details.media;
+    if (media) {
+        const items = (media.urls || []).map((url) => (/^https?:\/\//i.test(url)
+            ? `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(url)}</a>`
+            : escapeHtml(url)));
+        if (media.perRecipient) items.push('Per-recipient from CSV');
+        add('Media', items.join('<br>'));
+    }
+
+    const recipients = details.recipients || {};
+    const count = Number(recipients.count || 0);
+    if (recipients.source === 'csv') {
+        add('Recipients', ['CSV', recipients.fileName && escapeHtml(recipients.fileName), `· ${count}`]
+            .filter(Boolean).join(' '));
+    } else if (recipients.source === 'typed') {
+        add('Recipients', `Typed · ${count}`);
+    } else if (count) {
+        add('Recipients', String(count));
+    }
+
+    if (details.scheduledFor) {
+        add('Scheduled', escapeHtml(new Date(details.scheduledFor).toLocaleString()));
+    }
+    if (details.channel === 'whatsapp' && typeof details.fallbackToSms === 'boolean') {
+        add('SMS fallback', details.fallbackToSms ? 'On' : 'Off');
+    }
+    if (details.operationIds && details.operationIds.length) {
+        add('Operations', details.operationIds.map((id) => code(id)).join('<br>'));
+    }
+
+    return `
+        <div class="campaign-details">
+            <h3 class="campaign-details__title">Campaign details</h3>
+            <dl>${rows.join('')}</dl>
+        </div>
+    `;
+}
+
 function displayCampaigns(campaigns) {
     const campaignsContent = document.getElementById('campaigns-content');
     if (!campaignsContent) return;
@@ -1720,6 +1943,7 @@ function displayCampaigns(campaigns) {
         campaigns.map((c) => [
             c.campaignId, c.campaignName, c.totalMessages, c.sent, c.failed,
             c.delivered, c.read, c.startIndex, c.isComplete, c.lastUpdated,
+            c.summary,
         ]),
     ]);
     // Nothing to redraw: leave the DOM alone so the user's scroll survives.
@@ -1770,6 +1994,8 @@ function displayCampaigns(campaigns) {
             (campaign.createdAt ? new Date(campaign.createdAt).toLocaleString() :
             campaign.campaignId.replace('campaign_', ''));
 
+        const summaryText = campaignSummaryText(campaign.summary);
+
         const modeBadge = campaign.mode === 'bulk'
             ? '<span class="mode-badge mode-badge--bulk">Bulk</span> '
             : '<span class="mode-badge mode-badge--classic">Classic</span> ';
@@ -1789,6 +2015,7 @@ function displayCampaigns(campaigns) {
                         ` : ''}
                     </div>
                 </div>
+                ${summaryText ? `<div class="campaign-summary" title="${summaryText}">${summaryText}</div>` : ''}
                 <div class="campaign-stats">
                     <div class="stat-item">
                         <span class="stat-label">Total:</span>
@@ -1859,7 +2086,7 @@ async function fetchAndDisplayCampaignDetails(campaignId, mode) {
 
     if (bulk) {
         try {
-            const { rows, campaign } = await loadBulkMessages(campaignId);
+            const { rows, campaign, source, savedAt } = await loadBulkMessages(campaignId);
             // displayMessageDetails reads campaign.statuses and stores the whole
             // object in displayedCampaign, which is what CSV export exports. The
             // summary header above the table reads totalMessages/sent/failed/
@@ -1871,6 +2098,8 @@ async function fetchAndDisplayCampaignDetails(campaignId, mode) {
                 mode: 'bulk',
                 statuses: bulkRowsToStatuses(rows),
                 ...bulkCampaignAggregates(campaign),
+                detailsNote: bulkDetailsNote(source, savedAt),
+                details: campaign ? campaign.details : null,
             });
         } catch (error) {
             console.error('Error loading bulk recipients:', error);
@@ -1909,8 +2138,25 @@ function displayMessageDetails(campaign) {
     const statuses = campaign.statuses || {};
     const statusEntries = Object.entries(statuses);
 
+    const summary = `
+        <div style="margin-bottom: 15px; padding: 12px; background: var(--twilio-gray-50); border-radius: 6px;">
+            <div style="display: flex; gap: 20px; flex-wrap: wrap;">
+                <div><strong>Total Messages:</strong> ${Math.max(campaign.totalMessages || 0, campaign.sent || 0)}</div>
+                <div><strong>Sent:</strong> <span style="color: var(--twilio-success);">${campaign.sent || 0}</span></div>
+                <div><strong>Failed:</strong> <span style="color: var(--twilio-error);">${campaign.failed || 0}</span></div>
+                <div><strong>Delivered:</strong> <span style="color: var(--twilio-success);">${campaign.delivered || 0}</span></div>
+                <div><strong>Read:</strong> ${campaign.read || 0}</div>
+            </div>
+        </div>
+    `;
+    const note = campaign.detailsNote ? `<p class="details-note">${campaign.detailsNote}</p>` : '';
+    const detailsBlock = renderCampaignDetails(campaign.details);
+
     if (statusEntries.length === 0) {
-        messageDetailsContent.innerHTML = '<p style="color: #666; text-align: center; padding: 20px;">No messages sent yet. Messages will appear here once they are successfully sent.</p>';
+        // A bulk campaign's totals are kept in Sync and outlast Twilio's
+        // per-recipient rows, so they are shown even when there are no rows.
+        messageDetailsContent.innerHTML = detailsBlock + (campaign.mode === 'bulk' ? summary : '') +
+            (note || '<p style="color: #666; text-align: center; padding: 20px;">No messages sent yet. Messages will appear here once they are successfully sent.</p>');
         return;
     }
 
@@ -1926,23 +2172,14 @@ function displayMessageDetails(campaign) {
 
     const signature = JSON.stringify([
         campaign.campaignId, campaign.sent, campaign.failed, campaign.delivered,
-        campaign.read, campaign.totalMessages,
+        campaign.read, campaign.totalMessages, campaign.detailsNote, campaign.details,
         statusEntries.map(([sid, s]) => [sid, s.status, s.delivered, s.read, s.errorCode, s.dateUpdated]),
     ]);
     if (renderUnchanged('details', signature, Boolean(messageDetailsContent.querySelector('.message-status-scroll')))) {
         return;
     }
 
-    let html = `
-        <div style="margin-bottom: 15px; padding: 12px; background: var(--twilio-gray-50); border-radius: 6px;">
-            <div style="display: flex; gap: 20px; flex-wrap: wrap;">
-                <div><strong>Total Messages:</strong> ${Math.max(campaign.totalMessages || 0, campaign.sent || 0)}</div>
-                <div><strong>Sent:</strong> <span style="color: var(--twilio-success);">${campaign.sent || 0}</span></div>
-                <div><strong>Failed:</strong> <span style="color: var(--twilio-error);">${campaign.failed || 0}</span></div>
-                <div><strong>Delivered:</strong> <span style="color: var(--twilio-success);">${campaign.delivered || 0}</span></div>
-                <div><strong>Read:</strong> ${campaign.read || 0}</div>
-            </div>
-        </div>
+    let html = detailsBlock + summary + note + `
         <div class="message-status-scroll">
             <table class="message-status-table">
                 <thead>
