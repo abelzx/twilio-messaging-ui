@@ -767,6 +767,8 @@ function renderSenderOptions(data) {
             const opt = document.createElement('option');
             opt.value = sender.value;
             opt.textContent = sender.label;
+            // Recorded with the campaign, so its details can name the kind.
+            opt.dataset.kind = sender.kind;
             group.appendChild(opt);
         }
         select.appendChild(group);
@@ -1226,6 +1228,61 @@ function buildMessage(row, { channel, from, contentSid, body, contentVariables }
     return message;
 }
 
+/**
+ * The selected template's media as recipients receive it: each `media` entry
+ * with the shared variable values filled in. An entry whose placeholder a CSV
+ * fills row by row has no single URL, so it is reported as per-recipient.
+ */
+function templateMediaDetails(template, sharedVariables, usingCsv) {
+    const entries = [];
+    collectMediaStrings(template.types || {}, entries);
+
+    const placeholder = /\{\{\s*([\w.-]+)\s*\}\}/g;
+    const urls = [];
+    let perRecipient = false;
+    for (const entry of entries) {
+        if (!entry.match(placeholder)) {
+            urls.push(entry);
+        } else if (usingCsv) {
+            perRecipient = true;
+        } else {
+            urls.push(entry.replace(placeholder, (match, key) =>
+                (sharedVariables && sharedVariables[key]) || match));
+        }
+    }
+    return urls.length || perRecipient ? { urls, perRecipient } : null;
+}
+
+/**
+ * What only this page knows about the campaign being sent: what the sender and
+ * template are called, where the recipients came from, and the template's
+ * media. The send Function stores it beside the facts it actually sent (see
+ * campaign-details.private.js), so a campaign still says what it was sent with
+ * after these dropdowns have moved on to another channel.
+ */
+function collectCampaignDetails() {
+    const fromSelect = document.getElementById('from-number-select');
+    const option = fromSelect.value ? fromSelect.selectedOptions[0] : null;
+    const template = selectedTemplate();
+    const usingCsv = csvIsActive();
+    const sharedVariables = template && !usingCsv ? getSelectedContentVariables() : null;
+
+    return {
+        sender: option
+            ? { label: option.textContent, kind: option.dataset.kind || null }
+            : { label: null, kind: 'typed' },
+        template: template ? { name: template.friendlyName, language: template.language } : null,
+        message: { perRecipient: usingCsv && csvUpload.mode === 'body' },
+        variables: template
+            ? { values: sharedVariables, perRecipient: usingCsv && csvUpload.mode === 'variables' }
+            : null,
+        media: template ? templateMediaDetails(template, sharedVariables, usingCsv) : null,
+        recipients: usingCsv
+            ? { source: 'csv', fileName: csvUpload.fileName }
+            : { source: 'typed' },
+    };
+}
+
 async function handleSendMessages(e) {
     e.preventDefault();
     
@@ -1289,11 +1346,13 @@ async function handleSendMessages(e) {
     currentCampaignId = `campaign_${Date.now()}`;
     currentCampaignMode = isBulkMode() ? 'bulk' : 'classic';
 
+    const details = collectCampaignDetails();
+
     try {
         if (isBulkMode()) {
-            await sendBulkCampaign(messages, channel, from, campaignName);
+            await sendBulkCampaign(messages, channel, from, campaignName, details);
         } else {
-            await sendMessagesBatch(messages, channel, from, campaignName);
+            await sendMessagesBatch(messages, channel, from, campaignName, details);
         }
     } catch (error) {
         alert('Error: ' + error.message);
@@ -1301,7 +1360,7 @@ async function handleSendMessages(e) {
     }
 }
 
-async function sendMessagesBatch(messages, channel, from, campaignName) {
+async function sendMessagesBatch(messages, channel, from, campaignName, details) {
     let resumeFrom = 0;
     let isComplete = false;
 
@@ -1313,7 +1372,9 @@ async function sendMessagesBatch(messages, channel, from, campaignName) {
                 channel,
                 from,
                 resumeFrom,
-                campaignName: campaignName || null
+                campaignName: campaignName || null,
+                // Stored only when the first call creates the campaign.
+                ...(resumeFrom === 0 ? { details } : {})
             });
 
             const data = await response.json();
@@ -1361,7 +1422,7 @@ async function sendMessagesBatch(messages, channel, from, campaignName) {
  * The `messages` array the classic path builds is reused as-is — each entry
  * already carries `to`, and optionally `body` and `variables`.
  */
-async function sendBulkCampaign(messages, channel, from, campaignName) {
+async function sendBulkCampaign(messages, channel, from, campaignName, details) {
     const sendAtInput = document.getElementById('send-at');
     const fallbackInput = document.getElementById('fallback-to-sms');
 
@@ -1405,6 +1466,7 @@ async function sendBulkCampaign(messages, channel, from, campaignName) {
         campaignName: campaignName || null,
         sendAt,
         fallbackToSms: Boolean(fallbackInput && fallbackInput.checked),
+        details,
     });
 
     const data = await response.json();
