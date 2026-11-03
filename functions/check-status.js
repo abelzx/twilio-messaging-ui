@@ -6,6 +6,7 @@
 const twilio = require('twilio');
 const oauth = require(Runtime.getAssets()['/twilio-oauth.js'].path);
 const campaignDetails = require(Runtime.getAssets()['/campaign-details.js'].path);
+const { templateNames } = require(Runtime.getAssets()['/template-names.js'].path);
 
 /**
  * A real Twilio message SID: two-letter prefix (SM, MM) plus 32 hex. Used to
@@ -157,6 +158,14 @@ exports.handler = async function(context, event, callback) {
       data: campaignData
     });
 
+    // A campaign sent before details were recorded has only its template's
+    // SID, so look the name up rather than show the SID.
+    const details = campaignDetails.resolveDetails(campaignData);
+    if (details.template && details.template.sid && !details.template.name) {
+      const found = (await templateNames(client, [details.template.sid])).get(details.template.sid);
+      if (found) Object.assign(details.template, found);
+    }
+
     response.setStatusCode(200);
     response.setBody({
       success: true,
@@ -178,7 +187,7 @@ exports.handler = async function(context, event, callback) {
         messages: campaignData.messages || null,
         channel: campaignData.channel || null,
         from: campaignData.from || null,
-        details: campaignDetails.resolveDetails(campaignData)
+        details
       }
     });
 
