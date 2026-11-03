@@ -2,6 +2,7 @@ const twilio = require('twilio');
 const oauth = require(Runtime.getAssets()['/twilio-oauth.js'].path);
 const comms = require(Runtime.getAssets()['/twilio-comms.js'].path);
 const snapshot = require(Runtime.getAssets()['/bulk-snapshot.js'].path);
+const campaignDetails = require(Runtime.getAssets()['/campaign-details.js'].path);
 
 /**
  * POST /check-bulk-status — aggregate progress for a bulk campaign, and
@@ -131,6 +132,7 @@ exports.handler = async function (context, event, callback) {
           scheduledFor: campaignData.scheduledFor || null,
           recipientCount: campaignData.recipientCount || 0,
           operationIds: [],
+          details: campaignDetails.resolveDetails(campaignData),
           operationStatuses: [],
           stats: null,
           isComplete: true,
@@ -273,6 +275,7 @@ exports.handler = async function (context, event, callback) {
         scheduledFor: campaignData.scheduledFor || null,
         recipientCount: campaignData.recipientCount || 0,
         operationIds,
+        details: campaignDetails.resolveDetails(campaignData),
         operationStatuses,
         stats,
         isComplete,

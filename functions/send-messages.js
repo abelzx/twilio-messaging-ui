@@ -1,5 +1,6 @@
 const twilio = require('twilio');
 const oauth = require(Runtime.getAssets()['/twilio-oauth.js'].path);
+const campaignDetails = require(Runtime.getAssets()['/campaign-details.js'].path);
 
 /**
  * POST /send-messages — sends a chunk of messages via the caller's OAuth app,
@@ -144,6 +145,14 @@ exports.handler = async function(context, event, callback) {
           channel: channel,
           from: from,
           campaignName: campaignName || null,
+          // What the campaign was sent with, for the card and the delivery
+          // panel. Body and variables are not repeated here: messages[0]
+          // already holds them, and this document is near Sync's size limit.
+          details: campaignDetails.buildDetails(event.details, {
+            mode: 'classic',
+            contentSid: messages[0] && messages[0].contentSid,
+            recipientCount: messages.length,
+          }),
           createdAt: new Date().toISOString(),
           lastUpdated: new Date().toISOString()
         }

@@ -2,6 +2,7 @@ const twilio = require('twilio');
 const oauth = require(Runtime.getAssets()['/twilio-oauth.js'].path);
 const comms = require(Runtime.getAssets()['/twilio-comms.js'].path);
 const bulk = require(Runtime.getAssets()['/bulk-payload.js'].path);
+const campaignDetails = require(Runtime.getAssets()['/campaign-details.js'].path);
 
 /**
  * POST /send-bulk — submits a campaign through the Bulk Messaging API.
@@ -136,6 +137,21 @@ exports.handler = async function (context, event, callback) {
         from: event.from || null,
         campaignName: event.campaignName || null,
         scheduledFor: event.sendAt || null,
+        // What the campaign was sent with, for the card and the delivery
+        // panel. The browser supplies labels; these facts are what was sent.
+        details: campaignDetails.buildDetails(event.details, {
+          mode: 'bulk',
+          contentSid: event.contentSid,
+          body: event.body,
+          perRecipientBody:
+            Array.isArray(event.recipients) &&
+            event.recipients.some(
+              (recipient) => recipient && String(recipient.body == null ? '' : recipient.body).trim() !== ''
+            ),
+          recipientCount,
+          fallbackToSms:
+            String(event.channel || '').toLowerCase() === 'whatsapp' ? Boolean(event.fallbackToSms) : null,
+        }),
         stats: null,
         createdAt: new Date().toISOString(),
         lastUpdated: new Date().toISOString(),

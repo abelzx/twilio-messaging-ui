@@ -4,6 +4,7 @@
 
 const twilio = require('twilio');
 const oauth = require(Runtime.getAssets()['/twilio-oauth.js'].path);
+const campaignDetails = require(Runtime.getAssets()['/campaign-details.js'].path);
 
 exports.handler = async function(context, event, callback) {
   const response = new Twilio.Response();
@@ -70,6 +71,7 @@ exports.handler = async function(context, event, callback) {
           mode: 'bulk',
           campaignName: campaignData.campaignName || null,
           channel: campaignData.channel || null,
+          summary: campaignDetails.summaryLine(campaignData),
           recipientCount: campaignData.recipientCount || 0,
           totalMessages: campaignData.recipientCount || 0,
           sent:
@@ -118,7 +120,8 @@ exports.handler = async function(context, event, callback) {
         isComplete: (campaignData.startIndex || 0) >= (campaignData.totalMessages || 0),
         createdAt: campaignData.createdAt,
         lastUpdated: campaignData.lastUpdated,
-        campaignName: campaignData.campaignName || null
+        campaignName: campaignData.campaignName || null,
+        summary: campaignDetails.summaryLine(campaignData)
       });
     }
 
