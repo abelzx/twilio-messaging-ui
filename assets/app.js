@@ -1857,7 +1857,12 @@ function renderCampaignDetails(details) {
     const sender = details.sender || {};
     if (sender.label || sender.address) {
         const kind = SENDER_KIND_LABEL[sender.kind];
-        add('Sender', escapeHtml(sender.label || sender.address) + (kind ? ` ${muted(kind)}` : ''));
+        // A pool's label is its dropdown text, which get-phone-numbers.js ends
+        // in " · pool". The kind below already says so.
+        const text = sender.label && sender.kind === 'pool'
+            ? sender.label.replace(/\s*·\s*pool$/, '')
+            : sender.label || sender.address;
+        add('Sender', escapeHtml(text) + (kind ? ` ${muted(kind)}` : ''));
     }
 
     const template = details.template;
