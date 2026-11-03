@@ -145,9 +145,12 @@ exports.handler = async function (context, event, callback) {
           body: event.body,
           perRecipientBody:
             Array.isArray(event.recipients) &&
-            event.recipients.some(
-              (recipient) => recipient && String(recipient.body == null ? '' : recipient.body).trim() !== ''
-            ),
+            // Differs from the typed body: the browser sends a body on every row of
+            // a Body-mode CSV, including rows that only fell back to it.
+            event.recipients.some((recipient) => {
+              const own = recipient && String(recipient.body == null ? '' : recipient.body).trim();
+              return own !== '' && own !== String(event.body == null ? '' : event.body).trim();
+            }),
           recipientCount,
           fallbackToSms:
             String(event.channel || '').toLowerCase() === 'whatsapp' ? Boolean(event.fallbackToSms) : null,

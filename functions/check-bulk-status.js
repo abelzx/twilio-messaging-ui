@@ -190,7 +190,7 @@ exports.handler = async function (context, event, callback) {
 
     let messages;
     let nextCursor = null;
-    let details = {};
+    let rowsSource = {};
     if (event.includeMessages) {
       messages = [];
       let token = event.pageToken || null;
@@ -254,12 +254,12 @@ exports.handler = async function (context, event, callback) {
 
         if (saved && saved.rows.length) {
           messages = saved.rows;
-          details = { detailsSource: 'saved', savedAt: saved.savedAt };
+          rowsSource = { detailsSource: 'saved', savedAt: saved.savedAt };
         }
       }
 
       if (messages.length === 0 && operationIds.length > 0 && expiredOperations === operationIds.length) {
-        details = { detailsExpired: true };
+        rowsSource = { detailsExpired: true };
       }
     }
 
@@ -284,7 +284,7 @@ exports.handler = async function (context, event, callback) {
         createdAt: campaignData.createdAt,
         lastUpdated: campaignData.lastUpdated,
       },
-      ...(messages ? { messages, nextCursor, ...details } : {}),
+      ...(messages ? { messages, nextCursor, ...rowsSource } : {}),
     });
     return callback(null, response);
   } catch (error) {

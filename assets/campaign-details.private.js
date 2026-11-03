@@ -52,7 +52,9 @@ function text(value, max) {
   if (typeof value !== 'string') return null;
   const trimmed = value.trim();
   if (!trimmed) return null;
-  return trimmed.length > max ? `${trimmed.slice(0, max - 1)}…` : trimmed;
+  // By code point, so a cut never leaves half an emoji in Sync.
+  const chars = Array.from(trimmed);
+  return chars.length > max ? `${chars.slice(0, max - 1).join('')}…` : trimmed;
 }
 
 function contentSidOf(value) {
@@ -100,12 +102,21 @@ function byteSize(value) {
   return Buffer.byteLength(JSON.stringify(value), 'utf8');
 }
 
-/** Drops media, then variable values, then body, until the budget is met. */
+/**
+ * Drops media, then variable values, then body, then the labels, until the
+ * budget is met. Control characters serialise to 6 bytes each, so capped labels
+ * alone can overflow; with the labels gone only facts remain, which always fit.
+ */
 function fitBudget(details) {
   const drops = [
     () => { details.media = null; },
     () => { if (details.variables) details.variables.values = null; },
     () => { details.message.body = null; },
+    () => {
+      details.sender.label = null;
+      if (details.template) details.template.name = null;
+      details.recipients.fileName = null;
+    },
   ];
   for (const drop of drops) {
     if (byteSize(details) <= MAX_DETAILS_BYTES) break;
@@ -143,6 +154,8 @@ function buildDetails(input, facts) {
     (typeof known.perRecipientBody === 'boolean' ? known.perRecipientBody : message.perRecipient === true);
   const variablesPerRecipient = Boolean(contentSid) && variables.perRecipient === true;
   const csv = recipients.source === 'csv';
+  // Null when the browser did not say (no or malformed details): unknown, not typed.
+  const source = csv ? 'csv' : (recipients.source === 'typed' ? 'typed' : null);
 
   return fitBudget({
     sender: {
@@ -168,7 +181,7 @@ function buildDetails(input, facts) {
       : null,
     media: contentSid ? cleanMedia(given.media) : null,
     recipients: {
-      source: csv ? 'csv' : 'typed',
+      source,
       fileName: csv ? text(recipients.fileName, LIMITS.label) : null,
       count: Number.isFinite(known.recipientCount) ? known.recipientCount : 0,
     },

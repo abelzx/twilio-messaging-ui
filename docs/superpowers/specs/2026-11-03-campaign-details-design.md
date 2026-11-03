@@ -35,10 +35,10 @@ One new field, `details`, on the campaign's Sync Document. Written on create onl
 details: {
   sender:     { label, kind },                 // kind: 'direct' | 'service' | 'pool' | 'typed'
   template:   { sid, name, language } | null,
-  message:    { body, perRecipient },          // perRecipient: true when a Body-mode CSV supplied the text
+  message:    { body, perRecipient },          // perRecipient: true when a Body-mode CSV gave some recipient text different from the typed body
   variables:  { values, perRecipient } | null, // values: { "1": "Sarah", ... } shared across recipients
   media:      { urls, perRecipient } | null,   // the template's media entries with shared variables filled in
-  recipients: { source, fileName, count },     // source: 'typed' | 'csv'
+  recipients: { source, fileName, count },     // source: 'typed' | 'csv' | null (null when the browser did not say)
   fallbackToSms: boolean | null,               // bulk only
 }
 ```
@@ -67,7 +67,7 @@ Every string is trimmed and capped; anything that is not a string is dropped.
 | Variables | 10 keys; key 40 chars, value 100 chars |
 | Media | 3 URLs, 300 chars each |
 
-After capping, the serialised `details` must fit in **2 KiB**. If it does not, media is dropped, then variables, then body, in that order. A classic doc's checkpoint write rewrites the whole doc, so an oversized `details` would raise the chance of a checkpoint overflow — which today causes duplicate sends.
+After capping, the serialised `details` must fit in **2 KiB**. If it does not, media is dropped, then variables, then body, then the labels (sender, template name, file name), in that order. With the labels gone only facts remain, which always fit. A classic doc's checkpoint write rewrites the whole doc, so an oversized `details` would raise the chance of a checkpoint overflow — which today causes duplicate sends.
 
 ## Components
 

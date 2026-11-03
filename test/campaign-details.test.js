@@ -115,7 +115,7 @@ test('malformed input costs the labels, never the facts', () => {
     const out = details.buildDetails(input, { mode: 'bulk', body: 'Hi', recipientCount: 4, fallbackToSms: false });
     assert.deepStrictEqual(out.sender, { label: null, kind: null });
     assert.deepStrictEqual(out.message, { body: 'Hi', perRecipient: false });
-    assert.deepStrictEqual(out.recipients, { source: 'typed', fileName: null, count: 4 });
+    assert.deepStrictEqual(out.recipients, { source: null, fileName: null, count: 4 });
     assert.strictEqual(out.fallbackToSms, false);
   }
 });
@@ -266,4 +266,71 @@ test('summaryLine prefers labels and falls back to raw values', () => {
     details.summaryLine({ channel: 'sms', from: '+15017122661', messages: [{ contentSid: HX }] }),
     { channel: 'sms', sender: '+15017122661', template: HX }
   );
+});
+
+const chars = (s) => Array.from(s).length;
+const LONE_SURROGATE = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
+
+test('only the first three media URLs are kept', () => {
+  const urls = [1, 2, 3, 4].map((n) => `https://example.com/${n}.jpg`);
+  const out = details.buildDetails({ media: { urls } }, { mode: 'bulk', contentSid: HX, recipientCount: 1 });
+  assert.deepStrictEqual(out.media.urls, urls.slice(0, 3));
+});
+
+test('a 600-character body is cut to 500 ending in an ellipsis', () => {
+  const out = details.buildDetails({}, { mode: 'bulk', body: 'b'.repeat(600), recipientCount: 1 });
+  assert.strictEqual(chars(out.message.body), 500);
+  assert.ok(out.message.body.endsWith('…'));
+});
+
+test('a 50-character variable key is cut to 40 ending in an ellipsis', () => {
+  const out = details.buildDetails(
+    { variables: { values: { ['k'.repeat(50)]: 'v' } } },
+    { mode: 'bulk', contentSid: HX, recipientCount: 1 }
+  );
+  const [key] = Object.keys(out.variables.values);
+  assert.strictEqual(chars(key), 40);
+  assert.ok(key.endsWith('…'));
+});
+
+test('a 150-character variable value is cut to 100 ending in an ellipsis', () => {
+  const out = details.buildDetails(
+    { variables: { values: { 1: 'v'.repeat(150) } } },
+    { mode: 'bulk', contentSid: HX, recipientCount: 1 }
+  );
+  assert.strictEqual(chars(out.variables.values[1]), 100);
+  assert.ok(out.variables.values[1].endsWith('…'));
+});
+
+test('truncating emoji never leaves a lone surrogate', () => {
+  const out = details.buildDetails(
+    { sender: { label: '😀'.repeat(200) } },
+    { mode: 'bulk', recipientCount: 1 }
+  );
+  const label = Array.from(out.sender.label);
+  assert.strictEqual(label.length, 120);
+  assert.strictEqual(label[119], '…');
+  assert.doesNotMatch(out.sender.label, LONE_SURROGATE);
+});
+
+test('control-character labels cannot push details over budget', () => {
+  const noisy = '\u0001'.repeat(120);
+  const out = details.buildDetails(
+    {
+      sender: { label: noisy },
+      template: { name: noisy },
+      recipients: { source: 'csv', fileName: noisy },
+    },
+    { mode: 'bulk', contentSid: HX, recipientCount: 1 }
+  );
+  assert.ok(size(out) <= details.MAX_DETAILS_BYTES);
+  assert.strictEqual(out.sender.label, null);
+  assert.strictEqual(out.template.name, null);
+  assert.strictEqual(out.recipients.fileName, null);
+});
+
+test('recipients.source is typed when the browser says so, null when it says nothing', () => {
+  const facts = { mode: 'bulk', body: 'Hi', recipientCount: 1 };
+  assert.strictEqual(details.buildDetails({ recipients: { source: 'typed' } }, facts).recipients.source, 'typed');
+  assert.strictEqual(details.buildDetails({}, facts).recipients.source, null);
 });

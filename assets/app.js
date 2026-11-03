@@ -1266,15 +1266,22 @@ function collectCampaignDetails() {
     const template = selectedTemplate();
     const usingCsv = csvIsActive();
     const sharedVariables = template && !usingCsv ? getSelectedContentVariables() : null;
+    const rows = usingCsv ? csvUpload.rows : [];
+    const typedBody = document.getElementById('message-body').value.trim();
+    // True only when the CSV really varied the content, not merely when one is loaded.
+    const bodyVaries = usingCsv && csvUpload.mode === 'body' &&
+        rows.some(row => String(row.body == null ? '' : row.body).trim() !== typedBody);
+    const variablesVary = usingCsv && csvUpload.mode === 'variables' &&
+        rows.some(row => row.contentVariables && Object.keys(row.contentVariables).length > 0);
 
     return {
         sender: option
             ? { label: option.textContent, kind: option.dataset.kind || null }
             : { label: null, kind: 'typed' },
         template: template ? { name: template.friendlyName, language: template.language } : null,
-        message: { perRecipient: usingCsv && csvUpload.mode === 'body' },
+        message: { perRecipient: bodyVaries },
         variables: template
-            ? { values: sharedVariables, perRecipient: usingCsv && csvUpload.mode === 'variables' }
+            ? { values: sharedVariables, perRecipient: variablesVary }
             : null,
         media: template ? templateMediaDetails(template, sharedVariables, usingCsv) : null,
         recipients: usingCsv
@@ -1346,7 +1353,14 @@ async function handleSendMessages(e) {
     currentCampaignId = `campaign_${Date.now()}`;
     currentCampaignMode = isBulkMode() ? 'bulk' : 'classic';
 
-    const details = collectCampaignDetails();
+    // Display data only: if collecting it fails, send without it rather than
+    // not at all. buildDetails() on the server copes with a missing object.
+    let details = null;
+    try {
+        details = collectCampaignDetails();
+    } catch (error) {
+        console.error('Could not collect campaign details:', error);
+    }
 
     try {
         if (isBulkMode()) {
