@@ -1800,6 +1800,121 @@ async function loadCampaigns() {
     }
 }
 
+/** The channel's name as the Messaging Channel dropdown shows it. */
+function channelLabel(channel) {
+    if (!channel) return '';
+    const option = document.querySelector(`#channel option[value="${CSS.escape(channel)}"]`);
+    return option ? option.textContent : channel;
+}
+
+/** The card's "WhatsApp · Acme Service · promo_v2" line, escaped; '' when nothing is known. */
+function campaignSummaryText(summary) {
+    if (!summary) return '';
+    return [channelLabel(summary.channel), summary.sender, summary.template]
+        .filter(Boolean)
+        .map(escapeHtml)
+        .join(' · ');
+}
+
+const SENDER_KIND_LABEL = {
+    service: 'Messaging Service',
+    pool: 'Sender pool',
+    typed: 'Typed sender',
+};
+
+/**
+ * The "Campaign details" block above the delivery totals. `details` is
+ * resolveDetails() output from campaign-details.private.js. A row with nothing
+ * to say is left out. Every value is escaped: all of it was typed by someone.
+ */
+function renderCampaignDetails(details) {
+    if (!details) return '';
+
+    const rows = [];
+    const add = (label, html) => {
+        if (html) rows.push(`<dt>${label}</dt><dd>${html}</dd>`);
+    };
+    const muted = (text) => `<span class="campaign-details__muted">${text}</span>`;
+    const code = (text) => `<code>${escapeHtml(text)}</code>`;
+
+    add('API', details.mode === 'bulk' ? 'Bulk Messaging' : 'Programmable Messaging');
+    add('Channel', escapeHtml(channelLabel(details.channel)));
+
+    const sender = details.sender || {};
+    if (sender.label || sender.address) {
+        const kind = SENDER_KIND_LABEL[sender.kind];
+        add('Sender', escapeHtml(sender.label || sender.address) + (kind ? ` ${muted(kind)}` : ''));
+    }
+
+    const template = details.template;
+    if (template && template.notRecorded) {
+        add('Template', muted('Not recorded'));
+    } else if (template) {
+        // Campaigns sent before names were recorded carry only the SID. The
+        // name is filled in when the loaded template list still has it.
+        const known = template.name ? null : loadedTemplates.find((t) => t.sid === template.sid);
+        const name = template.name || (known && known.friendlyName);
+        const language = template.language || (known && known.language);
+        const title = name ? `${escapeHtml(name)}${language ? ` (${escapeHtml(language)})` : ''} ` : '';
+        add('Template', title + code(template.sid));
+    }
+
+    const message = details.message;
+    if (message && message.notRecorded) {
+        add('Message', muted('Not recorded'));
+    } else if (message && message.perRecipient) {
+        add('Message', 'Per-recipient text from CSV');
+    } else if (message && message.body) {
+        add('Message', `<span class="campaign-details__body" title="${escapeHtml(message.body)}">${escapeHtml(message.body)}</span>`);
+    }
+
+    const variables = details.variables;
+    if (variables && variables.perRecipient) {
+        add('Variables', 'Per-recipient from CSV');
+    } else if (variables && variables.values) {
+        add('Variables', Object.entries(variables.values)
+            .map(([key, value]) => `${code(`{{${key}}}`)} ${escapeHtml(value)}`)
+            .join(' · '));
+    }
+
+    const media = details.media;
+    if (media) {
+        const items = (media.urls || []).map((url) => (/^https?:\/\//i.test(url)
+            ? `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(url)}</a>`
+            : escapeHtml(url)));
+        if (media.perRecipient) items.push('Per-recipient from CSV');
+        add('Media', items.join('<br>'));
+    }
+
+    const recipients = details.recipients || {};
+    const count = Number(recipients.count || 0);
+    if (recipients.source === 'csv') {
+        add('Recipients', ['CSV', recipients.fileName && escapeHtml(recipients.fileName), `· ${count}`]
+            .filter(Boolean).join(' '));
+    } else if (recipients.source === 'typed') {
+        add('Recipients', `Typed · ${count}`);
+    } else if (count) {
+        add('Recipients', String(count));
+    }
+
+    if (details.scheduledFor) {
+        add('Scheduled', escapeHtml(new Date(details.scheduledFor).toLocaleString()));
+    }
+    if (details.channel === 'whatsapp' && typeof details.fallbackToSms === 'boolean') {
+        add('SMS fallback', details.fallbackToSms ? 'On' : 'Off');
+    }
+    if (details.operationIds && details.operationIds.length) {
+        add('Operations', details.operationIds.map((id) => code(id)).join('<br>'));
+    }
+
+    return `
+        <div class="campaign-details">
+            <h3 class="campaign-details__title">Campaign details</h3>
+            <dl>${rows.join('')}</dl>
+        </div>
+    `;
+}
+
 function displayCampaigns(campaigns) {
     const campaignsContent = document.getElementById('campaigns-content');
     if (!campaignsContent) return;
@@ -1814,6 +1929,7 @@ function displayCampaigns(campaigns) {
         campaigns.map((c) => [
             c.campaignId, c.campaignName, c.totalMessages, c.sent, c.failed,
             c.delivered, c.read, c.startIndex, c.isComplete, c.lastUpdated,
+            c.summary,
         ]),
     ]);
     // Nothing to redraw: leave the DOM alone so the user's scroll survives.
@@ -1864,6 +1980,8 @@ function displayCampaigns(campaigns) {
             (campaign.createdAt ? new Date(campaign.createdAt).toLocaleString() :
             campaign.campaignId.replace('campaign_', ''));
 
+        const summaryText = campaignSummaryText(campaign.summary);
+
         const modeBadge = campaign.mode === 'bulk'
             ? '<span class="mode-badge mode-badge--bulk">Bulk</span> '
             : '<span class="mode-badge mode-badge--classic">Classic</span> ';
@@ -1883,6 +2001,7 @@ function displayCampaigns(campaigns) {
                         ` : ''}
                     </div>
                 </div>
+                ${summaryText ? `<div class="campaign-summary" title="${summaryText}">${summaryText}</div>` : ''}
                 <div class="campaign-stats">
                     <div class="stat-item">
                         <span class="stat-label">Total:</span>
@@ -1966,6 +2085,7 @@ async function fetchAndDisplayCampaignDetails(campaignId, mode) {
                 statuses: bulkRowsToStatuses(rows),
                 ...bulkCampaignAggregates(campaign),
                 detailsNote: bulkDetailsNote(source, savedAt),
+                details: campaign ? campaign.details : null,
             });
         } catch (error) {
             console.error('Error loading bulk recipients:', error);
@@ -2016,11 +2136,12 @@ function displayMessageDetails(campaign) {
         </div>
     `;
     const note = campaign.detailsNote ? `<p class="details-note">${campaign.detailsNote}</p>` : '';
+    const detailsBlock = renderCampaignDetails(campaign.details);
 
     if (statusEntries.length === 0) {
         // A bulk campaign's totals are kept in Sync and outlast Twilio's
         // per-recipient rows, so they are shown even when there are no rows.
-        messageDetailsContent.innerHTML = (campaign.mode === 'bulk' ? summary : '') +
+        messageDetailsContent.innerHTML = detailsBlock + (campaign.mode === 'bulk' ? summary : '') +
             (note || '<p style="color: #666; text-align: center; padding: 20px;">No messages sent yet. Messages will appear here once they are successfully sent.</p>');
         return;
     }
@@ -2037,14 +2158,14 @@ function displayMessageDetails(campaign) {
 
     const signature = JSON.stringify([
         campaign.campaignId, campaign.sent, campaign.failed, campaign.delivered,
-        campaign.read, campaign.totalMessages, campaign.detailsNote,
+        campaign.read, campaign.totalMessages, campaign.detailsNote, campaign.details,
         statusEntries.map(([sid, s]) => [sid, s.status, s.delivered, s.read, s.errorCode, s.dateUpdated]),
     ]);
     if (renderUnchanged('details', signature, Boolean(messageDetailsContent.querySelector('.message-status-scroll')))) {
         return;
     }
 
-    let html = summary + note + `
+    let html = detailsBlock + summary + note + `
         <div class="message-status-scroll">
             <table class="message-status-table">
                 <thead>
