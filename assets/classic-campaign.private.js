@@ -21,6 +21,14 @@
  * go in status buckets keyed at its start, start + 32, start + 64 and
  * start + 96, so no status bucket is written by two chunks.
  *
+ * A chunk is claimed before it is sent, by creating its status buckets with an
+ * `unconfirmed-<index>` placeholder per recipient. Sync refuses to create a key
+ * twice, so only one sender can claim a chunk, and a chunk already claimed is
+ * skipped: no chunk is sent twice, whether by two tabs, a resume clicked
+ * mid-send, or a retry after a failed checkpoint. Once the chunk is sent, its
+ * results replace the placeholders. A sender cut off in between leaves them,
+ * so those recipients show as not confirmed: they may or may not have been sent.
+ *
  * The recipient list arrives in slices, one per send-messages call, because a
  * Function request is capped at 1 MB. storedCount says how much has arrived.
  * Nothing is sent until all of it has, so a campaign whose upload was cut off
@@ -66,6 +74,9 @@ const WRITE_CONCURRENCY = 8;
 const KEY_DIGITS = 7;
 const NOT_FOUND = 20404;
 const ITEM_EXISTS = 54208;
+
+/** The status of a claimed chunk's placeholder, until its result replaces it. */
+const UNCONFIRMED = 'unconfirmed';
 
 function byteSize(value) {
   return Buffer.byteLength(JSON.stringify(value), 'utf8');
@@ -173,10 +184,9 @@ function packRecipients(messages, { shared = sharedFields(messages), startIndex 
 
 /**
  * One chunk's results as status entries. An accepted send is keyed by its SID.
- * A refused one has no SID, so it is keyed by its position, which is stable:
- * re-sending a chunk overwrites the entry rather than duplicating it. Without an
- * entry a refusal would be invisible, both in check-status.js's counters and in
- * the delivery table.
+ * A refused one has no SID, so it is keyed by its position. Without an entry a
+ * refusal would be invisible, both in check-status.js's counters and in the
+ * delivery table.
  */
 function statusEntries(results, sentAt) {
   const entries = {};
@@ -280,22 +290,61 @@ async function readRecipientBucket(syncClient, campaignId, start) {
   }
 }
 
-/**
- * Records one status bucket's send results. The key normally does not exist
- * yet. It does when a chunk is sent a second time, and then the new entries are
- * merged in, so the first send's SIDs stay on record beside the second's.
- */
-async function writeStatusBucket(syncClient, campaignId, start, statuses) {
-  const items = syncClient.syncMaps(statusesMapName(campaignId)).syncMapItems;
-  const key = bucketKey(start);
-  try {
-    await items.create({ key, data: { statuses } });
-  } catch (error) {
-    if (error.code !== ITEM_EXISTS) throw error;
-    const existing = await items(key).fetch();
-    const before = (existing.data && existing.data.statuses) || {};
-    await items(key).update({ data: { statuses: { ...before, ...statuses } } });
+/** One chunk's recipients or results, split into the status buckets they belong in. */
+function statusGroups(chunkStart, list) {
+  const groups = [];
+  for (let i = 0; i < list.length; i += STATUS_BUCKET_ENTRIES) {
+    groups.push({ start: chunkStart + i, slice: list.slice(i, i + STATUS_BUCKET_ENTRIES) });
   }
+  return groups;
+}
+
+/**
+ * Claims the chunk of `recipients` starting at `chunkStart`, before any of it is
+ * sent, by creating its status buckets with an `unconfirmed-<index>`
+ * placeholder per recipient. The first bucket is the lock, created alone: Sync
+ * refuses a key that exists, so resolves to false when the chunk is already
+ * claimed, by another sender or by an earlier attempt that may have sent it.
+ * The other buckets are created once the lock is held.
+ */
+async function claimChunk(syncClient, campaignId, chunkStart, recipients, claimedAt) {
+  const items = syncClient.syncMaps(statusesMapName(campaignId)).syncMapItems;
+  const [lock, ...rest] = statusGroups(chunkStart, recipients).map((group) => {
+    const statuses = {};
+    group.slice.forEach((recipient, offset) => {
+      statuses[`unconfirmed-${group.start + offset}`] = { status: UNCONFIRMED, to: recipient.to };
+    });
+    return { key: bucketKey(group.start), data: { statuses, claimedAt } };
+  });
+
+  try {
+    await items.create(lock);
+  } catch (error) {
+    if (error.code === ITEM_EXISTS) return false;
+    throw error;
+  }
+
+  await Promise.all(rest.map(async (item) => {
+    try {
+      await items.create(item);
+    } catch (error) {
+      if (error.code !== ITEM_EXISTS) throw error;
+      // Only the lock's holder creates these, so this means the Map holds
+      // something this layout never writes. Sending could repeat a send.
+      throw new Error(`Status bucket ${item.key} already exists, so the chunk at ${chunkStart} is not sent`);
+    }
+  }));
+  return true;
+}
+
+/**
+ * Replaces a claimed status bucket's placeholders with the chunk's results. A
+ * chunk is never sent twice, so there is nothing to merge.
+ */
+async function recordStatusBucket(syncClient, campaignId, start, statuses) {
+  await syncClient.syncMaps(statusesMapName(campaignId)).syncMapItems(bucketKey(start)).update({
+    data: { statuses },
+  });
 }
 
 /**
@@ -323,19 +372,11 @@ async function updateStatusBucket(syncClient, campaignId, key, statuses, checked
   });
 }
 
-/** One chunk's results split into the status buckets they belong in. */
-function statusGroups(chunkStart, results) {
-  const groups = [];
-  for (let i = 0; i < results.length; i += STATUS_BUCKET_ENTRIES) {
-    groups.push({ start: chunkStart + i, results: results.slice(i, i + STATUS_BUCKET_ENTRIES) });
-  }
-  return groups;
-}
-
 /**
  * Sends from `startIndex` until the campaign is done or `deadline` passes, one
- * recipient bucket per chunk, recording each chunk's statuses and checkpoint as
- * it goes.
+ * recipient bucket per chunk: claiming each chunk, sending it, then recording
+ * its statuses and checkpoint. A chunk already claimed is skipped, uncounted,
+ * because it may have been sent.
  *
  * `send(messages, startIndex)` sends one chunk and resolves to one result per
  * message (classic-messages.js sendChunk). It is passed in because assets
@@ -343,15 +384,14 @@ function statusGroups(chunkStart, results) {
  * data and is updated in place.
  *
  * A failed checkpoint does not fail the call. By then the chunk has been sent,
- * and failing would send the browser back to retry it, which is how recipients
- * used to get the same message twice. The loop stops and reports
- * `checkpointFailed`, and `resumeFrom` still moves past the chunk. The Document
- * write is attempted even when a status write failed, so the stored index
- * advances whenever it can. The cost is that chunk's statuses, and its share of
- * the counters if the Document write was the one that failed.
+ * and failing would only send the browser back for a chunk that its claim now
+ * skips. The loop stops and reports `checkpointFailed`, and `resumeFrom` still
+ * moves past the chunk. The Document write is attempted even when a status
+ * write failed, so the stored index advances whenever it can. The cost is that
+ * chunk's statuses, which stay "not confirmed", and its share of the counters
+ * if the Document write was the one that failed.
  */
 async function runChunks({ syncClient, campaignId, campaignData, startIndex, deadline, send, now = Date.now }) {
-  const storedIndex = campaignData.startIndex || 0;
   const shared = campaignData.shared || {};
   let currentIndex = startIndex;
   let results = [];
@@ -359,24 +399,28 @@ async function runChunks({ syncClient, campaignId, campaignData, startIndex, dea
   let checkpointFailed = false;
 
   while (currentIndex < campaignData.totalMessages && now() < deadline) {
+    const chunkStart = currentIndex;
     let bucket;
+    let claimed;
     try {
-      bucket = await readRecipientBucket(syncClient, campaignId, currentIndex);
+      bucket = await readRecipientBucket(syncClient, campaignId, chunkStart);
       if (!bucket || !bucket.recipients.length) {
-        throw new Error(`No stored recipients start at index ${currentIndex}`);
+        throw new Error(`No stored recipients start at index ${chunkStart}`);
       }
+      claimed = await claimChunk(syncClient, campaignId, chunkStart, bucket.recipients, new Date(now()).toISOString());
     } catch (error) {
       if (!chunks) throw error;
       // The chunks already sent are checkpointed, and the next call meets the
       // same error before it sends anything.
-      console.error(`Could not read recipients for ${campaignId} at index ${currentIndex}:`, error);
+      console.error(`Could not read or claim recipients for ${campaignId} at index ${chunkStart}:`, error);
       break;
     }
 
-    const chunkStart = currentIndex;
+    currentIndex += bucket.recipients.length;
+    if (!claimed) continue;
+
     results = await send(bucket.recipients.map((entry) => unpackRecipient(entry, shared)), chunkStart);
     chunks++;
-    currentIndex += bucket.recipients.length;
 
     const accepted = results.filter((result) => result.success).length;
     campaignData.sent = (campaignData.sent || 0) + accepted;
@@ -386,7 +430,7 @@ async function runChunks({ syncClient, campaignId, campaignData, startIndex, dea
     campaignData.lastUpdated = new Date(now()).toISOString();
 
     const statusWrites = await Promise.allSettled(statusGroups(chunkStart, results).map((group) =>
-      writeStatusBucket(syncClient, campaignId, group.start, statusEntries(group.results, campaignData.lastUpdated))));
+      recordStatusBucket(syncClient, campaignId, group.start, statusEntries(group.slice, campaignData.lastUpdated))));
     let failure = statusWrites.find((write) => write.status === 'rejected')?.reason;
     try {
       await syncClient.documents(campaignId).update({ data: campaignData });
@@ -400,10 +444,12 @@ async function runChunks({ syncClient, campaignId, campaignData, startIndex, dea
     }
   }
 
-  // A resume that starts past the stored index, after a failed checkpoint, and
-  // finds nothing left to send must still save the index, or the campaign would
-  // show as in progress forever.
-  if (!chunks && currentIndex > storedIndex) {
+  // The index can move past the last one saved without a checkpoint: a resume
+  // that starts past the stored index, after a failed checkpoint, or chunks
+  // skipped because they were already claimed. It must still be saved, or the
+  // campaign would show as in progress forever. After a failed checkpoint the
+  // two are equal, so this does not retry it.
+  if (currentIndex > (campaignData.startIndex || 0)) {
     campaignData.startIndex = currentIndex;
     campaignData.lastUpdated = new Date(now()).toISOString();
     try {
@@ -461,7 +507,8 @@ module.exports = {
   createMaps,
   storeRecipients,
   readRecipientBucket,
-  writeStatusBucket,
+  claimChunk,
+  recordStatusBucket,
   readStatusBuckets,
   updateStatusBucket,
   runChunks,

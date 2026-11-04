@@ -154,14 +154,24 @@ function syncError(status, code) {
 
 /**
  * Just enough of twilio-node's Sync surface: `syncMaps` and `syncMapItems` are
- * callable and carry methods, as in the SDK. Map items list in key order.
+ * callable and carry methods, as in the SDK. Map items list in key order, and
+ * carry a revision that changes on every write, which `update` checks against
+ * `ifMatch` as Sync does.
  */
 function fakeSync() {
-  const state = { maps: {}, documents: {}, calls: [], failDocumentUpdate: false, failStatusWrite: false };
+  const state = {
+    maps: {}, revisions: {}, documents: {}, calls: [],
+    failDocumentUpdate: false, failStatusCreate: false, failStatusUpdate: false,
+  };
 
   const itemsOf = (name) => {
     if (!state.maps[name]) throw syncError(404, 20404);
     return state.maps[name];
+  };
+  const revisionOf = (name, key) => state.revisions[`${name}/${key}`];
+  const write = (name, key, data) => {
+    itemsOf(name)[key] = data;
+    state.revisions[`${name}/${key}`] = String(Number(revisionOf(name, key) || 0) + 1);
   };
 
   const syncMaps = (name) => {
@@ -169,26 +179,28 @@ function fakeSync() {
       fetch: async () => {
         const items = itemsOf(name);
         if (!(key in items)) throw syncError(404, 20404);
-        return { key, data: items[key] };
+        return { key, data: items[key], revision: revisionOf(name, key) };
       },
-      update: async ({ data }) => {
+      update: async ({ data, ifMatch }) => {
         state.calls.push(['updateItem', name, key]);
+        if (state.failStatusUpdate && name.endsWith('_statuses')) throw syncError(500, 20500);
         const items = itemsOf(name);
         if (!(key in items)) throw syncError(404, 20404);
-        items[key] = data;
+        if (ifMatch !== undefined && ifMatch !== revisionOf(name, key)) throw syncError(412, 54103);
+        write(name, key, data);
       },
     });
     syncMapItems.create = async ({ key, data }) => {
       state.calls.push(['createItem', name, key]);
-      if (state.failStatusWrite && name.endsWith('_statuses')) throw syncError(500, 20500);
+      if (state.failStatusCreate && name.endsWith('_statuses')) throw syncError(500, 20500);
       const items = itemsOf(name);
       if (key in items) throw syncError(409, 54208);
-      items[key] = data;
+      write(name, key, data);
     };
     syncMapItems.list = async () => {
       state.calls.push(['listItems', name]);
       const items = itemsOf(name);
-      return Object.keys(items).sort().map((key) => ({ key, data: items[key] }));
+      return Object.keys(items).sort().map((key) => ({ key, data: items[key], revision: revisionOf(name, key) }));
     };
     return { syncMapItems };
   };
@@ -207,6 +219,11 @@ function fakeSync() {
   });
 
   return { client: { syncMaps, documents }, state };
+}
+
+/** Creates a status bucket directly, as a send would have left it. */
+function putStatuses(client, key, statuses) {
+  return client.syncMaps('campaign_1_statuses').syncMapItems.create({ key, data: { statuses } });
 }
 
 test('createMaps creates the recipients and statuses Maps', async () => {
@@ -258,13 +275,29 @@ test('readRecipientBucket returns the bucket starting at a key, or null', async 
   assert.strictEqual(await storage.readRecipientBucket(client, 'campaign_1', 100), null);
 });
 
-test('writeStatusBucket merges into a bucket a re-sent chunk already wrote', async () => {
+test('claimChunk creates a placeholder per recipient, and refuses a chunk already claimed', async () => {
   const { client, state } = fakeSync();
   await storage.createMaps(client, 'campaign_1');
-  await storage.writeStatusBucket(client, 'campaign_1', 32, { a: { status: 'queued' } });
-  await storage.writeStatusBucket(client, 'campaign_1', 32, { b: { status: 'queued' } });
-  assert.deepStrictEqual(state.maps.campaign_1_statuses['0000032'], {
-    statuses: { a: { status: 'queued' }, b: { status: 'queued' } },
+  const recipients = messages(40).map(({ to }) => ({ to }));
+  assert.strictEqual(await storage.claimChunk(client, 'campaign_1', 128, recipients, 'T0'), true);
+  assert.deepStrictEqual(Object.keys(state.maps.campaign_1_statuses), ['0000128', '0000160']);
+  const first = state.maps.campaign_1_statuses['0000128'];
+  assert.strictEqual(first.claimedAt, 'T0');
+  assert.strictEqual(Object.keys(first.statuses).length, 32);
+  assert.deepStrictEqual(first.statuses['unconfirmed-128'], { status: 'unconfirmed', to: '+15550000000' });
+  assert.deepStrictEqual(Object.keys(state.maps.campaign_1_statuses['0000160'].statuses),
+    Array.from({ length: 8 }, (_, i) => `unconfirmed-${160 + i}`));
+  assert.strictEqual(await storage.claimChunk(client, 'campaign_1', 128, recipients, 'T1'), false);
+  assert.strictEqual(state.maps.campaign_1_statuses['0000128'].claimedAt, 'T0');
+});
+
+test('recordStatusBucket replaces a claimed bucket\'s placeholders with the results', async () => {
+  const { client, state } = fakeSync();
+  await storage.createMaps(client, 'campaign_1');
+  await storage.claimChunk(client, 'campaign_1', 0, [{ to: '+1' }, { to: '+2' }], 'T0');
+  await storage.recordStatusBucket(client, 'campaign_1', 0, { a: { status: 'queued' }, 'failed-1': { status: 'failed' } });
+  assert.deepStrictEqual(state.maps.campaign_1_statuses['0000000'], {
+    statuses: { a: { status: 'queued' }, 'failed-1': { status: 'failed' } },
   });
 });
 
@@ -272,8 +305,8 @@ test('readStatusBuckets returns every bucket in send order, or [] with no Map', 
   const { client } = fakeSync();
   assert.deepStrictEqual(await storage.readStatusBuckets(client, 'campaign_1'), []);
   await storage.createMaps(client, 'campaign_1');
-  await storage.writeStatusBucket(client, 'campaign_1', 32, { b: { status: 'sent' } });
-  await storage.writeStatusBucket(client, 'campaign_1', 0, { a: { status: 'sent' } });
+  await putStatuses(client, '0000032', { b: { status: 'sent' } });
+  await putStatuses(client, '0000000', { a: { status: 'sent' } });
   assert.deepStrictEqual(await storage.readStatusBuckets(client, 'campaign_1'), [
     { key: '0000000', statuses: { a: { status: 'sent' } }, checkedAt: null },
     { key: '0000032', statuses: { b: { status: 'sent' } }, checkedAt: null },
@@ -283,7 +316,7 @@ test('readStatusBuckets returns every bucket in send order, or [] with no Map', 
 test('updateStatusBucket replaces one bucket and records when it was checked', async () => {
   const { client, state } = fakeSync();
   await storage.createMaps(client, 'campaign_1');
-  await storage.writeStatusBucket(client, 'campaign_1', 0, { a: { status: 'sent' } });
+  await putStatuses(client, '0000000', { a: { status: 'sent' } });
   await storage.updateStatusBucket(client, 'campaign_1', '0000000', { a: { status: 'delivered' } }, 'T1');
   assert.deepStrictEqual(state.maps.campaign_1_statuses['0000000'], {
     statuses: { a: { status: 'delivered' } }, checkedAt: 'T1',
@@ -350,6 +383,13 @@ test('runChunks sends one recipient bucket per chunk and checkpoints each', asyn
     '0000000', '0000032', '0000064', '0000096', '0000128', '0000160', '0000192',
   ]);
   assert.strictEqual(Object.keys(state.maps.campaign_1_statuses['0000192'].statuses).length, 8);
+  // Every claim's placeholders were replaced by the real entries.
+  for (const [key, bucket] of Object.entries(state.maps.campaign_1_statuses)) {
+    assert.deepStrictEqual(Object.keys(bucket), ['statuses']);
+    const start = Number(key);
+    const expected = Array.from({ length: Math.min(32, 200 - start) }, (_, i) => `SM${String(start + i).padStart(32, '0')}`);
+    assert.deepStrictEqual(Object.keys(bucket.statuses), expected);
+  }
   assert.strictEqual(state.calls.filter(([op]) => op === 'updateDocument').length, 2);
   assert.strictEqual(state.documents.campaign_1.startIndex, 200);
   assert.strictEqual(state.documents.campaign_1.sent, 200);
@@ -426,10 +466,10 @@ test('a bucket read failing after a sent chunk ends the call with its progress',
   await assert.rejects(run(128), /No stored recipients start at index 128/);
 });
 
-test('a failed status write still saves the Document index', async (t) => {
+test('a failed status record leaves the chunk\'s placeholders and still saves the index', async (t) => {
   t.mock.method(console, 'error', () => {});
   const { client, state, campaignData } = await storedCampaign(200);
-  state.failStatusWrite = true;
+  state.failStatusUpdate = true;
   const { send, chunks } = fakeSend();
   const outcome = await storage.runChunks({
     syncClient: client, campaignId: 'campaign_1', campaignData, startIndex: 0, deadline: Infinity, send,
@@ -437,6 +477,73 @@ test('a failed status write still saves the Document index', async (t) => {
   assert.strictEqual(chunks.length, 1);
   assert.strictEqual(outcome.checkpointFailed, true);
   assert.strictEqual(outcome.resumeFrom, 128);
+  assert.strictEqual(state.documents.campaign_1.startIndex, 128);
+  // Sent, but unrecorded: these recipients show as not confirmed.
+  assert.deepStrictEqual(Object.keys(state.maps.campaign_1_statuses), ['0000000', '0000032', '0000064', '0000096']);
+  const statuses = state.maps.campaign_1_statuses['0000096'].statuses;
+  assert.deepStrictEqual(Object.keys(statuses), Array.from({ length: 32 }, (_, i) => `unconfirmed-${96 + i}`));
+  assert.deepStrictEqual(statuses['unconfirmed-96'], { status: 'unconfirmed', to: '+15550000096' });
+});
+
+test('a chunk already claimed is skipped, never sent again', async () => {
+  const { client, state, campaignData } = await storedCampaign(200);
+  // As another sender, or an attempt cut off mid-chunk, leaves it.
+  await putStatuses(client, '0000000', {});
+  const { send, chunks } = fakeSend();
+  const outcome = await storage.runChunks({
+    syncClient: client, campaignId: 'campaign_1', campaignData, startIndex: 0, deadline: Infinity, send,
+  });
+  assert.deepStrictEqual(chunks.map((c) => [c.startIndex, c.batch.length]), [[128, 72]]);
+  assert.strictEqual(outcome.resumeFrom, 200);
+  assert.strictEqual(state.documents.campaign_1.startIndex, 200);
+  assert.strictEqual(state.documents.campaign_1.sent, 72);
+});
+
+test('chunks skipped after the last one sent still move the stored index', async () => {
+  const { client, state, campaignData } = await storedCampaign(200);
+  await putStatuses(client, '0000128', {});
+  const { send, chunks } = fakeSend();
+  const outcome = await storage.runChunks({
+    syncClient: client, campaignId: 'campaign_1', campaignData, startIndex: 0, deadline: Infinity, send,
+  });
+  assert.deepStrictEqual(chunks.map((c) => c.startIndex), [0]);
+  assert.strictEqual(outcome.resumeFrom, 200);
+  assert.strictEqual(state.documents.campaign_1.startIndex, 200);
+});
+
+test('a chunk whose later status bucket already exists is not sent', async () => {
+  const { client, campaignData } = await storedCampaign(200);
+  await putStatuses(client, '0000032', {});
+  const { send, chunks } = fakeSend();
+  await assert.rejects(storage.runChunks({
+    syncClient: client, campaignId: 'campaign_1', campaignData, startIndex: 0, deadline: Infinity, send,
+  }), /0000032 already exists/);
+  assert.strictEqual(chunks.length, 0);
+});
+
+test('a failed claim rejects before any send, and after one ends the call with its progress', async (t) => {
+  t.mock.method(console, 'error', () => {});
+  const first = await storedCampaign(200);
+  first.state.failStatusCreate = true;
+  const { send: neverSent, chunks: none } = fakeSend();
+  await assert.rejects(storage.runChunks({
+    syncClient: first.client, campaignId: 'campaign_1', campaignData: first.campaignData,
+    startIndex: 0, deadline: Infinity, send: neverSent,
+  }), /Sync 500/);
+  assert.strictEqual(none.length, 0);
+
+  const { client, state, campaignData } = await storedCampaign(200);
+  const { send, chunks } = fakeSend();
+  const failLaterClaims = async (batch, startIndex) => {
+    state.failStatusCreate = true;
+    return send(batch, startIndex);
+  };
+  const outcome = await storage.runChunks({
+    syncClient: client, campaignId: 'campaign_1', campaignData, startIndex: 0, deadline: Infinity, send: failLaterClaims,
+  });
+  assert.strictEqual(chunks.length, 1);
+  assert.strictEqual(outcome.resumeFrom, 128);
+  assert.strictEqual(outcome.checkpointFailed, false);
   assert.strictEqual(state.documents.campaign_1.startIndex, 128);
 });
 
