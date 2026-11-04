@@ -160,19 +160,25 @@ function messageParams(message, { channel, from, messagingServiceSid } = {}) {
   return params;
 }
 
+/** Recorded for a send not started because its call ran out of time. */
+const OUT_OF_TIME = { errorCode: 20429, error: 'Not sent: the request ran out of time before this message. It can be sent again.' };
+
 /**
  * Sends one chunk, `concurrency` at a time. Resolves to one result per message,
  * in message order, and never rejects: a send Twilio refuses is a result,
  * recorded as a failure. So is a send still rate limited when a retry would
- * sleep past `deadline`; it can be sent again later.
+ * sleep past `deadline`, and one not started because `deadline` had passed;
+ * either can be sent again later.
  */
 async function sendChunk(client, messages, {
-  startIndex = 0, channel, from, messagingServiceSid, retry, deadline, now, concurrency = SEND_CONCURRENCY,
+  startIndex = 0, channel, from, messagingServiceSid, retry, deadline = Infinity, now = Date.now,
+  concurrency = SEND_CONCURRENCY,
 } = {}) {
   const results = new Array(messages.length);
   let next = 0;
 
   const sendOne = async (message, index) => {
+    if (now() >= deadline) return { index, success: false, ...OUT_OF_TIME, to: message.to };
     try {
       const sent = await retryWithExponentialBackoff(
         () => client.messages.create(messageParams(message, { channel, from, messagingServiceSid })),

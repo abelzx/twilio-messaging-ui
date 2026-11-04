@@ -128,6 +128,20 @@ test('sendChunk records a 429 as a failure rather than sleep past the deadline',
   assert.deepStrictEqual(result, { index: 0, success: false, error: 'Too Many Requests', errorCode: 429, to: '+1' });
 });
 
+test('sendChunk starts no send once the deadline has passed, and records why', async () => {
+  let clock = 0;
+  const client = fakeClient({ create: async () => ({ sid: sid(clock++), status: 'queued' }) });
+  const batch = [{ to: '+1' }, { to: '+2' }, { to: '+3' }];
+  const results = await classicMessages.sendChunk(client, batch, {
+    startIndex: 10, channel: 'sms', from: '+9', deadline: 2, now: () => clock, concurrency: 1,
+  });
+  assert.deepStrictEqual(results.map((r) => [r.index, r.success, r.errorCode || null]),
+    [[10, true, null], [11, true, null], [12, false, 20429]]);
+  assert.match(results[2].error, /ran out of time/);
+  assert.strictEqual(results[2].to, '+3');
+  assert.strictEqual(clock, 2);
+});
+
 test('a 429 retry still sleeps when it ends before the deadline', async (t) => {
   t.mock.method(console, 'log', () => {});
   let calls = 0;
