@@ -166,6 +166,13 @@ exports.handler = async function(context, event, callback) {
         });
         return callback(null, response);
       }
+      // Checked against the stored total: the request's own totalMessages
+      // only bounds the slice against itself.
+      if (offset + messages.length > campaignData.totalMessages) {
+        response.setStatusCode(400);
+        response.setBody({ error: 'This slice runs past the end of the campaign\'s recipient list.' });
+        return callback(null, response);
+      }
 
       campaignData.storedCount = await storage.storeRecipients(syncClient, campaignDocName, messages, {
         startIndex: offset, shared: campaignData.shared || {}, deadline: storeDeadline,

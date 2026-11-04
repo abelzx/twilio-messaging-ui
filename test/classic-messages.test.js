@@ -295,6 +295,16 @@ test('a failed fetch keeps the entry and records why', async () => {
   assert.ok(changed.has(sid(1)));
 });
 
+test('a failed fetch records at most FETCH_ERROR_MAX_CHARS of why', async () => {
+  const message = `The requested resource /2010-04-01/Accounts/AC${'0'.repeat(32)}/Messages/${sid(1)}.json was not found`;
+  const client = fakeClient({ fetch: async () => { throw Object.assign(new Error(message), { status: 404, code: 20404 }); } });
+  const { statuses } = await classicMessages.refreshStatuses(client, { [sid(1)]: { status: 'queued' } }, {
+    channel: 'sms', deadline: Infinity,
+  });
+  assert.strictEqual(classicMessages.FETCH_ERROR_MAX_CHARS, 64);
+  assert.strictEqual(statuses[sid(1)].error, message.slice(0, 64));
+});
+
 test('tally counts from the statuses, including refusals and recipients not confirmed', () => {
   assert.deepStrictEqual(classicMessages.tally({
     [sid(1)]: { status: 'delivered' },

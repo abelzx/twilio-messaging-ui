@@ -4,6 +4,7 @@ const test = require('node:test');
 const assert = require('node:assert');
 
 const storage = require('../assets/classic-campaign.private.js');
+const classicMessages = require('../assets/classic-messages.private.js');
 
 const FROM = '+15017122661';
 const HX = `HX${'a'.repeat(32)}`;
@@ -120,6 +121,24 @@ test('a full status bucket stays under the 10 KiB write-throttling threshold', (
   }
   const bytes = size({ statuses, checkedAt: '2026-11-04T00:00:05.000Z' });
   assert.ok(bytes < 10 * 1024, `bucket is ${bytes} bytes`);
+});
+
+test('a worst-case status bucket stays under Sync\'s 16 KiB item limit', () => {
+  // The longest error twilio-node gives for a failed fetch, a 404's message,
+  // as refreshStatuses stores it.
+  const fetchError = `The requested resource /2010-04-01/Accounts/AC${'0'.repeat(32)}/Messages/SM${'0'.repeat(32)}.json was not found`
+    .slice(0, classicMessages.FETCH_ERROR_MAX_CHARS);
+  const statuses = {};
+  for (let i = 0; i < storage.STATUS_BUCKET_ENTRIES; i++) {
+    statuses[`SM${String(i).padStart(32, '0')}`] = {
+      status: 'undelivered', to: 'whatsapp:+123456789012345', sentAt: '2026-11-04T00:00:00.000Z',
+      errorCode: 63049, errorMessage: 'm'.repeat(120), error: fetchError,
+      dateSent: '2026-11-04T00:00:01.000Z', dateUpdated: '2026-11-04T00:00:05.000Z',
+      delivered: false, read: false,
+    };
+  }
+  const bytes = size({ statuses, checkedAt: '2026-11-04T00:00:05.000Z' });
+  assert.ok(bytes < 16 * 1024, `bucket is ${bytes} bytes`);
 });
 
 test('statusEntries keys accepted sends by SID and refusals by index', () => {

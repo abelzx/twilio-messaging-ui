@@ -40,6 +40,13 @@ const SEND_CONCURRENCY = 64;
 const FETCH_CONCURRENCY = 20;
 
 /**
+ * Characters kept of why a status fetch failed. The page never shows it, and
+ * twilio-node's messages run long (a 404's is about 140 characters), so 32 of
+ * them beside long error messages could overflow a status bucket's 16 KiB.
+ */
+const FETCH_ERROR_MAX_CHARS = 64;
+
+/**
  * Retries `fn` with exponential backoff and jitter, on 429 rate limits only.
  * A retry that would sleep past `deadline` is not made: the 429 is thrown, so
  * the caller can finish inside the Function's 10-second limit.
@@ -241,7 +248,7 @@ async function refreshStatuses(client, statuses, {
         };
         delete after.error;
       } catch (error) {
-        after = { ...before, error: error.message };
+        after = { ...before, error: String(error.message).slice(0, FETCH_ERROR_MAX_CHARS) };
       }
       // Compared as JSON, which is also how Sync stores the Dates the SDK returns.
       if (JSON.stringify(after) !== JSON.stringify(before)) {
@@ -303,6 +310,7 @@ function tally(statuses) {
 }
 
 module.exports = {
+  FETCH_ERROR_MAX_CHARS,
   messageParams,
   retryWithExponentialBackoff,
   sendChunk,
