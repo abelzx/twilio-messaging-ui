@@ -22,6 +22,9 @@ let currentCampaignMode = 'classic';
 let activeSendCampaignId = null;
 let resumeInterval = null;
 let statusRefreshInterval = null;
+// True while a status poll is in flight, so the 5-second timer and the send
+// loop never run two at once.
+let refreshInFlight = false;
 // Content templates loaded for the current channel (full objects from the API)
 let loadedTemplates = [];
 
@@ -66,7 +69,7 @@ const UPLOAD_MAX_BYTES = 700 * 1024;
 
 /** Shown when a send or resume finished but a checkpoint could not be saved. */
 const CHECKPOINT_WARNING = 'Sending finished, but progress could not be saved for some messages. '
-    + 'They were sent, but may be missing from the delivery table and its counts. '
+    + 'They were sent, but may show as "not confirmed" in the delivery table. '
     + 'The Messaging logs in the Twilio Console have the full record.';
 
 function classicLimitMessage(count) {
@@ -1873,8 +1876,14 @@ function bulkRowsToStatuses(rows) {
  * one is never harmless.
  */
 async function refreshCurrentCampaign() {
-    if (currentCampaignMode === 'bulk') return checkBulkCampaignStatus();
-    return checkCampaignStatus();
+    if (refreshInFlight) return;
+    refreshInFlight = true;
+    try {
+        if (currentCampaignMode === 'bulk') return await checkBulkCampaignStatus();
+        return await checkCampaignStatus();
+    } finally {
+        refreshInFlight = false;
+    }
 }
 
 async function resumeCampaignById(campaignId, event) {
@@ -2273,6 +2282,25 @@ async function fetchAndDisplayCampaignDetails(campaignId, mode) {
     }
 }
 
+// A chunk's placeholders also show for the few seconds it is being sent, so
+// the note cannot assume the chunk was interrupted.
+const UNCONFIRMED_NOTE = 'Recipients not confirmed are in a chunk whose result has not been saved. '
+    + 'If it is still sending, this clears within seconds. Otherwise it was interrupted before its result '
+    + 'was saved, so they may or may not have been sent: check the Messaging logs in the Twilio Console '
+    + 'before sending to them again.';
+
+/**
+ * The Message SID column for a classic row. Twilio issued no SID for a send it
+ * refused ("failed-<n>"), and none is known for one whose chunk was cut off
+ * before its result was saved ("unconfirmed-<n>"). Showing those internal keys
+ * in a column headed "Message SID" would read as real identifiers, so say what
+ * happened instead.
+ */
+function classicSidLabel(key) {
+    if (MESSAGE_SID.test(key)) return key;
+    return key.startsWith('unconfirmed-') ? 'not confirmed' : 'not accepted';
+}
+
 function displayMessageDetails(campaign) {
     const messageDetailsContent = document.getElementById('message-details-content');
     if (!messageDetailsContent) return;
@@ -2283,6 +2311,7 @@ function displayMessageDetails(campaign) {
 
     const statuses = campaign.statuses || {};
     const statusEntries = Object.entries(statuses);
+    const unconfirmed = campaign.unconfirmed || 0;
 
     const summary = `
         <div style="margin-bottom: 15px; padding: 12px; background: var(--twilio-gray-50); border-radius: 6px;">
@@ -2292,8 +2321,10 @@ function displayMessageDetails(campaign) {
                 <div><strong>Failed:</strong> <span style="color: var(--twilio-error);">${campaign.failed || 0}</span></div>
                 <div><strong>Delivered:</strong> <span style="color: var(--twilio-success);">${campaign.delivered || 0}</span></div>
                 <div><strong>Read:</strong> ${campaign.read || 0}</div>
+                ${unconfirmed > 0 ? `<div><strong>Not confirmed:</strong> ${unconfirmed}</div>` : ''}
             </div>
         </div>
+        ${unconfirmed > 0 ? `<p class="details-note">${UNCONFIRMED_NOTE}</p>` : ''}
     `;
     const note = campaign.detailsNote ? `<p class="details-note">${campaign.detailsNote}</p>` : '';
     const detailsBlock = renderCampaignDetails(campaign.details);
@@ -2326,7 +2357,7 @@ function displayMessageDetails(campaign) {
 
     const signature = JSON.stringify([
         campaign.campaignId, campaign.sent, campaign.failed, campaign.delivered,
-        campaign.read, campaign.totalMessages, campaign.detailsNote, campaign.details,
+        campaign.read, campaign.unconfirmed, campaign.totalMessages, campaign.detailsNote, campaign.details,
         statusEntries.map(([sid, s]) => [sid, s.status, s.delivered, s.read, s.errorCode, s.dateUpdated]),
     ]);
     if (renderUnchanged('details', signature, Boolean(messageDetailsContent.querySelector('.message-status-scroll')))) {
@@ -2366,16 +2397,11 @@ function displayMessageDetails(campaign) {
         const errorCode = statusInfo.errorCode || '-';
         const errorMessage = (statusInfo.errorMessage || '-').replace(/"/g, '&quot;');
         const to = statusInfo.to || '-';
-        // Rejected sends are keyed "failed-<n>" because Twilio never issued a
-        // SID. Showing that internal key in a column headed "Message SID" would
-        // read as a real identifier, so say what actually happened instead.
         // Bulk identifiers are not classic Twilio SIDs at all, so they always
         // fail MESSAGE_SID — testing them against it would label every
         // successfully delivered bulk message as rejected. Show the bulk
         // identifier as-is instead; the regex only applies to classic rows.
-        const sidLabel = campaign.mode === 'bulk'
-            ? sid
-            : (MESSAGE_SID.test(sid) ? sid : 'not accepted');
+        const sidLabel = campaign.mode === 'bulk' ? sid : classicSidLabel(sid);
 
         const formatDate = (dateValue) => {
             if (!dateValue) return 'N/A';
@@ -2674,7 +2700,7 @@ function exportMessageStatusCsv() {
     // displayMessageDetails for why they must not be tested against MESSAGE_SID.
     const bulk = campaign.mode === 'bulk';
     const rows = entries.map(([sid, s]) => ({
-        'Message SID': bulk ? sid : (MESSAGE_SID.test(sid) ? sid : 'not accepted'),
+        'Message SID': bulk ? sid : classicSidLabel(sid),
         'To': s.to || '',
         'Status': s.status || '',
         'Delivered': s.delivered ? 'Yes' : 'No',
