@@ -6,6 +6,7 @@ const twilio = require('twilio');
 const oauth = require(Runtime.getAssets()['/twilio-oauth.js'].path);
 const campaignDetails = require(Runtime.getAssets()['/campaign-details.js'].path);
 const { templateNames } = require(Runtime.getAssets()['/template-names.js'].path);
+const storage = require(Runtime.getAssets()['/classic-campaign.js'].path);
 
 exports.handler = async function(context, event, callback) {
   const response = new Twilio.Response();
@@ -117,6 +118,9 @@ exports.handler = async function(context, event, callback) {
         read: campaignData.read || read,
         startIndex: campaignData.startIndex || 0,
         isComplete: (campaignData.startIndex || 0) >= (campaignData.totalMessages || 0),
+        // False for older campaigns and for ones whose upload was cut off;
+        // see resume-execution.js.
+        resumable: storage.isFullyStored(campaignData),
         createdAt: campaignData.createdAt,
         lastUpdated: campaignData.lastUpdated,
         campaignName: campaignData.campaignName || null,

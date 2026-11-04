@@ -334,3 +334,18 @@ test('recipients.source is typed when the browser says so, null when it says not
   assert.strictEqual(details.buildDetails({ recipients: { source: 'typed' } }, facts).recipients.source, 'typed');
   assert.strictEqual(details.buildDetails({}, facts).recipients.source, null);
 });
+
+test('resolveDetails reads a bucketed classic campaign from its shared fields', () => {
+  const out = details.resolveDetails({
+    storage: 'buckets',
+    channel: 'whatsapp',
+    from: '+15017122661',
+    totalMessages: 300,
+    shared: { from: '+15017122661', contentSid: HX, contentVariables: { 1: 'Sarah' } },
+    details: details.buildDetails(BULK_INPUT, { mode: 'classic', contentSid: HX, recipientCount: 300 }),
+  });
+  assert.deepStrictEqual(out.template, { sid: HX, name: 'promo_v2', language: 'en' });
+  assert.deepStrictEqual(out.variables, { values: { 1: 'Sarah' }, perRecipient: false });
+  assert.strictEqual(out.recipients.count, 300);
+  assert.strictEqual(details.summaryLine({ channel: 'whatsapp', from: '+1', shared: { contentSid: HX } }).template, HX);
+});
