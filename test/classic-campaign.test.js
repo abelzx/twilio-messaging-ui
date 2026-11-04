@@ -147,3 +147,158 @@ test('isBucketed and isFullyStored tell the Document shapes apart', () => {
   assert.strictEqual(storage.isFullyStored({ statuses: {}, messages: [] }), false);
   assert.strictEqual(storage.isBucketed(null), false);
 });
+
+function syncError(status, code) {
+  return Object.assign(new Error(`Sync ${status}`), { status, code });
+}
+
+/**
+ * Just enough of twilio-node's Sync surface: `syncMaps` and `syncMapItems` are
+ * callable and carry methods, as in the SDK. Map items list in key order.
+ */
+function fakeSync() {
+  const state = { maps: {}, documents: {}, calls: [], failDocumentUpdate: false };
+
+  const itemsOf = (name) => {
+    if (!state.maps[name]) throw syncError(404, 20404);
+    return state.maps[name];
+  };
+
+  const syncMaps = (name) => {
+    const syncMapItems = (key) => ({
+      fetch: async () => {
+        const items = itemsOf(name);
+        if (!(key in items)) throw syncError(404, 20404);
+        return { key, data: items[key] };
+      },
+      update: async ({ data }) => {
+        state.calls.push(['updateItem', name, key]);
+        const items = itemsOf(name);
+        if (!(key in items)) throw syncError(404, 20404);
+        items[key] = data;
+      },
+    });
+    syncMapItems.create = async ({ key, data }) => {
+      state.calls.push(['createItem', name, key]);
+      const items = itemsOf(name);
+      if (key in items) throw syncError(409, 54208);
+      items[key] = data;
+    };
+    syncMapItems.list = async () => {
+      state.calls.push(['listItems', name]);
+      const items = itemsOf(name);
+      return Object.keys(items).sort().map((key) => ({ key, data: items[key] }));
+    };
+    return { syncMapItems };
+  };
+  syncMaps.create = async ({ uniqueName }) => {
+    state.calls.push(['createMap', uniqueName]);
+    if (state.maps[uniqueName]) throw syncError(409, 54301);
+    state.maps[uniqueName] = {};
+  };
+
+  const documents = (name) => ({
+    update: async ({ data }) => {
+      state.calls.push(['updateDocument', name]);
+      if (state.failDocumentUpdate) throw syncError(400, 54006);
+      state.documents[name] = JSON.parse(JSON.stringify(data));
+    },
+  });
+
+  return { client: { syncMaps, documents }, state };
+}
+
+test('createMaps creates the recipients and statuses Maps', async () => {
+  const { client, state } = fakeSync();
+  await storage.createMaps(client, 'campaign_1');
+  assert.deepStrictEqual(Object.keys(state.maps).sort(), ['campaign_1_recipients', 'campaign_1_statuses']);
+});
+
+test('storeRecipients writes a slice under keys counted from its start', async () => {
+  const { client, state } = fakeSync();
+  await storage.createMaps(client, 'campaign_1');
+  const stored = await storage.storeRecipients(client, 'campaign_1', messages(300), {
+    startIndex: 1024, shared: { from: FROM }, deadline: Infinity,
+  });
+  assert.strictEqual(stored, 1324);
+  assert.deepStrictEqual(Object.keys(state.maps.campaign_1_recipients), ['0001024', '0001152', '0001280']);
+  assert.deepStrictEqual(state.maps.campaign_1_recipients['0001280'].recipients[0], { to: '+15550000256' });
+});
+
+test('storeRecipients stops at the deadline, after at least one batch', async () => {
+  const { client, state } = fakeSync();
+  await storage.createMaps(client, 'campaign_1');
+  const stored = await storage.storeRecipients(client, 'campaign_1', messages(2000), {
+    startIndex: 0, shared: { from: FROM }, deadline: 0, now: () => 1,
+  });
+  assert.strictEqual(stored, storage.WRITE_CONCURRENCY * 128);
+  assert.strictEqual(Object.keys(state.maps.campaign_1_recipients).length, storage.WRITE_CONCURRENCY);
+});
+
+test('storeRecipients overwrites buckets a retried slice already wrote', async () => {
+  const { client, state } = fakeSync();
+  await storage.createMaps(client, 'campaign_1');
+  const slice = messages(200);
+  const options = { startIndex: 0, shared: { from: FROM }, deadline: Infinity };
+  await storage.storeRecipients(client, 'campaign_1', slice, options);
+  assert.strictEqual(await storage.storeRecipients(client, 'campaign_1', slice, options), 200);
+  assert.strictEqual(Object.keys(state.maps.campaign_1_recipients).length, 2);
+});
+
+test('readRecipientBucket returns the bucket starting at a key, or null', async () => {
+  const { client } = fakeSync();
+  await storage.createMaps(client, 'campaign_1');
+  await storage.storeRecipients(client, 'campaign_1', messages(200), {
+    startIndex: 0, shared: { from: FROM }, deadline: Infinity,
+  });
+  const bucket = await storage.readRecipientBucket(client, 'campaign_1', 128);
+  assert.strictEqual(bucket.start, 128);
+  assert.strictEqual(bucket.recipients.length, 72);
+  assert.strictEqual(await storage.readRecipientBucket(client, 'campaign_1', 100), null);
+});
+
+test('writeStatusBucket merges into a bucket a re-sent chunk already wrote', async () => {
+  const { client, state } = fakeSync();
+  await storage.createMaps(client, 'campaign_1');
+  await storage.writeStatusBucket(client, 'campaign_1', 32, { a: { status: 'queued' } });
+  await storage.writeStatusBucket(client, 'campaign_1', 32, { b: { status: 'queued' } });
+  assert.deepStrictEqual(state.maps.campaign_1_statuses['0000032'], {
+    statuses: { a: { status: 'queued' }, b: { status: 'queued' } },
+  });
+});
+
+test('readStatusBuckets returns every bucket in send order, or [] with no Map', async () => {
+  const { client } = fakeSync();
+  assert.deepStrictEqual(await storage.readStatusBuckets(client, 'campaign_1'), []);
+  await storage.createMaps(client, 'campaign_1');
+  await storage.writeStatusBucket(client, 'campaign_1', 32, { b: { status: 'sent' } });
+  await storage.writeStatusBucket(client, 'campaign_1', 0, { a: { status: 'sent' } });
+  assert.deepStrictEqual(await storage.readStatusBuckets(client, 'campaign_1'), [
+    { key: '0000000', statuses: { a: { status: 'sent' } }, checkedAt: null },
+    { key: '0000032', statuses: { b: { status: 'sent' } }, checkedAt: null },
+  ]);
+});
+
+test('updateStatusBucket replaces one bucket and records when it was checked', async () => {
+  const { client, state } = fakeSync();
+  await storage.createMaps(client, 'campaign_1');
+  await storage.writeStatusBucket(client, 'campaign_1', 0, { a: { status: 'sent' } });
+  await storage.updateStatusBucket(client, 'campaign_1', '0000000', { a: { status: 'delivered' } }, 'T1');
+  assert.deepStrictEqual(state.maps.campaign_1_statuses['0000000'], {
+    statuses: { a: { status: 'delivered' } }, checkedAt: 'T1',
+  });
+});
+
+test('inBatches never runs more than the limit at once and keeps order', async () => {
+  let running = 0;
+  let peak = 0;
+  const tasks = Array.from({ length: 20 }, (_, i) => async () => {
+    running++;
+    peak = Math.max(peak, running);
+    await new Promise((resolve) => setImmediate(resolve));
+    running--;
+    return i;
+  });
+  assert.deepStrictEqual(await storage.inBatches(tasks, 8), Array.from({ length: 20 }, (_, i) => i));
+  assert.strictEqual(peak, 8);
+});

@@ -64,9 +64,15 @@ const SHARED_MAX_BYTES = 4 * 1024;
 const WRITE_CONCURRENCY = 8;
 
 const KEY_DIGITS = 7;
+const NOT_FOUND = 20404;
+const ITEM_EXISTS = 54208;
 
 function byteSize(value) {
   return Buffer.byteLength(JSON.stringify(value), 'utf8');
+}
+
+function isNotFound(error) {
+  return Boolean(error) && (error.status === 404 || error.code === NOT_FOUND);
 }
 
 const EMPTY_BUCKET_BYTES = byteSize({ recipients: [] });
@@ -215,6 +221,108 @@ function newCampaignData({ ownerKey, accountSid, totalMessages, shared, channel,
   };
 }
 
+/** Runs `tasks` (functions returning promises) at most `limit` at a time. */
+async function inBatches(tasks, limit = WRITE_CONCURRENCY) {
+  const results = [];
+  for (let i = 0; i < tasks.length; i += limit) {
+    results.push(...(await Promise.all(tasks.slice(i, i + limit).map((task) => task()))));
+  }
+  return results;
+}
+
+/** Creates an item, or overwrites it when the key is already taken. */
+async function putItem(items, key, data) {
+  try {
+    await items.create({ key, data });
+  } catch (error) {
+    if (error.code !== ITEM_EXISTS) throw error;
+    await items(key).update({ data });
+  }
+}
+
+async function createMaps(syncClient, campaignId) {
+  await syncClient.syncMaps.create({ uniqueName: recipientsMapName(campaignId) });
+  await syncClient.syncMaps.create({ uniqueName: statusesMapName(campaignId) });
+}
+
+/**
+ * Stores one upload slice, starting at `startIndex`, packed against the
+ * campaign's `shared` fields. Buckets are written in order, WRITE_CONCURRENCY
+ * at a time. Once `deadline` passes no further batch starts, but the first
+ * always does, so every call makes progress. Resolves to how many recipients
+ * are now stored; the caller sends the next slice from there.
+ */
+async function storeRecipients(syncClient, campaignId, messages, { startIndex, shared, deadline, now = Date.now }) {
+  const { buckets } = packRecipients(messages, { shared, startIndex });
+  const items = syncClient.syncMaps(recipientsMapName(campaignId)).syncMapItems;
+  let stored = startIndex;
+
+  for (let i = 0; i < buckets.length; i += WRITE_CONCURRENCY) {
+    if (i > 0 && now() >= deadline) break;
+    const batch = buckets.slice(i, i + WRITE_CONCURRENCY);
+    await Promise.all(batch.map((bucket) =>
+      putItem(items, bucketKey(bucket.start), { recipients: bucket.recipients })));
+    const last = batch[batch.length - 1];
+    stored = last.start + last.recipients.length;
+  }
+
+  return stored;
+}
+
+/** The recipient bucket keyed `start`, or null when no bucket starts there. */
+async function readRecipientBucket(syncClient, campaignId, start) {
+  try {
+    const item = await syncClient.syncMaps(recipientsMapName(campaignId)).syncMapItems(bucketKey(start)).fetch();
+    return { start, recipients: (item.data && item.data.recipients) || [] };
+  } catch (error) {
+    if (isNotFound(error)) return null;
+    throw error;
+  }
+}
+
+/**
+ * Records one status bucket's send results. The key normally does not exist
+ * yet. It does when a chunk is sent a second time, and then the new entries are
+ * merged in, so the first send's SIDs stay on record beside the second's.
+ */
+async function writeStatusBucket(syncClient, campaignId, start, statuses) {
+  const items = syncClient.syncMaps(statusesMapName(campaignId)).syncMapItems;
+  const key = bucketKey(start);
+  try {
+    await items.create({ key, data: { statuses } });
+  } catch (error) {
+    if (error.code !== ITEM_EXISTS) throw error;
+    const existing = await items(key).fetch();
+    const before = (existing.data && existing.data.statuses) || {};
+    await items(key).update({ data: { statuses: { ...before, ...statuses } } });
+  }
+}
+
+/**
+ * Every status bucket in send order, or [] when the Map is missing. A bucket
+ * not yet refreshed by check-status.js has a null `checkedAt`.
+ */
+async function readStatusBuckets(syncClient, campaignId) {
+  let items;
+  try {
+    items = await syncClient.syncMaps(statusesMapName(campaignId)).syncMapItems.list({ pageSize: 100 });
+  } catch (error) {
+    if (isNotFound(error)) return [];
+    throw error;
+  }
+  return items.map((item) => ({
+    key: item.key,
+    statuses: (item.data && item.data.statuses) || {},
+    checkedAt: (item.data && item.data.checkedAt) || null,
+  }));
+}
+
+async function updateStatusBucket(syncClient, campaignId, key, statuses, checkedAt) {
+  await syncClient.syncMaps(statusesMapName(campaignId)).syncMapItems(key).update({
+    data: { statuses, checkedAt },
+  });
+}
+
 module.exports = {
   STORAGE,
   RECIPIENT_BUCKET_MAX_ENTRIES,
@@ -232,4 +340,11 @@ module.exports = {
   unpackRecipient,
   statusEntries,
   newCampaignData,
+  inBatches,
+  createMaps,
+  storeRecipients,
+  readRecipientBucket,
+  writeStatusBucket,
+  readStatusBuckets,
+  updateStatusBucket,
 };
