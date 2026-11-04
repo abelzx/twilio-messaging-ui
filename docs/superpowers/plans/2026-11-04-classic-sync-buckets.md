@@ -2882,7 +2882,7 @@ for m in recipients statuses; do
 done
 ```
 
-Expected: `recipients 79`, `statuses 313`
+Expected: about 79–80 recipient items and 313–314 status items (one more of each per upload-slice boundary)
 
 - [ ] **Step 7: 10,000 recipients with their own bodies (no messages sent)**
 
@@ -2891,7 +2891,7 @@ node -e "const r=['Number,Body'];for(let i=0;i<10000;i++)r.push('+999'+String(i)
 ```
 
 Upload and send.
-Expected: several `send-messages` calls before sending starts, each request under 1 MB; no 500; the campaign completes. The recipients Map holds about 300 items. If a call fails with a Sync 429 after retries, or overruns 10 s, lower `WRITE_CONCURRENCY` or `STORE_DEADLINE_MS` and repeat.
+Expected: several `send-messages` calls before sending starts, each request under 1 MB; no 500; the campaign completes. The recipients Map holds about 300 items. With claims, each chunk writes the statuses Map twice: once to claim its status items before sending, and once to replace their placeholders with the results. If a call fails with a Sync 429 after retries, or overruns 10 s, lower `WRITE_CONCURRENCY` or `STORE_DEADLINE_MS` and repeat.
 
 - [ ] **Step 8: Real delivery (sends real messages — use numbers the user provides)**
 
