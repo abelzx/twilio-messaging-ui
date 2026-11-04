@@ -17,6 +17,9 @@ let currentCampaignId = null;
 // opened while the toggle reads "classic" must still be polled as bulk, or its
 // auto-refresh timer would call check-status and get a 409 every 5 seconds.
 let currentCampaignMode = 'classic';
+// The classic campaign this tab is sending or resuming, if any. The campaign
+// list offers no Resume button for it while the send is running.
+let activeSendCampaignId = null;
 let resumeInterval = null;
 let statusRefreshInterval = null;
 // Content templates loaded for the current channel (full objects from the API)
@@ -1434,6 +1437,14 @@ async function handleSendMessages(e) {
     }
 }
 
+/**
+ * Why a failed upload call cannot be retried blindly: it carried the last
+ * slice, so the server may have stored it and started sending.
+ */
+const UPLOAD_MAY_HAVE_SENT = 'The request failed after the recipient list may have been fully uploaded, '
+    + 'so sending may have started. If the campaign shows a Resume button, resume it. If it shows as '
+    + 'Complete, it was sent. Otherwise nothing was sent, and it can be sent again.';
+
 /** A Function's error, with the underlying cause when it sent one. */
 function functionError(data, fallback) {
     const error = (data && data.error) || fallback;
@@ -1502,67 +1513,91 @@ async function continueCampaign(campaignId, resumeFrom) {
  * Nothing is sent until the whole list is stored.
  */
 async function sendMessagesBatch(messages, channel, from, campaignName, details) {
-    let storedCount = 0;
-    let data = null;
+    // Captured once: opening another campaign mid-send moves currentCampaignId.
+    const campaignId = currentCampaignId;
+    activeSendCampaignId = campaignId;
+    try {
+        let storedCount = 0;
+        let data = null;
 
-    while (storedCount < messages.length) {
-        const end = uploadSliceEnd(messages, storedCount, UPLOAD_MAX_BYTES);
-        const response = await postToFunction('send-messages', {
-            messages: messages.slice(storedCount, end),
-            offset: storedCount,
-            totalMessages: messages.length,
-            campaignId: currentCampaignId,
-            channel,
-            from,
-            campaignName: campaignName || null,
-            // Stored only when the first slice creates the campaign.
-            ...(storedCount === 0 ? { details } : {})
-        });
-        data = await response.json();
+        while (storedCount < messages.length) {
+            const end = uploadSliceEnd(messages, storedCount, UPLOAD_MAX_BYTES);
+            let response = null;
+            data = null;
+            try {
+                response = await postToFunction('send-messages', {
+                    messages: messages.slice(storedCount, end),
+                    offset: storedCount,
+                    totalMessages: messages.length,
+                    campaignId,
+                    channel,
+                    from,
+                    campaignName: campaignName || null,
+                    // Stored only when the first slice creates the campaign.
+                    ...(storedCount === 0 ? { details } : {})
+                });
+                data = await response.json();
+            } catch (error) {
+                // A gateway timeout or a dropped connection has no JSON body.
+                console.error('send-messages call failed:', error);
+            }
 
-        if (!response.ok) {
-            // Nothing has been sent yet unless the list was complete, in which
-            // case the refreshed list offers to resume it.
-            loadCampaigns();
-            throw new Error(functionError(data, 'Failed to send messages'));
+            if (!data || !response.ok) {
+                const status = response ? `HTTP ${response.status}` : 'no response';
+                const reason = functionError(data, `Failed to send messages (${status})`);
+                // This tab has stopped sending, so the list may offer Resume.
+                activeSendCampaignId = null;
+                await loadCampaigns();
+                // Only the call carrying the last slice can start sending: the
+                // loop ends once a response reports the whole list stored. It
+                // may have stored the slice and sent before failing.
+                if (end === messages.length) {
+                    throw new Error(`${UPLOAD_MAY_HAVE_SENT} (${reason})`);
+                }
+                throw new Error(reason);
+            }
+            if (!(data.storedCount > storedCount)) {
+                throw new Error('Failed to send messages (the recipient list stopped uploading)');
+            }
+
+            storedCount = data.storedCount;
+            await refreshCurrentCampaign();
         }
-        if (!(data.storedCount > storedCount)) {
-            throw new Error('Failed to send messages (the recipient list stopped uploading)');
+
+        let checkpointFailed = Boolean(data.checkpointFailed);
+
+        if (!data.isComplete) {
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            try {
+                checkpointFailed = (await continueCampaign(campaignId, data.resumeFrom)) || checkpointFailed;
+            } catch (error) {
+                console.error('Error sending messages:', error);
+
+                // Show error but allow manual resume. This tab has stopped
+                // sending, so the list it reloads offers Resume.
+                activeSendCampaignId = null;
+                showResumeOption();
+                throw error;
+            }
+        } else if (checkpointFailed) {
+            await saveReachedIndex(campaignId, data.resumeFrom);
         }
 
-        storedCount = data.storedCount;
+        if (checkpointFailed) alert(CHECKPOINT_WARNING);
+
+        // Final status check
         await refreshCurrentCampaign();
+
+        // Reload campaigns list
+        await loadCampaigns();
+
+        // Start auto-refresh
+        startStatusAutoRefresh();
+
+        setSendingState(false);
+    } finally {
+        activeSendCampaignId = null;
     }
-
-    let checkpointFailed = Boolean(data.checkpointFailed);
-
-    if (!data.isComplete) {
-        await new Promise(resolve => setTimeout(resolve, 1000));
-        try {
-            checkpointFailed = (await continueCampaign(currentCampaignId, data.resumeFrom)) || checkpointFailed;
-        } catch (error) {
-            console.error('Error sending messages:', error);
-
-            // Show error but allow manual resume
-            showResumeOption();
-            throw error;
-        }
-    } else if (checkpointFailed) {
-        await saveReachedIndex(currentCampaignId, data.resumeFrom);
-    }
-
-    if (checkpointFailed) alert(CHECKPOINT_WARNING);
-
-    // Final status check
-    await refreshCurrentCampaign();
-
-    // Reload campaigns list
-    await loadCampaigns();
-
-    // Start auto-refresh
-    startStatusAutoRefresh();
-
-    setSendingState(false);
 }
 
 /**
@@ -1861,6 +1896,7 @@ async function resumeCampaignById(campaignId, event) {
         // server reads the recipients from Sync, so nothing is fetched first.
         currentCampaignId = campaignId;
         currentCampaignMode = 'classic';
+        activeSendCampaignId = campaignId;
 
         const checkpointFailed = await continueCampaign(campaignId);
         if (checkpointFailed) alert(CHECKPOINT_WARNING);
@@ -1874,6 +1910,7 @@ async function resumeCampaignById(campaignId, event) {
         console.error('Error resuming campaign:', error);
         alert('Error resuming campaign: ' + error.message);
     } finally {
+        activeSendCampaignId = null;
         // Restore button state
         if (resumeBtn) {
             resumeBtn.disabled = false;
@@ -2044,6 +2081,7 @@ function displayCampaigns(campaigns) {
 
     const signature = JSON.stringify([
         currentCampaignId,
+        activeSendCampaignId,
         campaigns.map((c) => [
             c.campaignId, c.campaignName, c.totalMessages, c.sent, c.failed,
             c.delivered, c.read, c.startIndex, c.isComplete, c.lastUpdated,
@@ -2092,8 +2130,10 @@ function displayCampaigns(campaigns) {
         // recipient list is stored to resume from. An operation continues on its
         // own or has already finished. Nor can classic campaigns saved in the
         // older format, or whose upload was cut off; see resume-execution.js.
+        // Nor is one this tab is already sending.
         const canResume = campaign.mode !== 'bulk' && campaign.resumable !== false
-            && !campaign.isComplete && campaign.startIndex < campaign.totalMessages;
+            && !campaign.isComplete && campaign.startIndex < campaign.totalMessages
+            && campaign.campaignId !== activeSendCampaignId;
 
         // Use campaign name if available, otherwise fall back to formatted timestamp
         const displayName = campaign.campaignName ||
