@@ -2282,23 +2282,22 @@ async function fetchAndDisplayCampaignDetails(campaignId, mode) {
     }
 }
 
-// A chunk's placeholders also show for the few seconds it is being sent, so
-// the note cannot assume the chunk was interrupted.
-const UNCONFIRMED_NOTE = 'Recipients not confirmed are in a chunk whose result has not been saved. '
-    + 'If it is still sending, this clears within seconds. Otherwise it was interrupted before its result '
-    + 'was saved, so they may or may not have been sent: check the Messaging logs in the Twilio Console '
+const UNCONFIRMED_NOTE = 'Recipients not confirmed were in a chunk that was interrupted before its result '
+    + 'was saved, so they may or may not have been sent. Check the Messaging logs in the Twilio Console '
     + 'before sending to them again.';
 
 /**
  * The Message SID column for a classic row. Twilio issued no SID for a send it
- * refused ("failed-<n>"), and none is known for one whose chunk was cut off
- * before its result was saved ("unconfirmed-<n>"). Showing those internal keys
- * in a column headed "Message SID" would read as real identifiers, so say what
- * happened instead.
+ * refused ("failed-<n>"), and none is known yet for a recipient whose chunk is
+ * being sent, or was cut off before its result was saved ("unconfirmed-<n>",
+ * which check-status reports as `sending` or `unconfirmed`). Showing those
+ * internal keys in a column headed "Message SID" would read as real
+ * identifiers, so say what happened instead.
  */
-function classicSidLabel(key) {
+function classicSidLabel(key, entry) {
     if (MESSAGE_SID.test(key)) return key;
-    return key.startsWith('unconfirmed-') ? 'not confirmed' : 'not accepted';
+    if (!key.startsWith('unconfirmed-')) return 'not accepted';
+    return entry.status === 'sending' ? 'sending' : 'not confirmed';
 }
 
 /** A row's status. A placeholder is stored with only `to`: its key says what it is. */
@@ -2407,7 +2406,7 @@ function displayMessageDetails(campaign) {
         // fail MESSAGE_SID — testing them against it would label every
         // successfully delivered bulk message as rejected. Show the bulk
         // identifier as-is instead; the regex only applies to classic rows.
-        const sidLabel = campaign.mode === 'bulk' ? sid : classicSidLabel(sid);
+        const sidLabel = campaign.mode === 'bulk' ? sid : classicSidLabel(sid, statusInfo);
 
         const formatDate = (dateValue) => {
             if (!dateValue) return 'N/A';
@@ -2706,7 +2705,7 @@ function exportMessageStatusCsv() {
     // displayMessageDetails for why they must not be tested against MESSAGE_SID.
     const bulk = campaign.mode === 'bulk';
     const rows = entries.map(([sid, s]) => ({
-        'Message SID': bulk ? sid : classicSidLabel(sid),
+        'Message SID': bulk ? sid : classicSidLabel(sid, s),
         'To': s.to || '',
         'Status': rowStatus(sid, s),
         'Delivered': s.delivered ? 'Yes' : 'No',

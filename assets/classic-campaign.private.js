@@ -364,8 +364,9 @@ async function recordChunk(syncClient, campaignId, chunkStart, results, sentAt) 
 
 /**
  * Every status bucket in send order, or [] when the Map is missing. A bucket
- * not yet refreshed by check-status.js has a null `checkedAt`. `revision`
- * lets updateStatusBucket write only over the bucket as it was read.
+ * not yet refreshed by check-status.js has a null `checkedAt`; only a claim not
+ * yet replaced has a `claimedAt`. `revision` lets updateStatusBucket write only
+ * over the bucket as it was read.
  */
 async function readStatusBuckets(syncClient, campaignId) {
   let items;
@@ -379,6 +380,7 @@ async function readStatusBuckets(syncClient, campaignId) {
     key: item.key,
     statuses: (item.data && item.data.statuses) || {},
     checkedAt: (item.data && item.data.checkedAt) || null,
+    claimedAt: (item.data && item.data.claimedAt) || null,
     revision: item.revision,
   }));
 }

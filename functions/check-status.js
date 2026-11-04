@@ -123,7 +123,15 @@ exports.handler = async function(context, event, callback) {
     const updates = classicMessages.bucketUpdates(selected, refreshed, {
       channel: campaignData.channel, takingTurns, checkedAt,
     });
-    const statuses = Object.assign({}, ...buckets.map((bucket) => bucket.statuses), refreshed.statuses);
+    const refreshedStatuses = new Map(updates.map((update) => [update.key, update.statuses]));
+    const current = buckets.map((bucket) => refreshedStatuses.get(bucket.key) || bucket.statuses);
+
+    // A claim's placeholders read as sending while it is young, then as not
+    // confirmed. That status is for the response and counters only: it is
+    // never written back.
+    const now = Date.now();
+    const statuses = Object.assign({}, ...current.map((bucketStatuses, i) =>
+      classicMessages.placeholderStatuses(bucketStatuses, buckets[i].claimedAt, now)));
 
     if (bucketed) {
       // Each write is conditional on the revision read above. A 412 means a
@@ -140,7 +148,7 @@ exports.handler = async function(context, event, callback) {
         }
       });
     } else {
-      campaignData.statuses = statuses;
+      campaignData.statuses = current[0];
     }
 
     campaignData.lastUpdated = checkedAt;

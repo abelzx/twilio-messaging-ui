@@ -27,6 +27,12 @@ const MESSAGING_SERVICE_SID = /^MG[0-9a-f]{32}$/i;
  */
 const PLACEHOLDER_PREFIX = 'unconfirmed-';
 
+/**
+ * How long a claim's placeholders read as still sending. A Function runs for
+ * at most 10 seconds, so after this no sender is left to replace them.
+ */
+const CLAIM_SENDING_MS = 15000;
+
 /** Statuses that never change again. */
 const FINAL = new Set(['failed', 'undelivered', 'canceled', 'read']);
 
@@ -301,11 +307,30 @@ function bucketUpdates(selected, { statuses, changed, fetched }, { channel, taki
 }
 
 /**
+ * One bucket's statuses with each placeholder given the status it is reported
+ * with: `sending` while the bucket's claim is under CLAIM_SENDING_MS old, else
+ * `unconfirmed`. A claim replaced after its send, keeping the placeholders of a
+ * bucket it could not write, has no `claimedAt`, so those are unconfirmed.
+ * Returns a new map, for the response only: placeholders are stored as `{ to }`.
+ */
+function placeholderStatuses(statuses, claimedAt, now = Date.now()) {
+  const sending = Boolean(claimedAt) && now - Date.parse(claimedAt) < CLAIM_SENDING_MS;
+  const next = {};
+  for (const [key, entry] of Object.entries(statuses)) {
+    next[key] = key.startsWith(PLACEHOLDER_PREFIX)
+      ? { ...entry, status: sending ? 'sending' : 'unconfirmed' }
+      : entry;
+  }
+  return next;
+}
+
+/**
  * The derived counters. This is the only place that counts per-message
  * status, so a badge and a counter cannot disagree. `sent` is every send
  * Twilio accepted; `failed` includes the sends it refused; `pending` is
- * accepted and not yet delivered or failed; `unconfirmed` is the recipients of
- * a chunk whose results were never saved (see classic-campaign.private.js).
+ * accepted and not yet delivered or failed, or still being sent; `unconfirmed`
+ * is the recipients of a chunk whose results were never saved (see
+ * classic-campaign.private.js).
  */
 function tally(statuses) {
   const counts = { sent: 0, delivered: 0, read: 0, failed: 0, pending: 0, unconfirmed: 0 };
@@ -317,6 +342,7 @@ function tally(statuses) {
     if (entry.read || status === 'read') counts.read++;
     if (isFailed) counts.failed++;
     if (status === 'unconfirmed') counts.unconfirmed++;
+    if (status === 'sending') counts.pending++;
     if (MESSAGE_SID.test(key)) {
       counts.sent++;
       if (!isDelivered && !isFailed) counts.pending++;
@@ -334,5 +360,6 @@ module.exports = {
   selectRefreshBuckets,
   refreshStatuses,
   bucketUpdates,
+  placeholderStatuses,
   tally,
 };

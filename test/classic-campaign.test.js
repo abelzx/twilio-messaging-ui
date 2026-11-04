@@ -391,9 +391,11 @@ test('readStatusBuckets returns every bucket in send order, or [] with no Map', 
   await storage.createMaps(client, 'campaign_1');
   await putStatuses(client, '0000032', { b: { status: 'sent' } });
   await putStatuses(client, '0000000', { a: { status: 'sent' } });
+  await storage.claimChunk(client, 'campaign_1', 128, [{ to: '+1' }], 'T0');
   assert.deepStrictEqual(await storage.readStatusBuckets(client, 'campaign_1'), [
-    { key: '0000000', statuses: { a: { status: 'sent' } }, checkedAt: null, revision: '1' },
-    { key: '0000032', statuses: { b: { status: 'sent' } }, checkedAt: null, revision: '1' },
+    { key: '0000000', statuses: { a: { status: 'sent' } }, checkedAt: null, claimedAt: null, revision: '1' },
+    { key: '0000032', statuses: { b: { status: 'sent' } }, checkedAt: null, claimedAt: null, revision: '1' },
+    { key: '0000128', statuses: { 'unconfirmed-128': { to: '+1' } }, checkedAt: null, claimedAt: 'T0', revision: '1' },
   ]);
 });
 

@@ -311,6 +311,18 @@ test('a failed fetch records at most FETCH_ERROR_MAX_CHARS of why', async () => 
   assert.strictEqual(statuses[sid(1)].error, message.slice(0, 64));
 });
 
+test('placeholderStatuses reports a claim under 15 s old as sending, and an older one as unconfirmed', () => {
+  const statuses = { [sid(1)]: { status: 'queued' }, 'unconfirmed-1': { to: '+1' } };
+  const claimedAt = '2026-11-04T00:00:00.000Z';
+  const at = (ms) => classicMessages.placeholderStatuses(statuses, claimedAt, Date.parse(claimedAt) + ms);
+  assert.deepStrictEqual(at(14999)['unconfirmed-1'], { to: '+1', status: 'sending' });
+  assert.deepStrictEqual(at(15000)['unconfirmed-1'], { to: '+1', status: 'unconfirmed' });
+  assert.strictEqual(at(0)[sid(1)], statuses[sid(1)]);
+  // A claim replaced after its send, keeping a bucket's placeholders, has no claimedAt.
+  assert.deepStrictEqual(classicMessages.placeholderStatuses(statuses, null, 0)['unconfirmed-1'], { to: '+1', status: 'unconfirmed' });
+  assert.deepStrictEqual(statuses['unconfirmed-1'], { to: '+1' });
+});
+
 test('tally counts from the statuses, including refusals and recipients not confirmed', () => {
   assert.deepStrictEqual(classicMessages.tally({
     [sid(1)]: { status: 'delivered' },
@@ -324,5 +336,7 @@ test('tally counts from the statuses, including refusals and recipients not conf
     // A placeholder as stored carries only `to`; its key says what it is.
     'unconfirmed-9': { to: '+9' },
     'unconfirmed-10': { status: 'unconfirmed', to: '+10' },
-  }), { sent: 7, delivered: 3, read: 1, failed: 3, pending: 2, unconfirmed: 2 });
+    // Still being sent: pending, not yet unconfirmed.
+    'unconfirmed-11': { status: 'sending', to: '+11' },
+  }), { sent: 7, delivered: 3, read: 1, failed: 3, pending: 3, unconfirmed: 2 });
 });
