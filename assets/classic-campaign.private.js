@@ -420,7 +420,6 @@ async function runChunks({ syncClient, campaignId, campaignData, startIndex, dea
   const shared = campaignData.shared || {};
   let currentIndex = startIndex;
   let results = [];
-  let chunks = 0;
   let checkpointFailed = false;
 
   while (currentIndex < campaignData.totalMessages && now() < deadline) {
@@ -434,9 +433,9 @@ async function runChunks({ syncClient, campaignId, campaignData, startIndex, dea
       }
       claimed = await claimChunk(syncClient, campaignId, chunkStart, bucket.recipients, new Date(now()).toISOString());
     } catch (error) {
-      if (!chunks) throw error;
-      // The chunks already sent are checkpointed, and the next call meets the
-      // same error before it sends anything.
+      if (currentIndex === startIndex) throw error;
+      // This call has sent or skipped chunks, and its progress is saved below or
+      // already checkpointed. The next call meets the same error at once.
       console.error(`Could not read or claim recipients for ${campaignId} at index ${chunkStart}:`, error);
       break;
     }
@@ -445,7 +444,6 @@ async function runChunks({ syncClient, campaignId, campaignData, startIndex, dea
     if (!claimed) continue;
 
     results = await send(bucket.recipients.map((entry) => unpackRecipient(entry, shared)), chunkStart);
-    chunks++;
 
     const accepted = results.filter((result) => result.success).length;
     campaignData.sent = (campaignData.sent || 0) + accepted;

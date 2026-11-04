@@ -630,6 +630,20 @@ test('chunks skipped after the last one sent still move the stored index', async
   assert.strictEqual(state.documents.campaign_1.startIndex, 200);
 });
 
+test('a bucket read failing after a skipped chunk ends the call and saves the index past it', async (t) => {
+  t.mock.method(console, 'error', () => {});
+  const { client, state, campaignData } = await storedCampaign(200);
+  await putStatuses(client, '0000000', {});
+  delete state.maps.campaign_1_recipients['0000128'];
+  const { send, chunks } = fakeSend();
+  const outcome = await storage.runChunks({
+    syncClient: client, campaignId: 'campaign_1', campaignData, startIndex: 0, deadline: Infinity, send,
+  });
+  assert.strictEqual(chunks.length, 0);
+  assert.strictEqual(outcome.resumeFrom, 128);
+  assert.strictEqual(state.documents.campaign_1.startIndex, 128);
+});
+
 test('a failed claim rejects before any send, and after one ends the call with its progress', async (t) => {
   t.mock.method(console, 'error', () => {});
   const first = await storedCampaign(200);
