@@ -20,6 +20,13 @@
 const MESSAGE_SID = /^[A-Z]{2}[0-9a-f]{32}$/i;
 const MESSAGING_SERVICE_SID = /^MG[0-9a-f]{32}$/i;
 
+/**
+ * Keys a recipient whose chunk was claimed but whose result was never saved
+ * (see claimChunk in classic-campaign.private.js). Such an entry holds only
+ * `to`: its status is implied by the key.
+ */
+const PLACEHOLDER_PREFIX = 'unconfirmed-';
+
 /** Statuses that never change again. */
 const FINAL = new Set(['failed', 'undelivered', 'canceled', 'read']);
 
@@ -188,6 +195,12 @@ async function sendChunk(client, messages, {
   return results;
 }
 
+/** An entry's status, lower-cased, with a placeholder's implied by its key. */
+function statusOf(key, entry) {
+  if (entry && entry.status) return String(entry.status).toLowerCase();
+  return key.startsWith(PLACEHOLDER_PREFIX) ? 'unconfirmed' : '';
+}
+
 function isFinal(entry, channel) {
   const status = String((entry && entry.status) || '').toLowerCase();
   if (FINAL.has(status)) return true;
@@ -294,7 +307,7 @@ function bucketUpdates(selected, { statuses, changed, fetched }, { channel, taki
 function tally(statuses) {
   const counts = { sent: 0, delivered: 0, read: 0, failed: 0, pending: 0, unconfirmed: 0 };
   for (const [key, entry] of Object.entries(statuses)) {
-    const status = String(entry.status || '').toLowerCase();
+    const status = statusOf(key, entry);
     const isDelivered = Boolean(entry.delivered) || status === 'delivered' || status === 'read';
     const isFailed = TERMINAL_FAILURE.has(status);
     if (isDelivered) counts.delivered++;

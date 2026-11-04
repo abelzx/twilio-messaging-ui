@@ -315,7 +315,8 @@ test('tally counts from the statuses, including refusals and recipients not conf
     [sid(6)]: { status: 'queued' },
     [sid(7)]: { status: 'sent' },
     'failed-8': { status: 'failed' },
-    'unconfirmed-9': { status: 'unconfirmed', to: '+9' },
+    // A placeholder as stored carries only `to`; its key says what it is.
+    'unconfirmed-9': { to: '+9' },
     'unconfirmed-10': { status: 'unconfirmed', to: '+10' },
   }), { sent: 7, delivered: 3, read: 1, failed: 3, pending: 2, unconfirmed: 2 });
 });

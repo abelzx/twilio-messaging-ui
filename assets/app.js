@@ -2301,6 +2301,12 @@ function classicSidLabel(key) {
     return key.startsWith('unconfirmed-') ? 'not confirmed' : 'not accepted';
 }
 
+/** A row's status. A placeholder is stored with only `to`: its key says what it is. */
+function rowStatus(key, entry) {
+    if (entry.status) return entry.status;
+    return key.startsWith('unconfirmed-') ? 'unconfirmed' : '';
+}
+
 function displayMessageDetails(campaign) {
     const messageDetailsContent = document.getElementById('message-details-content');
     if (!messageDetailsContent) return;
@@ -2384,7 +2390,7 @@ function displayMessageDetails(campaign) {
     `;
 
     statusEntries.forEach(([sid, statusInfo]) => {
-        const status = statusInfo.status || 'unknown';
+        const status = rowStatus(sid, statusInfo) || 'unknown';
         const statusClass = status === 'delivered' || status === 'read' ? 'success' : 
                            status === 'failed' || status === 'undelivered' ? 'failed' : 'pending';
         
@@ -2702,7 +2708,7 @@ function exportMessageStatusCsv() {
     const rows = entries.map(([sid, s]) => ({
         'Message SID': bulk ? sid : classicSidLabel(sid),
         'To': s.to || '',
-        'Status': s.status || '',
+        'Status': rowStatus(sid, s),
         'Delivered': s.delivered ? 'Yes' : 'No',
         'Read': s.read ? 'Yes' : 'No',
         'Error Code': s.errorCode == null ? '' : s.errorCode,

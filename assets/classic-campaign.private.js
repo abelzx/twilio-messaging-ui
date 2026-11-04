@@ -14,6 +14,7 @@
  *   campaign_<id>             Document  owner, counters, storedCount, startIndex, shared fields
  *   campaign_<id>_recipients  Map       key -> { recipients: [...] }      up to 128 recipients
  *   campaign_<id>_statuses    Map       key -> { statuses, checkedAt }    up to 32 statuses
+ *                                       (a claim: { statuses, claimedAt }, up to 128 placeholders)
  *
  * A key is the index of the first recipient its item covers, zero-padded so
  * that Sync's ascending key order is send order. A chunk is one recipient
@@ -21,13 +22,15 @@
  * go in status buckets keyed at its start, start + 32, start + 64 and
  * start + 96, so no status bucket is written by two chunks.
  *
- * A chunk is claimed before it is sent, by creating its status buckets with an
- * `unconfirmed-<index>` placeholder per recipient. Sync refuses to create a key
- * twice, so only one sender can claim a chunk, and a chunk already claimed is
- * skipped: no chunk is sent twice, whether by two tabs, a resume clicked
- * mid-send, or a retry after a failed checkpoint. Once the chunk is sent, its
- * results replace the placeholders. A sender cut off in between leaves them,
- * so those recipients show as not confirmed: they may or may not have been sent.
+ * A chunk is claimed before it is sent, by creating its first status bucket
+ * holding an `unconfirmed-<index>` placeholder for every recipient in the
+ * chunk. That is one write, so a claim is all or nothing. Sync refuses to
+ * create a key twice, so only one sender can claim a chunk, and a chunk already
+ * claimed is skipped: no chunk is sent twice, whether by two tabs, a resume
+ * clicked mid-send, or a retry after a failed checkpoint. Once the chunk is
+ * sent, its results replace the placeholders. A sender cut off in between
+ * leaves them, so those recipients show as not confirmed: they may or may not
+ * have been sent.
  *
  * The recipient list arrives in slices, one per send-messages call, because a
  * Function request is capped at 1 MB. storedCount says how much has arrived.
@@ -75,8 +78,8 @@ const KEY_DIGITS = 7;
 const NOT_FOUND = 20404;
 const ITEM_EXISTS = 54208;
 
-/** The status of a claimed chunk's placeholder, until its result replaces it. */
-const UNCONFIRMED = 'unconfirmed';
+/** Keys a claimed chunk's placeholders, until its results replace them. */
+const PLACEHOLDER_PREFIX = 'unconfirmed-';
 
 function byteSize(value) {
   return Buffer.byteLength(JSON.stringify(value), 'utf8');
@@ -300,51 +303,63 @@ function statusGroups(chunkStart, list) {
 }
 
 /**
+ * Placeholder status entries for recipients, until their results are saved.
+ * The key prefix says what they are, so each holds only `to`.
+ */
+function placeholderEntries(start, list) {
+  const entries = {};
+  list.forEach((item, offset) => {
+    entries[`${PLACEHOLDER_PREFIX}${start + offset}`] = { to: item.to };
+  });
+  return entries;
+}
+
+/**
  * Claims the chunk of `recipients` starting at `chunkStart`, before any of it is
- * sent, by creating its status buckets with an `unconfirmed-<index>`
- * placeholder per recipient. The first bucket is the lock, created alone: Sync
- * refuses a key that exists, so resolves to false when the chunk is already
- * claimed, by another sender or by an earlier attempt that may have sent it.
- * The other buckets are created once the lock is held.
+ * sent, by creating its first status bucket with a placeholder for every
+ * recipient. Sync refuses a key that exists, so resolves to false when the
+ * chunk is already claimed, by another sender or by an earlier attempt that may
+ * have sent it.
  */
 async function claimChunk(syncClient, campaignId, chunkStart, recipients, claimedAt) {
-  const items = syncClient.syncMaps(statusesMapName(campaignId)).syncMapItems;
-  const [lock, ...rest] = statusGroups(chunkStart, recipients).map((group) => {
-    const statuses = {};
-    group.slice.forEach((recipient, offset) => {
-      statuses[`unconfirmed-${group.start + offset}`] = { status: UNCONFIRMED, to: recipient.to };
-    });
-    return { key: bucketKey(group.start), data: { statuses, claimedAt } };
-  });
-
   try {
-    await items.create(lock);
+    await syncClient.syncMaps(statusesMapName(campaignId)).syncMapItems.create({
+      key: bucketKey(chunkStart),
+      data: { statuses: placeholderEntries(chunkStart, recipients), claimedAt },
+    });
+    return true;
   } catch (error) {
     if (error.code === ITEM_EXISTS) return false;
     throw error;
   }
-
-  await Promise.all(rest.map(async (item) => {
-    try {
-      await items.create(item);
-    } catch (error) {
-      if (error.code !== ITEM_EXISTS) throw error;
-      // Only the lock's holder creates these, so this means the Map holds
-      // something this layout never writes. Sending could repeat a send.
-      throw new Error(`Status bucket ${item.key} already exists, so the chunk at ${chunkStart} is not sent`);
-    }
-  }));
-  return true;
 }
 
 /**
- * Replaces a claimed status bucket's placeholders with the chunk's results. A
- * chunk is never sent twice, so there is nothing to merge.
+ * Records a sent chunk's results over its claim. The status buckets after the
+ * first are written first, created or overwritten. The claim is updated last,
+ * to the first bucket's results plus the placeholders of any bucket that could
+ * not be written, so no recipient drops off the record. If that update fails,
+ * every placeholder stays. Resolves to the first failure, or null.
  */
-async function recordStatusBucket(syncClient, campaignId, start, statuses) {
-  await syncClient.syncMaps(statusesMapName(campaignId)).syncMapItems(bucketKey(start)).update({
-    data: { statuses },
+async function recordChunk(syncClient, campaignId, chunkStart, results, sentAt) {
+  const items = syncClient.syncMaps(statusesMapName(campaignId)).syncMapItems;
+  const [first, ...rest] = statusGroups(chunkStart, results);
+  const writes = await Promise.allSettled(rest.map((group) =>
+    putItem(items, bucketKey(group.start), { statuses: statusEntries(group.slice, sentAt) })));
+
+  let failure = null;
+  const statuses = statusEntries(first.slice, sentAt);
+  writes.forEach((write, i) => {
+    if (write.status === 'fulfilled') return;
+    failure = failure || write.reason;
+    Object.assign(statuses, placeholderEntries(rest[i].start, rest[i].slice));
   });
+  try {
+    await items(bucketKey(chunkStart)).update({ data: { statuses } });
+  } catch (error) {
+    failure = failure || error;
+  }
+  return failure;
 }
 
 /**
@@ -437,9 +452,7 @@ async function runChunks({ syncClient, campaignId, campaignData, startIndex, dea
     campaignData.startIndex = currentIndex;
     campaignData.lastUpdated = new Date(now()).toISOString();
 
-    const statusWrites = await Promise.allSettled(statusGroups(chunkStart, results).map((group) =>
-      recordStatusBucket(syncClient, campaignId, group.start, statusEntries(group.slice, campaignData.lastUpdated))));
-    let failure = statusWrites.find((write) => write.status === 'rejected')?.reason;
+    let failure = await recordChunk(syncClient, campaignId, chunkStart, results, campaignData.lastUpdated);
     try {
       await syncClient.documents(campaignId).update({ data: campaignData });
     } catch (error) {
@@ -516,7 +529,7 @@ module.exports = {
   storeRecipients,
   readRecipientBucket,
   claimChunk,
-  recordStatusBucket,
+  recordChunk,
   readStatusBuckets,
   updateStatusBucket,
   runChunks,
