@@ -157,7 +157,7 @@ function syncError(status, code) {
  * callable and carry methods, as in the SDK. Map items list in key order.
  */
 function fakeSync() {
-  const state = { maps: {}, documents: {}, calls: [], failDocumentUpdate: false };
+  const state = { maps: {}, documents: {}, calls: [], failDocumentUpdate: false, failStatusWrite: false };
 
   const itemsOf = (name) => {
     if (!state.maps[name]) throw syncError(404, 20404);
@@ -180,6 +180,7 @@ function fakeSync() {
     });
     syncMapItems.create = async ({ key, data }) => {
       state.calls.push(['createItem', name, key]);
+      if (state.failStatusWrite && name.endsWith('_statuses')) throw syncError(500, 20500);
       const items = itemsOf(name);
       if (key in items) throw syncError(409, 54208);
       items[key] = data;
@@ -408,6 +409,35 @@ test('a failed checkpoint stops the loop but still moves resumeFrom past the sen
   assert.strictEqual(chunks.length, 1);
   assert.strictEqual(outcome.checkpointFailed, true);
   assert.strictEqual(outcome.resumeFrom, 128);
+});
+
+test('a bucket read failing after a sent chunk ends the call with its progress', async (t) => {
+  t.mock.method(console, 'error', () => {});
+  const { client, state, campaignData } = await storedCampaign(200);
+  delete state.maps.campaign_1_recipients['0000128'];
+  const { send, chunks } = fakeSend();
+  const run = (startIndex) => storage.runChunks({
+    syncClient: client, campaignId: 'campaign_1', campaignData, startIndex, deadline: Infinity, send,
+  });
+  const outcome = await run(0);
+  assert.strictEqual(chunks.length, 1);
+  assert.strictEqual(outcome.resumeFrom, 128);
+  assert.strictEqual(outcome.checkpointFailed, false);
+  await assert.rejects(run(128), /No stored recipients start at index 128/);
+});
+
+test('a failed status write still saves the Document index', async (t) => {
+  t.mock.method(console, 'error', () => {});
+  const { client, state, campaignData } = await storedCampaign(200);
+  state.failStatusWrite = true;
+  const { send, chunks } = fakeSend();
+  const outcome = await storage.runChunks({
+    syncClient: client, campaignId: 'campaign_1', campaignData, startIndex: 0, deadline: Infinity, send,
+  });
+  assert.strictEqual(chunks.length, 1);
+  assert.strictEqual(outcome.checkpointFailed, true);
+  assert.strictEqual(outcome.resumeFrom, 128);
+  assert.strictEqual(state.documents.campaign_1.startIndex, 128);
 });
 
 test('a resume past the stored index with nothing left to send still saves the index', async () => {

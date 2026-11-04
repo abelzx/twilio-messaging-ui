@@ -345,9 +345,10 @@ function statusGroups(chunkStart, results) {
  * A failed checkpoint does not fail the call. By then the chunk has been sent,
  * and failing would send the browser back to retry it, which is how recipients
  * used to get the same message twice. The loop stops and reports
- * `checkpointFailed`, and `resumeFrom` still moves past the chunk. The cost is
- * that chunk's statuses, and its share of the counters if the Document write
- * was the one that failed.
+ * `checkpointFailed`, and `resumeFrom` still moves past the chunk. The Document
+ * write is attempted even when a status write failed, so the stored index
+ * advances whenever it can. The cost is that chunk's statuses, and its share of
+ * the counters if the Document write was the one that failed.
  */
 async function runChunks({ syncClient, campaignId, campaignData, startIndex, deadline, send, now = Date.now }) {
   const storedIndex = campaignData.startIndex || 0;
@@ -358,9 +359,18 @@ async function runChunks({ syncClient, campaignId, campaignData, startIndex, dea
   let checkpointFailed = false;
 
   while (currentIndex < campaignData.totalMessages && now() < deadline) {
-    const bucket = await readRecipientBucket(syncClient, campaignId, currentIndex);
-    if (!bucket || !bucket.recipients.length) {
-      throw new Error(`No stored recipients start at index ${currentIndex}`);
+    let bucket;
+    try {
+      bucket = await readRecipientBucket(syncClient, campaignId, currentIndex);
+      if (!bucket || !bucket.recipients.length) {
+        throw new Error(`No stored recipients start at index ${currentIndex}`);
+      }
+    } catch (error) {
+      if (!chunks) throw error;
+      // The chunks already sent are checkpointed, and the next call meets the
+      // same error before it sends anything.
+      console.error(`Could not read recipients for ${campaignId} at index ${currentIndex}:`, error);
+      break;
     }
 
     const chunkStart = currentIndex;
@@ -375,12 +385,16 @@ async function runChunks({ syncClient, campaignId, campaignData, startIndex, dea
     campaignData.startIndex = currentIndex;
     campaignData.lastUpdated = new Date(now()).toISOString();
 
+    const statusWrites = await Promise.allSettled(statusGroups(chunkStart, results).map((group) =>
+      writeStatusBucket(syncClient, campaignId, group.start, statusEntries(group.results, campaignData.lastUpdated))));
+    let failure = statusWrites.find((write) => write.status === 'rejected')?.reason;
     try {
-      await Promise.all(statusGroups(chunkStart, results).map((group) =>
-        writeStatusBucket(syncClient, campaignId, group.start, statusEntries(group.results, campaignData.lastUpdated))));
       await syncClient.documents(campaignId).update({ data: campaignData });
     } catch (error) {
-      console.error(`Checkpoint failed for ${campaignId} at index ${currentIndex}:`, error);
+      failure = failure || error;
+    }
+    if (failure) {
+      console.error(`Checkpoint failed for ${campaignId} at index ${currentIndex}:`, failure);
       checkpointFailed = true;
       break;
     }
@@ -389,7 +403,7 @@ async function runChunks({ syncClient, campaignId, campaignData, startIndex, dea
   // A resume that starts past the stored index, after a failed checkpoint, and
   // finds nothing left to send must still save the index, or the campaign would
   // show as in progress forever.
-  if (!chunks && currentIndex !== storedIndex) {
+  if (!chunks && currentIndex > storedIndex) {
     campaignData.startIndex = currentIndex;
     campaignData.lastUpdated = new Date(now()).toISOString();
     try {
