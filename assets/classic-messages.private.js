@@ -39,9 +39,13 @@ const SEND_CONCURRENCY = 64;
 /** Status fetches in flight at once. */
 const FETCH_CONCURRENCY = 20;
 
-/** Retries `fn` with exponential backoff and jitter, on 429 rate limits only. */
+/**
+ * Retries `fn` with exponential backoff and jitter, on 429 rate limits only.
+ * A retry that would sleep past `deadline` is not made: the 429 is thrown, so
+ * the caller can finish inside the Function's 10-second limit.
+ */
 async function retryWithExponentialBackoff(fn, options = {}) {
-  const { maxRetries = 5, baseDelay = 1000, maxDelay = 30000 } = options;
+  const { maxRetries = 5, baseDelay = 1000, maxDelay = 30000, deadline = Infinity, now = Date.now } = options;
 
   let lastError;
 
@@ -62,6 +66,7 @@ async function retryWithExponentialBackoff(fn, options = {}) {
       const delay = Math.min(baseDelay * Math.pow(2, attempt), maxDelay);
       // Up to 30% jitter, so parallel sends do not retry in lockstep.
       const totalDelay = delay + Math.random() * 0.3 * delay;
+      if (now() + totalDelay > deadline) throw error;
 
       console.log(`Rate limit (429) encountered. Retrying in ${Math.round(totalDelay)}ms (attempt ${attempt + 1}/${maxRetries})`);
 
@@ -138,10 +143,11 @@ function messageParams(message, { channel, from, messagingServiceSid } = {}) {
 /**
  * Sends one chunk, `concurrency` at a time. Resolves to one result per message,
  * in message order, and never rejects: a send Twilio refuses is a result,
- * recorded as a failure.
+ * recorded as a failure. So is a send still rate limited when a retry would
+ * sleep past `deadline`; it can be sent again later.
  */
 async function sendChunk(client, messages, {
-  startIndex = 0, channel, from, messagingServiceSid, retry, concurrency = SEND_CONCURRENCY,
+  startIndex = 0, channel, from, messagingServiceSid, retry, deadline, now, concurrency = SEND_CONCURRENCY,
 } = {}) {
   const results = new Array(messages.length);
   let next = 0;
@@ -150,7 +156,7 @@ async function sendChunk(client, messages, {
     try {
       const sent = await retryWithExponentialBackoff(
         () => client.messages.create(messageParams(message, { channel, from, messagingServiceSid })),
-        retry
+        { ...retry, deadline, now }
       );
       return { index, success: true, sid: sent.sid, status: sent.status, to: message.to };
     } catch (error) {

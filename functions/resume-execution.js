@@ -24,9 +24,22 @@ const LEGACY_CAMPAIGN = 'This campaign was saved in an older format and cannot b
 const INCOMPLETE_UPLOAD = 'This campaign\'s recipient list was not fully saved, so it cannot be resumed. ' +
   'Nothing was sent; send it again as a new campaign.';
 
+/**
+ * No chunk starts after this. A chunk is up to 128 sends in two rounds, plus up
+ * to eight status writes and a Document write, and must finish inside the
+ * Function's 10-second limit: one cut off there leaves its recipients "not
+ * confirmed".
+ */
+const SEND_DEADLINE_MS = 7000;
+
+/**
+ * No retry of a rate-limited send sleeps past this. The send is recorded as
+ * failed instead, and the checkpoint still has time to be written.
+ */
+const RETRY_DEADLINE_MS = 9000;
+
 exports.handler = async function(context, event, callback) {
   const startTime = Date.now();
-  const MAX_EXECUTION_TIME = 9000;
   const response = new Twilio.Response();
   response.appendHeader('Access-Control-Allow-Origin', '*');
   response.appendHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
@@ -109,14 +122,15 @@ exports.handler = async function(context, event, callback) {
       campaignId,
       campaignData,
       startIndex,
-      // The handler's own start time, so the 9s ceiling bounds total elapsed
-      // time including the token exchange and the fetch above.
-      deadline: startTime + MAX_EXECUTION_TIME,
+      // The handler's own start time, so the budget bounds total elapsed time
+      // including the token exchange and the fetch above.
+      deadline: startTime + SEND_DEADLINE_MS,
       send: (batch, index) => classicMessages.sendChunk(client, batch, {
         startIndex: index,
         channel: campaignData.channel,
         from: campaignData.from,
         messagingServiceSid: context.MESSAGING_SERVICE_SID,
+        deadline: startTime + RETRY_DEADLINE_MS,
       }),
     });
 

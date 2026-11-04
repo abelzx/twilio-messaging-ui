@@ -115,6 +115,30 @@ test('sendChunk retries a 429', async (t) => {
   assert.strictEqual(calls, 3);
 });
 
+test('sendChunk records a 429 as a failure rather than sleep past the deadline', async () => {
+  const client = fakeClient({
+    create: async () => { throw Object.assign(new Error('Too Many Requests'), { status: 429 }); },
+  });
+  const started = Date.now();
+  // The first backoff alone would sleep at least a second.
+  const [result] = await classicMessages.sendChunk(client, [{ to: '+1' }], {
+    channel: 'sms', from: '+9', deadline: Date.now() + 5,
+  });
+  assert.ok(Date.now() - started < 500, `took ${Date.now() - started}ms`);
+  assert.deepStrictEqual(result, { index: 0, success: false, error: 'Too Many Requests', errorCode: 429, to: '+1' });
+});
+
+test('a 429 retry still sleeps when it ends before the deadline', async (t) => {
+  t.mock.method(console, 'log', () => {});
+  let calls = 0;
+  const result = await classicMessages.retryWithExponentialBackoff(async () => {
+    if (++calls < 2) throw Object.assign(new Error('Too Many Requests'), { status: 429 });
+    return 'ok';
+  }, { baseDelay: 1, maxDelay: 1, deadline: 1000, now: () => 0 });
+  assert.strictEqual(result, 'ok');
+  assert.strictEqual(calls, 2);
+});
+
 test('pendingKeys skips refusals and settled statuses', () => {
   const statuses = {
     [sid(1)]: { status: 'queued' },

@@ -16,9 +16,23 @@ const classicMessages = require(Runtime.getAssets()['/classic-messages.js'].path
 
 /**
  * No recipient write starts after this. A slice that completes the list then
- * has the rest of the 9-second budget to start sending.
+ * has until SEND_DEADLINE_MS to start sending.
  */
 const STORE_DEADLINE_MS = 6000;
+
+/**
+ * No chunk starts after this. A chunk is up to 128 sends in two rounds, plus up
+ * to eight status writes and a Document write, and must finish inside the
+ * Function's 10-second limit: one cut off there leaves its recipients "not
+ * confirmed".
+ */
+const SEND_DEADLINE_MS = 7000;
+
+/**
+ * No retry of a rate-limited send sleeps past this. The send is recorded as
+ * failed instead, and the checkpoint still has time to be written.
+ */
+const RETRY_DEADLINE_MS = 9000;
 
 exports.handler = async function(context, event, callback) {
   const response = new Twilio.Response();
@@ -32,7 +46,6 @@ exports.handler = async function(context, event, callback) {
   }
 
   const startTime = Date.now();
-  const MAX_EXECUTION_TIME = 9000; // 9 seconds to leave buffer
 
   try {
     const {
@@ -171,12 +184,13 @@ exports.handler = async function(context, event, callback) {
         campaignId: campaignDocName,
         campaignData,
         startIndex,
-        deadline: startTime + MAX_EXECUTION_TIME,
+        deadline: startTime + SEND_DEADLINE_MS,
         send: (batch, index) => classicMessages.sendChunk(client, batch, {
           startIndex: index,
           channel: campaignData.channel,
           from: campaignData.from,
           messagingServiceSid: context.MESSAGING_SERVICE_SID,
+          deadline: startTime + RETRY_DEADLINE_MS,
         }),
       });
     }

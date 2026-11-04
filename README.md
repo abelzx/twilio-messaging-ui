@@ -138,7 +138,7 @@ A template with no type the channel can render is omitted rather than offered, s
 
 ## How resumable execution works
 
-The page uploads the recipient list to `send-messages.js` in slices of up to 700 KB, since a Function request is capped at 1 MB. Once the whole list is in Sync, sending starts: up to 128 messages per chunk, chunk after chunk, until the Function approaches a 9-second budget (inside the platform's 10-second ceiling), saving the position after each chunk. The page then calls `resume-execution.js`, which reads the next recipients back from Sync, until the campaign completes.
+The page uploads the recipient list to `send-messages.js` in slices of up to 700 KB, since a Function request is capped at 1 MB. Once the whole list is in Sync, sending starts: up to 128 messages per chunk, chunk after chunk, starting no chunk after 7 seconds so that the last one finishes inside the platform's 10-second ceiling, saving the position after each chunk. A send still rate limited at 9 seconds is recorded as failed rather than retried past the ceiling, and can be sent again. The page then calls `resume-execution.js`, which reads the next recipients back from Sync, until the campaign completes.
 
 A campaign's Sync Document holds only what does not grow with it: owner, counters, position, and the fields every message shares. Recipients live in the `campaign_<id>_recipients` Map, in buckets of up to 128 recipients and 9 KiB; statuses live in `campaign_<id>_statuses`, in buckets of 32. Every key is the index of the first recipient its bucket covers. That keeps every item under Sync's 16 KiB limit. Campaigns saved before this layout still open, but cannot be resumed.
 
