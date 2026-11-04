@@ -281,9 +281,15 @@ test('bucketUpdates writes what changed, and stamps only buckets whose pending k
   assert.deepStrictEqual(turns[0].statuses, { [sid(1)]: { status: 'delivered' }, [sid(2)]: { status: 'sent' } });
   assert.strictEqual(turns[0].revision, '3');
 
-  // Not taking turns, an unchanged bucket is not written.
-  const settled = classicMessages.bucketUpdates([a, b, c], refreshed, { channel: 'sms', takingTurns: false, checkedAt: 'T9' });
-  assert.deepStrictEqual(summary(settled), [['A', false, true, 'T0'], ['B', true, false, 'T9'], ['C', true, false, 'T9']]);
+  // Not taking turns, but A was cut off: B and C still take their turn, or the
+  // same buckets would be fetched first, and A cut off, on every poll.
+  const cutOff = classicMessages.bucketUpdates([a, b, c], refreshed, { channel: 'sms', takingTurns: false, checkedAt: 'T9' });
+  assert.deepStrictEqual(summary(cutOff), [['A', false, true, 'T0'], ['B', true, true, 'T9'], ['C', true, true, 'T9']]);
+
+  // Not taking turns and nothing cut off, an unchanged bucket is not written.
+  const all = { ...refreshed, fetched: new Set([sid(1), sid(2), sid(3), sid(4)]) };
+  const settled = classicMessages.bucketUpdates([a, b, c], all, { channel: 'sms', takingTurns: false, checkedAt: 'T9' });
+  assert.deepStrictEqual(summary(settled), [['A', true, true, 'T9'], ['B', true, false, 'T9'], ['C', true, false, 'T9']]);
 });
 
 test('a failed fetch keeps the entry and records why', async () => {

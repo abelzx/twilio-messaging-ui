@@ -281,12 +281,15 @@ async function refreshStatuses(client, statuses, {
  * could change was fetched; only then is it stamped `checkedAt`, so one cut off
  * by the fetch deadline stays at the front of the queue. A bucket is written
  * when an entry in it changed or, while buckets are taking turns, when it is
- * complete, to record that it has had its turn.
+ * complete, to record that it has had its turn. Buckets take turns too when
+ * any was cut off, or the same ones would be fetched first on every poll.
  */
 function bucketUpdates(selected, { statuses, changed, fetched }, { channel, takingTurns, checkedAt }) {
+  const isComplete = (bucket) => pendingKeys(bucket.statuses, channel).every((key) => fetched.has(key));
+  takingTurns = takingTurns || !selected.every(isComplete);
   return selected.map((bucket) => {
     const keys = Object.keys(bucket.statuses);
-    const complete = pendingKeys(bucket.statuses, channel).every((key) => fetched.has(key));
+    const complete = isComplete(bucket);
     return {
       ...bucket,
       statuses: Object.fromEntries(keys.map((key) => [key, statuses[key]])),
