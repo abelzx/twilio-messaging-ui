@@ -100,6 +100,11 @@ Unit tests in `test/campaign-details.test.js`.
 - `displayCampaigns` — one line under each card header: `WhatsApp · Acme Service · MG1a2b… · promo_v2`. Missing parts are skipped. The render signature includes it.
 - `displayMessageDetails` — a "Campaign details" block above the totals, also shown in the empty-state branch. The render signature includes `details`.
 - For an old campaign whose template has only a SID, the name is filled from `loadedTemplates` when that template is in the list.
+- A pool sender's label ends in " · pool" (the dropdown text). The Sender row drops that suffix, since the kind label already says "Sender pool".
+
+### Template names for old classic campaigns (`assets/template-names.private.js`)
+
+An old classic campaign records only its template SID, and `loadedTemplates` holds only the selected channel's templates, so the browser misses most of them. `list-campaigns` (card line) and `check-status` (details block) look up missing names with `client.content.v1.contents(sid).fetch()`. Lookups are cached per account for the life of the warm container, so the 5-second poll does not refetch; a 4xx other than 429 (deleted template, missing Content scope) is cached as unresolvable; 429 and 5xx are retried. The whole lookup is capped at 2 seconds and never fails the response: an unresolved SID is shown as the SID.
 
 ## Display
 

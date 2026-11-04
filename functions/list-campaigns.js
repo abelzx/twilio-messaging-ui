@@ -5,6 +5,7 @@
 const twilio = require('twilio');
 const oauth = require(Runtime.getAssets()['/twilio-oauth.js'].path);
 const campaignDetails = require(Runtime.getAssets()['/campaign-details.js'].path);
+const { templateNames } = require(Runtime.getAssets()['/template-names.js'].path);
 
 exports.handler = async function(context, event, callback) {
   const response = new Twilio.Response();
@@ -18,17 +19,15 @@ exports.handler = async function(context, event, callback) {
   }
 
   let creds;
+  let client;
   try {
     creds = oauth.credsFrom(event);
-    // This function makes no call against the user's own account — it only
-    // reads Sync through the runtime client. It authenticates anyway, because
-    // the ownerKey filter below rests on the caller actually holding the Client
-    // ID they sent, and only a successful token exchange establishes that.
-    // Skipping this would let anyone list another app's campaigns by sending
-    // its Client ID with any secret.
-    // The returned client is intentionally unused — this call exists solely as
-    // the authorization step.
-    await oauth.authenticate(creds);
+    // Authentication is the authorization step here: the ownerKey filter below
+    // rests on the caller actually holding the Client ID they sent, and only a
+    // successful token exchange establishes that. Skipping this would let
+    // anyone list another app's campaigns by sending its Client ID with any
+    // secret. The client's only other use is looking up template names.
+    client = await oauth.authenticate(creds);
   } catch (error) {
     response.setStatusCode(error.statusCode || 401);
     response.setBody({ error: error.message });
@@ -123,6 +122,14 @@ exports.handler = async function(context, event, callback) {
         campaignName: campaignData.campaignName || null,
         summary: campaignDetails.summaryLine(campaignData)
       });
+    }
+
+    // Classic campaigns sent before details were recorded carry only their
+    // template's SID. Show its name on the card instead.
+    const names = await templateNames(client, campaigns.map((c) => c.summary && c.summary.template));
+    for (const campaign of campaigns) {
+      const found = campaign.summary && names.get(campaign.summary.template);
+      if (found && found.name) campaign.summary.template = found.name;
     }
 
     // Sort by creation date (newest first)
