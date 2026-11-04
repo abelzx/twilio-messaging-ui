@@ -193,24 +193,37 @@ function pendingKeys(statuses, channel) {
 }
 
 /**
- * Re-fetches from Twilio every message whose status can still change, oldest
- * first, `concurrency` at a time. No fetch starts once `deadline` has passed;
- * the rest wait for a later poll.
+ * The status buckets to refresh this poll: those with a status that can still
+ * change, least recently checked first (never checked before any), at most
+ * `limit`. `takingTurns` is true when some were left for a later poll.
+ */
+function selectRefreshBuckets(buckets, channel, limit) {
+  const candidates = buckets
+    .filter((bucket) => pendingKeys(bucket.statuses, channel).length)
+    .sort((a, b) => String(a.checkedAt || '').localeCompare(String(b.checkedAt || '')));
+  return { selected: candidates.slice(0, limit), takingTurns: candidates.length > limit };
+}
+
+/**
+ * Re-fetches from Twilio every message whose status can still change, in the
+ * order given, `concurrency` at a time. No fetch starts once `deadline` has
+ * passed; the rest wait for a later poll.
  *
- * Resolves to a new statuses map and the keys whose entry changed, so the
- * caller writes back only what moved.
+ * Resolves to a new statuses map, the keys whose entry changed, so the caller
+ * writes back only what moved, and the keys fetched at all.
  */
 async function refreshStatuses(client, statuses, {
   channel, deadline, now = Date.now, concurrency = FETCH_CONCURRENCY,
 } = {}) {
   const next = { ...statuses };
   const changed = new Set();
-  const queue = pendingKeys(statuses, channel)
-    .sort((a, b) => String(statuses[a].sentAt || '').localeCompare(String(statuses[b].sentAt || '')));
+  const fetched = new Set();
+  const queue = pendingKeys(statuses, channel);
 
   const worker = async () => {
     while (queue.length && now() < deadline) {
       const messageSid = queue.shift();
+      fetched.add(messageSid);
       const before = statuses[messageSid];
       let after;
       try {
@@ -239,24 +252,54 @@ async function refreshStatuses(client, statuses, {
   };
 
   await Promise.all(Array.from({ length: concurrency }, worker));
-  return { statuses: next, changed };
+  return { statuses: next, changed, fetched };
+}
+
+/**
+ * What to write back for each bucket selectRefreshBuckets chose, given what
+ * refreshStatuses returned. A bucket is `complete` when every status in it that
+ * could change was fetched; only then is it stamped `checkedAt`, so one cut off
+ * by the fetch deadline stays at the front of the queue. A bucket is written
+ * when an entry in it changed or, while buckets are taking turns, when it is
+ * complete, to record that it has had its turn.
+ */
+function bucketUpdates(selected, { statuses, changed, fetched }, { channel, takingTurns, checkedAt }) {
+  return selected.map((bucket) => {
+    const keys = Object.keys(bucket.statuses);
+    const complete = pendingKeys(bucket.statuses, channel).every((key) => fetched.has(key));
+    return {
+      ...bucket,
+      statuses: Object.fromEntries(keys.map((key) => [key, statuses[key]])),
+      checkedAt: complete ? checkedAt : bucket.checkedAt,
+      complete,
+      write: keys.some((key) => changed.has(key)) || (takingTurns && complete),
+    };
+  });
 }
 
 /**
  * The derived counters. This is the only place that counts per-message
- * status, so a badge and a counter cannot disagree.
+ * status, so a badge and a counter cannot disagree. `sent` is every send
+ * Twilio accepted; `failed` includes the sends it refused; `pending` is
+ * accepted and not yet delivered or failed; `unconfirmed` is the recipients of
+ * a chunk whose results were never saved (see classic-campaign.private.js).
  */
 function tally(statuses) {
-  let delivered = 0;
-  let read = 0;
-  let failed = 0;
-  for (const entry of Object.values(statuses)) {
+  const counts = { sent: 0, delivered: 0, read: 0, failed: 0, pending: 0, unconfirmed: 0 };
+  for (const [key, entry] of Object.entries(statuses)) {
     const status = String(entry.status || '').toLowerCase();
-    if (entry.delivered || status === 'delivered' || status === 'read') delivered++;
-    if (entry.read || status === 'read') read++;
-    if (TERMINAL_FAILURE.has(status)) failed++;
+    const isDelivered = Boolean(entry.delivered) || status === 'delivered' || status === 'read';
+    const isFailed = TERMINAL_FAILURE.has(status);
+    if (isDelivered) counts.delivered++;
+    if (entry.read || status === 'read') counts.read++;
+    if (isFailed) counts.failed++;
+    if (status === 'unconfirmed') counts.unconfirmed++;
+    if (MESSAGE_SID.test(key)) {
+      counts.sent++;
+      if (!isDelivered && !isFailed) counts.pending++;
+    }
   }
-  return { delivered, read, failed };
+  return counts;
 }
 
 module.exports = {
@@ -264,6 +307,8 @@ module.exports = {
   retryWithExponentialBackoff,
   sendChunk,
   pendingKeys,
+  selectRefreshBuckets,
   refreshStatuses,
+  bucketUpdates,
   tally,
 };

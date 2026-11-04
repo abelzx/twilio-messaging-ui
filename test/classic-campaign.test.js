@@ -308,8 +308,8 @@ test('readStatusBuckets returns every bucket in send order, or [] with no Map', 
   await putStatuses(client, '0000032', { b: { status: 'sent' } });
   await putStatuses(client, '0000000', { a: { status: 'sent' } });
   assert.deepStrictEqual(await storage.readStatusBuckets(client, 'campaign_1'), [
-    { key: '0000000', statuses: { a: { status: 'sent' } }, checkedAt: null },
-    { key: '0000032', statuses: { b: { status: 'sent' } }, checkedAt: null },
+    { key: '0000000', statuses: { a: { status: 'sent' } }, checkedAt: null, revision: '1' },
+    { key: '0000032', statuses: { b: { status: 'sent' } }, checkedAt: null, revision: '1' },
   ]);
 });
 
@@ -321,6 +321,21 @@ test('updateStatusBucket replaces one bucket and records when it was checked', a
   assert.deepStrictEqual(state.maps.campaign_1_statuses['0000000'], {
     statuses: { a: { status: 'delivered' } }, checkedAt: 'T1',
   });
+});
+
+test('updateStatusBucket writes only over the revision it was given', async () => {
+  const { client, state } = fakeSync();
+  await storage.createMaps(client, 'campaign_1');
+  await putStatuses(client, '0000000', { a: { status: 'sent' } });
+  const [read] = await storage.readStatusBuckets(client, 'campaign_1');
+  // A write since the read, as a second poll makes.
+  await storage.updateStatusBucket(client, 'campaign_1', '0000000', { a: { status: 'sent' } }, 'T1');
+  await assert.rejects(
+    storage.updateStatusBucket(client, 'campaign_1', '0000000', { a: { status: 'delivered' } }, 'T2', read.revision),
+    (error) => error.status === 412);
+  assert.strictEqual(state.maps.campaign_1_statuses['0000000'].checkedAt, 'T1');
+  await storage.updateStatusBucket(client, 'campaign_1', '0000000', { a: { status: 'delivered' } }, 'T2', '2');
+  assert.strictEqual(state.maps.campaign_1_statuses['0000000'].checkedAt, 'T2');
 });
 
 test('inBatches never runs more than the limit at once and keeps order', async () => {

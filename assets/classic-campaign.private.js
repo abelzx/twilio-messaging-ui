@@ -349,7 +349,8 @@ async function recordStatusBucket(syncClient, campaignId, start, statuses) {
 
 /**
  * Every status bucket in send order, or [] when the Map is missing. A bucket
- * not yet refreshed by check-status.js has a null `checkedAt`.
+ * not yet refreshed by check-status.js has a null `checkedAt`. `revision`
+ * lets updateStatusBucket write only over the bucket as it was read.
  */
 async function readStatusBuckets(syncClient, campaignId) {
   let items;
@@ -363,12 +364,19 @@ async function readStatusBuckets(syncClient, campaignId) {
     key: item.key,
     statuses: (item.data && item.data.statuses) || {},
     checkedAt: (item.data && item.data.checkedAt) || null,
+    revision: item.revision,
   }));
 }
 
-async function updateStatusBucket(syncClient, campaignId, key, statuses, checkedAt) {
+/**
+ * Replaces one status bucket after check-status.js refreshed it. Given the
+ * `revision` it was read at, the write fails with a 412 if anything wrote the
+ * bucket since.
+ */
+async function updateStatusBucket(syncClient, campaignId, key, statuses, checkedAt, revision) {
   await syncClient.syncMaps(statusesMapName(campaignId)).syncMapItems(key).update({
     data: { statuses, checkedAt },
+    ...(revision ? { ifMatch: revision } : {}),
   });
 }
 

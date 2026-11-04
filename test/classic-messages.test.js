@@ -206,7 +206,7 @@ test('refreshStatuses starts no fetch after the deadline', async () => {
   assert.strictEqual(changed.size, 0);
 });
 
-test('refreshStatuses fetches at most `concurrency` at once, oldest first', async () => {
+test('refreshStatuses fetches in the given order, at most `concurrency` at once', async () => {
   let running = 0;
   let peak = 0;
   const order = [];
@@ -220,11 +220,70 @@ test('refreshStatuses fetches at most `concurrency` at once, oldest first', asyn
       return { status: 'delivered' };
     },
   });
+  // Given newest first: the order is the caller's, not sentAt's.
   const statuses = {};
   for (let i = 9; i >= 0; i--) statuses[sid(i)] = { status: 'queued', sentAt: `2026-11-04T00:00:0${i}.000Z` };
-  await classicMessages.refreshStatuses(client, statuses, { channel: 'sms', deadline: Infinity, concurrency: 3 });
+  const { fetched } = await classicMessages.refreshStatuses(client, statuses, {
+    channel: 'sms', deadline: Infinity, concurrency: 3,
+  });
   assert.strictEqual(peak, 3);
-  assert.deepStrictEqual(order, Array.from({ length: 10 }, (_, i) => sid(i)));
+  assert.deepStrictEqual(order, Object.keys(statuses));
+  assert.deepStrictEqual([...fetched].sort(), Object.keys(statuses).sort());
+});
+
+test('refreshStatuses reports which keys it fetched before the deadline', async () => {
+  let clock = 0;
+  const client = fakeClient({ fetch: async () => { clock++; return { status: 'delivered' }; } });
+  const statuses = {};
+  for (let i = 0; i < 6; i++) statuses[sid(i)] = { status: 'queued' };
+  statuses['failed-6'] = { status: 'failed' };
+  const { fetched } = await classicMessages.refreshStatuses(client, statuses, {
+    channel: 'sms', deadline: 3, now: () => clock, concurrency: 1,
+  });
+  assert.deepStrictEqual([...fetched], [sid(0), sid(1), sid(2)]);
+});
+
+test('selectRefreshBuckets takes buckets with a pending status, least recently checked first', () => {
+  const bucket = (key, checkedAt, statuses) => ({ key, checkedAt, statuses });
+  const queued = (n) => ({ [sid(n)]: { status: 'queued' } });
+  const buckets = [
+    bucket('0000000', '2026-11-04T00:00:02.000Z', queued(0)),
+    bucket('0000032', null, queued(32)),
+    bucket('0000064', '2026-11-04T00:00:01.000Z', queued(64)),
+    bucket('0000096', null, { [sid(96)]: { status: 'delivered' }, 'failed-97': { status: 'failed' } }),
+    bucket('0000128', null, { 'unconfirmed-128': { status: 'unconfirmed', to: '+1' } }),
+    bucket('0000160', null, queued(160)),
+  ];
+  const turns = classicMessages.selectRefreshBuckets(buckets, 'sms', 3);
+  assert.deepStrictEqual(turns.selected.map((b) => b.key), ['0000032', '0000160', '0000064']);
+  assert.strictEqual(turns.takingTurns, true);
+  const all = classicMessages.selectRefreshBuckets(buckets, 'sms', 4);
+  assert.deepStrictEqual(all.selected.map((b) => b.key), ['0000032', '0000160', '0000064', '0000000']);
+  assert.strictEqual(all.takingTurns, false);
+  // On WhatsApp a delivered message can still be read.
+  assert.ok(classicMessages.selectRefreshBuckets(buckets, 'whatsapp', 24).selected.some((b) => b.key === '0000096'));
+});
+
+test('bucketUpdates writes what changed, and stamps only buckets whose pending keys were all fetched', () => {
+  const a = { key: 'A', revision: '3', checkedAt: 'T0', statuses: { [sid(1)]: { status: 'sent' }, [sid(2)]: { status: 'sent' } } };
+  const b = { key: 'B', revision: '1', checkedAt: null, statuses: { [sid(3)]: { status: 'sent' } } };
+  const c = { key: 'C', revision: '2', checkedAt: 'T0', statuses: { [sid(4)]: { status: 'sent' }, 'failed-5': { status: 'failed' } } };
+  const refreshed = {
+    statuses: { ...a.statuses, [sid(1)]: { status: 'delivered' }, ...b.statuses, ...c.statuses },
+    changed: new Set([sid(1)]),
+    fetched: new Set([sid(1), sid(3), sid(4)]),
+  };
+  const summary = (updates) => updates.map((u) => [u.key, u.complete, u.write, u.checkedAt]);
+
+  // A changed but was cut off before sid(2), so it keeps its place at the front.
+  const turns = classicMessages.bucketUpdates([a, b, c], refreshed, { channel: 'sms', takingTurns: true, checkedAt: 'T9' });
+  assert.deepStrictEqual(summary(turns), [['A', false, true, 'T0'], ['B', true, true, 'T9'], ['C', true, true, 'T9']]);
+  assert.deepStrictEqual(turns[0].statuses, { [sid(1)]: { status: 'delivered' }, [sid(2)]: { status: 'sent' } });
+  assert.strictEqual(turns[0].revision, '3');
+
+  // Not taking turns, an unchanged bucket is not written.
+  const settled = classicMessages.bucketUpdates([a, b, c], refreshed, { channel: 'sms', takingTurns: false, checkedAt: 'T9' });
+  assert.deepStrictEqual(summary(settled), [['A', false, true, 'T0'], ['B', true, false, 'T9'], ['C', true, false, 'T9']]);
 });
 
 test('a failed fetch keeps the entry and records why', async () => {
@@ -236,12 +295,17 @@ test('a failed fetch keeps the entry and records why', async () => {
   assert.ok(changed.has(sid(1)));
 });
 
-test('tally counts delivered, read and terminal failures', () => {
+test('tally counts from the statuses, including refusals and recipients not confirmed', () => {
   assert.deepStrictEqual(classicMessages.tally({
-    a: { status: 'delivered' },
-    b: { status: 'read' },
-    c: { status: 'undelivered' },
-    d: { status: 'failed' },
-    e: { status: 'sent', delivered: true },
-  }), { delivered: 3, read: 1, failed: 2 });
+    [sid(1)]: { status: 'delivered' },
+    [sid(2)]: { status: 'read' },
+    [sid(3)]: { status: 'undelivered' },
+    [sid(4)]: { status: 'failed' },
+    [sid(5)]: { status: 'sent', delivered: true },
+    [sid(6)]: { status: 'queued' },
+    [sid(7)]: { status: 'sent' },
+    'failed-8': { status: 'failed' },
+    'unconfirmed-9': { status: 'unconfirmed', to: '+9' },
+    'unconfirmed-10': { status: 'unconfirmed', to: '+10' },
+  }), { sent: 7, delivered: 3, read: 1, failed: 3, pending: 2, unconfirmed: 2 });
 });

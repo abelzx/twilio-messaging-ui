@@ -108,51 +108,55 @@ exports.handler = async function(context, event, callback) {
       ? await storage.readStatusBuckets(syncClient, campaignId)
       : [{ key: null, statuses: campaignData.statuses || {}, checkedAt: null }];
 
-    const candidates = buckets
-      .filter((bucket) => classicMessages.pendingKeys(bucket.statuses, campaignData.channel).length)
-      .sort((a, b) => String(a.checkedAt || '').localeCompare(String(b.checkedAt || '')));
-    const selected = candidates.slice(0, MAX_REFRESH_BUCKETS);
-    const takingTurns = candidates.length > selected.length;
+    const { selected, takingTurns } = classicMessages.selectRefreshBuckets(
+      buckets, campaignData.channel, MAX_REFRESH_BUCKETS);
 
-    const { statuses: refreshed, changed } = await classicMessages.refreshStatuses(
+    // In bucket order, so each bucket's statuses are fetched together and as
+    // many buckets as possible are refreshed in full.
+    const refreshed = await classicMessages.refreshStatuses(
       client,
       Object.assign({}, ...selected.map((bucket) => bucket.statuses)),
       { channel: campaignData.channel, deadline: startTime + FETCH_DEADLINE_MS }
     );
 
-    // A selected bucket is written when an entry in it changed, or, while
-    // buckets are taking turns, to record that it has had its turn.
     const checkedAt = new Date().toISOString();
-    const toWrite = [];
-    for (const bucket of selected) {
-      const keys = Object.keys(bucket.statuses);
-      if (takingTurns || keys.some((key) => changed.has(key))) toWrite.push(bucket);
-      bucket.statuses = Object.fromEntries(keys.map((key) => [key, refreshed[key]]));
-    }
+    const updates = classicMessages.bucketUpdates(selected, refreshed, {
+      channel: campaignData.channel, takingTurns, checkedAt,
+    });
+    const statuses = Object.assign({}, ...buckets.map((bucket) => bucket.statuses), refreshed.statuses);
 
     if (bucketed) {
-      await storage.inBatches(toWrite.map((bucket) => () =>
-        storage.updateStatusBucket(syncClient, campaignId, bucket.key, bucket.statuses, checkedAt)));
+      // Each write is conditional on the revision read above. A 412 means a
+      // send or another poll wrote the bucket since, and is skipped. A failed
+      // write does not fail the poll: the stored entry is still pending, so a
+      // later poll fetches and writes it again.
+      const toWrite = updates.filter((update) => update.write);
+      const outcomes = await storage.inBatches(toWrite.map((update) => () =>
+        storage.updateStatusBucket(syncClient, campaignId, update.key, update.statuses, update.checkedAt, update.revision)
+          .then(() => null, (error) => error)));
+      outcomes.forEach((error, i) => {
+        if (error && error.status !== 412) {
+          console.error(`Could not save status bucket ${toWrite[i].key} of ${campaignId}:`, error);
+        }
+      });
     } else {
-      campaignData.statuses = buckets[0].statuses;
+      campaignData.statuses = statuses;
     }
 
-    const statuses = Object.assign({}, ...buckets.map((bucket) => bucket.statuses));
     campaignData.lastUpdated = checkedAt;
 
+    // As refreshed, whether or not each bucket's write landed.
     const counts = classicMessages.tally(statuses);
+    campaignData.sent = counts.sent;
     campaignData.delivered = counts.delivered;
     campaignData.read = counts.read;
     campaignData.failed = counts.failed;
-    // Anything accepted by Twilio that has not yet reached a terminal state.
-    // Clamped at zero: a chunk sent twice inflates `sent` past the recipient
-    // count, and a negative "pending" is noise rather than information.
-    campaignData.pending = Math.max(0, (campaignData.sent || 0) - counts.delivered - counts.failed);
+    campaignData.pending = counts.pending;
+    campaignData.unconfirmed = counts.unconfirmed;
 
     // Conditional on the revision read above. A send that checkpointed since
     // then owns startIndex, and writing this older copy over it would move the
-    // index back, so the next resume would send a chunk again. Losing this write
-    // costs a stale counter until the next poll.
+    // index back. Losing this write costs a stale counter until the next poll.
     try {
       await syncClient.documents(campaignId).update({ data: campaignData, ifMatch: revision });
     } catch (error) {
@@ -179,6 +183,7 @@ exports.handler = async function(context, event, callback) {
         sent: campaignData.sent,
         failed: campaignData.failed,
         pending: campaignData.pending,
+        unconfirmed: campaignData.unconfirmed,
         delivered: campaignData.delivered || 0,
         read: campaignData.read || 0,
         startIndex: campaignData.startIndex,
