@@ -1502,6 +1502,20 @@ input::placeholder, textarea::placeholder { color: var(--text-muted); }
     font-weight: 500;
 }
 
+/* Under Recipients when a Programmable Messaging campaign is over the
+   suggested size. Advice, not an error: the same tinted box as
+   .send-note--active, with the text kept --text for the same contrast reason. */
+.limit-notice {
+    margin: 8px 0 0;
+    padding: 10px 12px;
+    border-radius: var(--radius);
+    border: 1px solid rgba(228, 98, 22, 0.35);
+    background: rgba(228, 98, 22, 0.08);
+    color: var(--text);
+    font-size: 12px;
+    line-height: 1.5;
+}
+
 /* Above the delivery table when its rows are not live from Twilio. The same
    tinted box as .send-note--active, for the same contrast reason. */
 .details-note {

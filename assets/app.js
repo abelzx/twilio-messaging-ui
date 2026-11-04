@@ -48,6 +48,60 @@ let displayedCampaign = null;
  */
 const MESSAGE_SID = /^[A-Z]{2}[0-9a-f]{32}$/i;
 
+/**
+ * The size above which a Programmable Messaging campaign gets a notice
+ * suggesting Bulk Messaging. Advice only: nothing refuses a larger campaign.
+ * Bulk takes up to 10,000 recipients in one request and needs no open tab.
+ */
+const CLASSIC_SUGGESTED_MAX = 1000;
+
+/**
+ * Most JSON per send-messages request. A Function request is capped at 1 MB,
+ * credentials and headers included, so the recipient list goes up in slices.
+ */
+const UPLOAD_MAX_BYTES = 700 * 1024;
+
+/** Shown when a send or resume finished but a checkpoint could not be saved. */
+const CHECKPOINT_WARNING = 'Sending finished, but progress could not be saved for some messages. '
+    + 'They were sent, but may be missing from the delivery table and its counts. '
+    + 'The Messaging logs in the Twilio Console have the full record.';
+
+function classicLimitMessage(count) {
+    return `This campaign has ${count.toLocaleString('en-US')} recipients. Programmable Messaging is suggested `
+        + `for up to ${CLASSIC_SUGGESTED_MAX.toLocaleString('en-US')} per campaign; for larger campaigns, `
+        + 'switch the API to Bulk Messaging.';
+}
+
+/** Recipients the form would send right now: the CSV's rows, or the typed list. */
+function currentRecipientCount() {
+    if (csvIsActive()) return csvUpload.rows.length;
+    const text = document.getElementById('recipients').value.trim();
+    return text ? text.split(/[\n,]+/).map(r => r.trim()).filter(r => r.length > 0).length : 0;
+}
+
+/** Shows the size notice only for a Programmable Messaging campaign over the suggested size. */
+function updateClassicLimitNotice() {
+    const notice = document.getElementById('classic-limit-notice');
+    if (!notice) return;
+    const count = isBulkMode() ? 0 : currentRecipientCount();
+    notice.hidden = count <= CLASSIC_SUGGESTED_MAX;
+    notice.textContent = notice.hidden ? '' : classicLimitMessage(count);
+}
+
+/** Where the upload slice starting at `start` ends, so it stays under `maxBytes` of JSON. */
+function uploadSliceEnd(messages, start, maxBytes) {
+    const encoder = new TextEncoder();
+    let bytes = 0;
+    let end = start;
+    while (end < messages.length) {
+        const size = encoder.encode(JSON.stringify(messages[end])).length + 1;
+        if (end > start && bytes + size > maxBytes) break;
+        bytes += size;
+        end++;
+    }
+    return end;
+}
+
 // The 5s poll rebuilds whole panels with innerHTML, which destroys the scroll
 // container and snaps the user back to the top. Two defences: skip the write
 // entirely when nothing changed, and restore scrollTop when it did.
@@ -192,6 +246,8 @@ function applySendMode(refetchSenders = true) {
             : 'One message per recipient, driven from this tab.';
     }
 
+    updateClassicLimitNotice();
+
     const sendNote = document.getElementById('send-note');
     // Shared with setSendingState() below so the idle wording can never drift
     // between the two call sites.
@@ -283,6 +339,9 @@ function setupEventListeners() {
 
     // Message form
     document.getElementById('message-form').addEventListener('submit', handleSendMessages);
+
+    // Typed recipients drive the size notice as they are entered.
+    document.getElementById('recipients').addEventListener('input', updateClassicLimitNotice);
 
     // Channel change handler to load content templates
     document.getElementById('channel').addEventListener('change', handleChannelChange);
@@ -377,6 +436,7 @@ function csvIsActive() {
  * would block submit on an empty field the user was told to ignore.
  */
 function renderCsvState() {
+    updateClassicLimitNotice();
     const summary = document.getElementById('csv-summary');
     const clearBtn = document.getElementById('csv-clear-btn');
     const recipients = document.getElementById('recipients');
@@ -1374,39 +1434,112 @@ async function handleSendMessages(e) {
     }
 }
 
-async function sendMessagesBatch(messages, channel, from, campaignName, details) {
-    let resumeFrom = 0;
+/** A Function's error, with the underlying cause when it sent one. */
+function functionError(data, fallback) {
+    const error = (data && data.error) || fallback;
+    return data && data.message ? `${error} (${data.message})` : error;
+}
+
+/**
+ * After a checkpoint failed on the last chunk, the stored position is behind
+ * what was sent, and the campaign list would offer to resume it, sending that
+ * chunk again. One more resume call with the position reached makes the
+ * server save it: there is nothing left to send, so it only saves.
+ */
+async function saveReachedIndex(campaignId, resumeFrom) {
+    try {
+        await postToFunction('resume-execution', { campaignId, resumeFrom });
+    } catch (error) {
+        console.error('Could not save campaign progress:', error);
+    }
+}
+
+/**
+ * Carries a classic campaign on to completion through resume-execution, one
+ * time-boxed call after another. Returns true if any checkpoint failed.
+ *
+ * `resumeFrom` is the server's own value from the previous call, passed back
+ * because a checkpoint can fail after its chunk was sent. The stored index is
+ * then behind, and resuming from it would send that chunk again. Omitted, the
+ * server resumes from the stored index.
+ */
+async function continueCampaign(campaignId, resumeFrom) {
+    let checkpointFailed = false;
+    let lastCheckpointFailed = false;
     let isComplete = false;
 
     while (!isComplete) {
+        const response = await postToFunction('resume-execution', { campaignId, resumeFrom });
+        const data = await response.json();
+
+        if (!response.ok) {
+            throw new Error(functionError(data, 'Failed to resume campaign'));
+        }
+
+        resumeFrom = data.resumeFrom;
+        isComplete = data.isComplete;
+        lastCheckpointFailed = Boolean(data.checkpointFailed);
+        checkpointFailed = checkpointFailed || lastCheckpointFailed;
+
+        // Update UI - fetch full campaign status to get delivery/read info
+        await refreshCurrentCampaign();
+
+        if (!isComplete) {
+            // Wait a bit before resuming (to avoid hitting rate limits)
+            await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+    }
+
+    if (lastCheckpointFailed) await saveReachedIndex(campaignId, resumeFrom);
+
+    return checkpointFailed;
+}
+
+/**
+ * Uploads the recipient list to send-messages in slices that fit a Function
+ * request, each starting where the server says the last one ended. The call
+ * that completes the list also starts sending; continueCampaign does the rest.
+ * Nothing is sent until the whole list is stored.
+ */
+async function sendMessagesBatch(messages, channel, from, campaignName, details) {
+    let storedCount = 0;
+    let data = null;
+
+    while (storedCount < messages.length) {
+        const end = uploadSliceEnd(messages, storedCount, UPLOAD_MAX_BYTES);
+        const response = await postToFunction('send-messages', {
+            messages: messages.slice(storedCount, end),
+            offset: storedCount,
+            totalMessages: messages.length,
+            campaignId: currentCampaignId,
+            channel,
+            from,
+            campaignName: campaignName || null,
+            // Stored only when the first slice creates the campaign.
+            ...(storedCount === 0 ? { details } : {})
+        });
+        data = await response.json();
+
+        if (!response.ok) {
+            // Nothing has been sent yet unless the list was complete, in which
+            // case the refreshed list offers to resume it.
+            loadCampaigns();
+            throw new Error(functionError(data, 'Failed to send messages'));
+        }
+        if (!(data.storedCount > storedCount)) {
+            throw new Error('Failed to send messages (the recipient list stopped uploading)');
+        }
+
+        storedCount = data.storedCount;
+        await refreshCurrentCampaign();
+    }
+
+    let checkpointFailed = Boolean(data.checkpointFailed);
+
+    if (!data.isComplete) {
+        await new Promise(resolve => setTimeout(resolve, 1000));
         try {
-            const response = await postToFunction('send-messages', {
-                messages,
-                campaignId: currentCampaignId,
-                channel,
-                from,
-                resumeFrom,
-                campaignName: campaignName || null,
-                // Stored only when the first call creates the campaign.
-                ...(resumeFrom === 0 ? { details } : {})
-            });
-
-            const data = await response.json();
-
-            if (!response.ok) {
-                throw new Error(data.error || 'Failed to send messages');
-            }
-
-            resumeFrom = data.resumeFrom;
-            isComplete = data.isComplete;
-
-            // Update UI - fetch full campaign status to get delivery/read info
-            await refreshCurrentCampaign();
-
-            if (!isComplete) {
-                // Wait a bit before resuming (to avoid hitting rate limits)
-                await new Promise(resolve => setTimeout(resolve, 1000));
-            }
+            checkpointFailed = (await continueCampaign(currentCampaignId, data.resumeFrom)) || checkpointFailed;
         } catch (error) {
             console.error('Error sending messages:', error);
 
@@ -1414,17 +1547,21 @@ async function sendMessagesBatch(messages, channel, from, campaignName, details)
             showResumeOption();
             throw error;
         }
+    } else if (checkpointFailed) {
+        await saveReachedIndex(currentCampaignId, data.resumeFrom);
     }
+
+    if (checkpointFailed) alert(CHECKPOINT_WARNING);
 
     // Final status check
     await refreshCurrentCampaign();
 
     // Reload campaigns list
     await loadCampaigns();
-    
+
     // Start auto-refresh
     startStatusAutoRefresh();
-    
+
     setSendingState(false);
 }
 
@@ -1719,52 +1856,14 @@ async function resumeCampaignById(campaignId, event) {
     }
 
     try {
-        // Fetch campaign details including messages
-        const response = await postToFunction('check-status', { campaignId });
-        const data = await response.json();
-
-        if (!response.ok) {
-            throw new Error(data.error || 'Failed to fetch campaign details');
-        }
-
-        const campaign = data.campaign;
-        
-        // Check if campaign has resume data
-        if (!campaign.messages || !campaign.channel || !campaign.from) {
-            throw new Error('Campaign data is missing. Cannot resume this campaign.');
-        }
-
-        // Set current campaign ID. Resume only ever reaches a classic campaign
-        // — the Resume button is not offered for bulk (see displayCampaigns).
+        // Resume only ever reaches a fully stored classic campaign — the
+        // Resume button is offered for nothing else (see displayCampaigns). The
+        // server reads the recipients from Sync, so nothing is fetched first.
         currentCampaignId = campaignId;
         currentCampaignMode = 'classic';
 
-        // Continue resuming until complete
-        let isComplete = false;
-        while (!isComplete) {
-            const resumeResponse = await postToFunction('resume-execution', {
-                campaignId: campaignId,
-                messages: campaign.messages,
-                channel: campaign.channel,
-                from: campaign.from
-            });
-
-            const resumeData = await resumeResponse.json();
-
-            if (!resumeResponse.ok) {
-                throw new Error(resumeData.error || 'Failed to resume campaign');
-            }
-
-            isComplete = resumeData.isComplete;
-
-            // Update UI
-            await checkCampaignStatus();
-
-            if (!isComplete) {
-                // Wait a bit before resuming (to avoid hitting rate limits)
-                await new Promise(resolve => setTimeout(resolve, 1000));
-            }
-        }
+        const checkpointFailed = await continueCampaign(campaignId);
+        if (checkpointFailed) alert(CHECKPOINT_WARNING);
 
         // Campaign completed
         await checkCampaignStatus();
@@ -1991,8 +2090,10 @@ function displayCampaigns(campaigns) {
 
         // Bulk campaigns cannot be resumed: Twilio owns the processing, and no
         // recipient list is stored to resume from. An operation continues on its
-        // own or has already finished.
-        const canResume = campaign.mode !== 'bulk' && !campaign.isComplete && campaign.startIndex < campaign.totalMessages;
+        // own or has already finished. Nor can classic campaigns saved in the
+        // older format, or whose upload was cut off; see resume-execution.js.
+        const canResume = campaign.mode !== 'bulk' && campaign.resumable !== false
+            && !campaign.isComplete && campaign.startIndex < campaign.totalMessages;
 
         // Use campaign name if available, otherwise fall back to formatted timestamp
         const displayName = campaign.campaignName ||
@@ -2157,6 +2258,14 @@ function displayMessageDetails(campaign) {
     const note = campaign.detailsNote ? `<p class="details-note">${campaign.detailsNote}</p>` : '';
     const detailsBlock = renderCampaignDetails(campaign.details);
 
+    if (campaign.statusesOmitted) {
+        // check-status leaves the per-message list out when it would not fit a
+        // Function response; the counts it sends are still complete.
+        messageDetailsContent.innerHTML = detailsBlock + summary +
+            '<p class="details-note">This campaign is too large to list message by message here. The counts above are complete.</p>';
+        return;
+    }
+
     if (statusEntries.length === 0) {
         // A bulk campaign's totals are kept in Sync and outlast Twilio's
         // per-recipient rows, so they are shown even when there are no rows.
@@ -2198,7 +2307,6 @@ function displayMessageDetails(campaign) {
                         <th>Error Message</th>
                         <th>Sent At</th>
                         <th>Updated At</th>
-                        <th>Webhook Received</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -2214,7 +2322,6 @@ function displayMessageDetails(campaign) {
         
         const sentAt = statusInfo.sentAt || statusInfo.dateSent || null;
         const updatedAt = statusInfo.dateUpdated || statusInfo.webhookReceivedAt || null;
-        const webhookReceived = statusInfo.webhookReceivedAt || null;
         
         const errorCode = statusInfo.errorCode || '-';
         const errorMessage = (statusInfo.errorMessage || '-').replace(/"/g, '&quot;');
@@ -2250,7 +2357,6 @@ function displayMessageDetails(campaign) {
                 <td style="max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${errorMessage}">${errorMessage}</td>
                 <td>${formatDate(sentAt)}</td>
                 <td>${formatDate(updatedAt)}</td>
-                <td>${formatDate(webhookReceived)}</td>
             </tr>
         `;
     });
@@ -2537,7 +2643,6 @@ function exportMessageStatusCsv() {
         'Error Message': s.errorMessage || '',
         'Sent At': s.sentAt || s.dateSent || '',
         'Updated At': s.dateUpdated || '',
-        'Webhook Received': s.webhookReceivedAt || '',
     }));
 
     const label = (campaign.campaignName || campaign.campaignId || 'campaign')
