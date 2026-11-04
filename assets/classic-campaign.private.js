@@ -323,6 +323,109 @@ async function updateStatusBucket(syncClient, campaignId, key, statuses, checked
   });
 }
 
+/** One chunk's results split into the status buckets they belong in. */
+function statusGroups(chunkStart, results) {
+  const groups = [];
+  for (let i = 0; i < results.length; i += STATUS_BUCKET_ENTRIES) {
+    groups.push({ start: chunkStart + i, results: results.slice(i, i + STATUS_BUCKET_ENTRIES) });
+  }
+  return groups;
+}
+
+/**
+ * Sends from `startIndex` until the campaign is done or `deadline` passes, one
+ * recipient bucket per chunk, recording each chunk's statuses and checkpoint as
+ * it goes.
+ *
+ * `send(messages, startIndex)` sends one chunk and resolves to one result per
+ * message (classic-messages.js sendChunk). It is passed in because assets
+ * cannot require each other once deployed. `campaignData` is the Document's
+ * data and is updated in place.
+ *
+ * A failed checkpoint does not fail the call. By then the chunk has been sent,
+ * and failing would send the browser back to retry it, which is how recipients
+ * used to get the same message twice. The loop stops and reports
+ * `checkpointFailed`, and `resumeFrom` still moves past the chunk. The cost is
+ * that chunk's statuses, and its share of the counters if the Document write
+ * was the one that failed.
+ */
+async function runChunks({ syncClient, campaignId, campaignData, startIndex, deadline, send, now = Date.now }) {
+  const storedIndex = campaignData.startIndex || 0;
+  const shared = campaignData.shared || {};
+  let currentIndex = startIndex;
+  let results = [];
+  let chunks = 0;
+  let checkpointFailed = false;
+
+  while (currentIndex < campaignData.totalMessages && now() < deadline) {
+    const bucket = await readRecipientBucket(syncClient, campaignId, currentIndex);
+    if (!bucket || !bucket.recipients.length) {
+      throw new Error(`No stored recipients start at index ${currentIndex}`);
+    }
+
+    const chunkStart = currentIndex;
+    results = await send(bucket.recipients.map((entry) => unpackRecipient(entry, shared)), chunkStart);
+    chunks++;
+    currentIndex += bucket.recipients.length;
+
+    const accepted = results.filter((result) => result.success).length;
+    campaignData.sent = (campaignData.sent || 0) + accepted;
+    campaignData.failed = (campaignData.failed || 0) + (results.length - accepted);
+    campaignData.pending = Math.max(0, campaignData.totalMessages - campaignData.sent - campaignData.failed);
+    campaignData.startIndex = currentIndex;
+    campaignData.lastUpdated = new Date(now()).toISOString();
+
+    try {
+      await Promise.all(statusGroups(chunkStart, results).map((group) =>
+        writeStatusBucket(syncClient, campaignId, group.start, statusEntries(group.results, campaignData.lastUpdated))));
+      await syncClient.documents(campaignId).update({ data: campaignData });
+    } catch (error) {
+      console.error(`Checkpoint failed for ${campaignId} at index ${currentIndex}:`, error);
+      checkpointFailed = true;
+      break;
+    }
+  }
+
+  // A resume that starts past the stored index, after a failed checkpoint, and
+  // finds nothing left to send must still save the index, or the campaign would
+  // show as in progress forever.
+  if (!chunks && currentIndex !== storedIndex) {
+    campaignData.startIndex = currentIndex;
+    campaignData.lastUpdated = new Date(now()).toISOString();
+    try {
+      await syncClient.documents(campaignId).update({ data: campaignData });
+    } catch (error) {
+      console.error(`Checkpoint failed for ${campaignId} at index ${currentIndex}:`, error);
+      checkpointFailed = true;
+    }
+  }
+
+  return { resumeFrom: currentIndex, results, checkpointFailed };
+}
+
+/** The 200 body of send-messages.js and resume-execution.js. */
+function progressBody(campaignId, campaignData, startIndex, outcome) {
+  const isComplete = outcome.resumeFrom >= campaignData.totalMessages;
+  return {
+    success: true,
+    campaignId,
+    storedCount: campaignData.storedCount,
+    processed: outcome.resumeFrom - startIndex,
+    totalProcessed: outcome.resumeFrom,
+    totalMessages: campaignData.totalMessages,
+    isComplete,
+    hasMore: !isComplete,
+    resumeFrom: outcome.resumeFrom,
+    results: outcome.results,
+    checkpointFailed: outcome.checkpointFailed,
+    stats: {
+      sent: campaignData.sent,
+      failed: campaignData.failed,
+      pending: campaignData.pending,
+    },
+  };
+}
+
 module.exports = {
   STORAGE,
   RECIPIENT_BUCKET_MAX_ENTRIES,
@@ -347,4 +450,6 @@ module.exports = {
   writeStatusBucket,
   readStatusBuckets,
   updateStatusBucket,
+  runChunks,
+  progressBody,
 };

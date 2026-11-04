@@ -302,3 +302,144 @@ test('inBatches never runs more than the limit at once and keeps order', async (
   assert.deepStrictEqual(await storage.inBatches(tasks, 8), Array.from({ length: 20 }, (_, i) => i));
   assert.strictEqual(peak, 8);
 });
+
+/** A fully stored campaign of `count` recipients, as send-messages.js leaves it. */
+async function storedCampaign(count, extra) {
+  const sync = fakeSync();
+  const list = messages(count, extra);
+  const shared = storage.sharedFields(list);
+  await storage.createMaps(sync.client, 'campaign_1');
+  await storage.storeRecipients(sync.client, 'campaign_1', list, { startIndex: 0, shared, deadline: Infinity });
+  const campaignData = storage.newCampaignData({
+    ownerKey: 'owner', accountSid: 'AC1', totalMessages: count, shared,
+    channel: 'sms', from: FROM, campaignName: null, details: null, now: '2026-11-04T00:00:00.000Z',
+  });
+  campaignData.storedCount = count;
+  return { ...sync, campaignData, list };
+}
+
+/** A `send` that accepts every message except those `refuse(index)` picks. */
+function fakeSend(refuse = () => false) {
+  const chunks = [];
+  const send = async (batch, startIndex) => {
+    chunks.push({ startIndex, batch });
+    return batch.map((message, offset) => {
+      const index = startIndex + offset;
+      return refuse(index)
+        ? { index, success: false, error: 'Invalid To', errorCode: 21211, to: message.to }
+        : { index, success: true, sid: `SM${String(index).padStart(32, '0')}`, status: 'queued', to: message.to };
+    });
+  };
+  return { send, chunks };
+}
+
+test('runChunks sends one recipient bucket per chunk and checkpoints each', async () => {
+  const { client, state, campaignData, list } = await storedCampaign(200);
+  const { send, chunks } = fakeSend();
+  const outcome = await storage.runChunks({
+    syncClient: client, campaignId: 'campaign_1', campaignData, startIndex: 0, deadline: Infinity, send,
+  });
+
+  assert.deepStrictEqual(chunks.map((c) => [c.startIndex, c.batch.length]), [[0, 128], [128, 72]]);
+  assert.deepStrictEqual(chunks.flatMap((c) => c.batch), list);
+  assert.strictEqual(outcome.resumeFrom, 200);
+  assert.strictEqual(outcome.checkpointFailed, false);
+  assert.strictEqual(outcome.results.length, 72);
+  assert.deepStrictEqual(Object.keys(state.maps.campaign_1_statuses).sort(), [
+    '0000000', '0000032', '0000064', '0000096', '0000128', '0000160', '0000192',
+  ]);
+  assert.strictEqual(Object.keys(state.maps.campaign_1_statuses['0000192'].statuses).length, 8);
+  assert.strictEqual(state.calls.filter(([op]) => op === 'updateDocument').length, 2);
+  assert.strictEqual(state.documents.campaign_1.startIndex, 200);
+  assert.strictEqual(state.documents.campaign_1.sent, 200);
+  assert.strictEqual(state.documents.campaign_1.pending, 0);
+});
+
+test('runChunks stops at the deadline with resumeFrom on a bucket key', async () => {
+  const { client, campaignData } = await storedCampaign(200);
+  const { send, chunks } = fakeSend();
+  let clock = 0;
+  const slowSend = async (batch, startIndex) => {
+    clock += 5000;
+    return send(batch, startIndex);
+  };
+  const outcome = await storage.runChunks({
+    syncClient: client, campaignId: 'campaign_1', campaignData, startIndex: 0,
+    deadline: 4000, send: slowSend, now: () => clock,
+  });
+  assert.strictEqual(chunks.length, 1);
+  assert.strictEqual(outcome.resumeFrom, 128);
+});
+
+test('runChunks resumes from a bucket key and refuses an index inside a bucket', async () => {
+  const { client, campaignData } = await storedCampaign(200);
+  const { send, chunks } = fakeSend();
+  const run = (startIndex) => storage.runChunks({
+    syncClient: client, campaignId: 'campaign_1', campaignData, startIndex, deadline: Infinity, send,
+  });
+  await run(128);
+  assert.deepStrictEqual(chunks.map((c) => [c.startIndex, c.batch.length]), [[128, 72]]);
+  await assert.rejects(run(100), /No stored recipients start at index 100/);
+  assert.strictEqual(chunks.length, 1);
+});
+
+test('refused sends are recorded under their index and counted as failed', async () => {
+  const { client, state, campaignData } = await storedCampaign(3);
+  const { send } = fakeSend((index) => index === 1);
+  await storage.runChunks({
+    syncClient: client, campaignId: 'campaign_1', campaignData, startIndex: 0, deadline: Infinity, send,
+  });
+  const statuses = state.maps.campaign_1_statuses['0000000'].statuses;
+  assert.strictEqual(Object.keys(statuses).length, 3);
+  assert.strictEqual(statuses['failed-1'].errorCode, 21211);
+  assert.strictEqual(state.documents.campaign_1.sent, 2);
+  assert.strictEqual(state.documents.campaign_1.failed, 1);
+  assert.strictEqual(state.documents.campaign_1.pending, 0);
+});
+
+test('a failed checkpoint stops the loop but still moves resumeFrom past the sent chunk', async (t) => {
+  t.mock.method(console, 'error', () => {});
+  const { client, state, campaignData } = await storedCampaign(200);
+  state.failDocumentUpdate = true;
+  const { send, chunks } = fakeSend();
+  const outcome = await storage.runChunks({
+    syncClient: client, campaignId: 'campaign_1', campaignData, startIndex: 0, deadline: Infinity, send,
+  });
+  assert.strictEqual(chunks.length, 1);
+  assert.strictEqual(outcome.checkpointFailed, true);
+  assert.strictEqual(outcome.resumeFrom, 128);
+});
+
+test('a resume past the stored index with nothing left to send still saves the index', async () => {
+  const { client, state, campaignData } = await storedCampaign(3);
+  // As a failed checkpoint on the last chunk leaves it: all sent, index not saved.
+  const { send, chunks } = fakeSend();
+  const outcome = await storage.runChunks({
+    syncClient: client, campaignId: 'campaign_1', campaignData, startIndex: 3, deadline: Infinity, send,
+  });
+  assert.strictEqual(chunks.length, 0);
+  assert.strictEqual(outcome.resumeFrom, 3);
+  assert.strictEqual(outcome.checkpointFailed, false);
+  assert.strictEqual(state.documents.campaign_1.startIndex, 3);
+});
+
+test('progressBody reports progress the way the browser reads it', () => {
+  const outcome = { resumeFrom: 128, results: [], checkpointFailed: true };
+  assert.deepStrictEqual(
+    storage.progressBody('campaign_1', { totalMessages: 200, storedCount: 200, sent: 128, failed: 0, pending: 72 }, 0, outcome),
+    {
+      success: true,
+      campaignId: 'campaign_1',
+      storedCount: 200,
+      processed: 128,
+      totalProcessed: 128,
+      totalMessages: 200,
+      isComplete: false,
+      hasMore: true,
+      resumeFrom: 128,
+      results: [],
+      checkpointFailed: true,
+      stats: { sent: 128, failed: 0, pending: 72 },
+    }
+  );
+});
