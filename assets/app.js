@@ -1483,11 +1483,19 @@ async function continueCampaign(campaignId, resumeFrom) {
     let isComplete = false;
 
     while (!isComplete) {
-        const response = await postToFunction('resume-execution', { campaignId, resumeFrom });
-        const data = await response.json();
+        let response = null;
+        let data = null;
+        try {
+            response = await postToFunction('resume-execution', { campaignId, resumeFrom });
+            data = await response.json();
+        } catch (error) {
+            // A gateway timeout or a dropped connection has no JSON body.
+            console.error('resume-execution call failed:', error);
+        }
 
-        if (!response.ok) {
-            throw new Error(functionError(data, 'Failed to resume campaign'));
+        if (!data || !response.ok) {
+            const status = response ? `HTTP ${response.status}` : 'no response';
+            throw new Error(functionError(data, `Failed to resume campaign (${status})`));
         }
 
         resumeFrom = data.resumeFrom;
