@@ -18,11 +18,11 @@ const classicMessages = require(Runtime.getAssets()['/classic-messages.js'].path
 const FETCH_DEADLINE_MS = 6500;
 
 /**
- * Status buckets refreshed per poll: up to 768 fetches, and no more writes
- * than Sync's 20/s per Map comfortably allows. A larger campaign's buckets take
- * turns, least recently checked first, over several polls.
+ * Chunks refreshed per poll: up to 384 fetches and 3 writes, leaving most of the
+ * chunk Map's write rate (about 2 a second) to sending. A larger campaign's
+ * chunks take turns, least recently checked first, over several polls.
  */
-const MAX_REFRESH_BUCKETS = 24;
+const MAX_REFRESH_CHUNKS = 3;
 
 /**
  * A Function response is capped at 4 MB. Past this, roughly 13,000 messages,
@@ -101,60 +101,48 @@ exports.handler = async function(context, event, callback) {
       return callback(null, response);
     }
 
-    // A bucketed campaign keeps its statuses in a Map. One stored before that
-    // keeps them inline, on the Document, and is treated as a single bucket.
-    const bucketed = storage.isBucketed(campaignData);
-    const buckets = bucketed
-      ? await storage.readStatusBuckets(syncClient, campaignId)
-      : [{ key: null, statuses: campaignData.statuses || {}, checkedAt: null }];
-
-    const { selected, takingTurns } = classicMessages.selectRefreshBuckets(
-      buckets, campaignData.channel, MAX_REFRESH_BUCKETS);
-
-    // In bucket order, so each bucket's statuses are fetched together and as
-    // many buckets as possible are refreshed in full.
-    const refreshed = await classicMessages.refreshStatuses(
-      client,
-      Object.assign({}, ...selected.map((bucket) => bucket.statuses)),
-      { channel: campaignData.channel, deadline: startTime + FETCH_DEADLINE_MS }
-    );
-
+    // `refresh: false` reads only: the page sends it while this tab is sending,
+    // so polls take nothing from the chunk Map's write rate.
+    const refresh = event.refresh !== false && event.refresh !== 'false';
+    const channel = campaignData.channel;
     const checkedAt = new Date().toISOString();
-    const updates = classicMessages.bucketUpdates(selected, refreshed, {
-      channel: campaignData.channel, takingTurns, checkedAt,
-    });
-    const refreshedStatuses = new Map(updates.map((update) => [update.key, update.statuses]));
-    const current = buckets.map((bucket) => refreshedStatuses.get(bucket.key) || bucket.statuses);
+    let statuses;
 
-    // A claim's placeholders read as sending while it is young, then as not
-    // confirmed. That status is for the response and counters only: it is
-    // never written back.
-    const now = Date.now();
-    const statuses = Object.assign({}, ...current.map((bucketStatuses, i) =>
-      classicMessages.placeholderStatuses(bucketStatuses, buckets[i].claimedAt, now)));
-
-    if (bucketed) {
-      // Each write is conditional on the revision read above. A 412 means a
-      // send or another poll wrote the bucket since, and is skipped. A failed
-      // write does not fail the poll: the stored entry is still pending, so a
-      // later poll fetches and writes it again.
-      const toWrite = updates.filter((update) => update.write);
-      const outcomes = await storage.inBatches(toWrite.map((update) => () =>
-        storage.updateStatusBucket(syncClient, campaignId, update.key, update.statuses, update.checkedAt, update.revision)
-          .then(() => null, (error) => error)));
-      outcomes.forEach((error, i) => {
-        if (error && error.status !== 412) {
-          console.error(`Could not save status bucket ${toWrite[i].key} of ${campaignId}:`, error);
+    if (storage.isLean(campaignData)) {
+      const chunks = await storage.readChunks(syncClient, campaignId);
+      if (refresh) {
+        const { selected, takingTurns } = storage.selectChunks(chunks, channel, MAX_REFRESH_CHUNKS);
+        const sids = selected.flatMap((chunk) => storage.pendingRows(chunk, channel).map((i) => chunk.rows[i][0]));
+        const fetched = await classicMessages.fetchStatuses(client, sids, { deadline: startTime + FETCH_DEADLINE_MS });
+        const plan = storage.refreshPlan(selected, fetched, { channel, takingTurns, checkedAt });
+        const refreshed = new Map(plan.map((entry) => [entry.chunk.key, entry.chunk]));
+        chunks.forEach((chunk, i) => {
+          if (refreshed.has(chunk.key)) chunks[i] = refreshed.get(chunk.key);
+        });
+        // One at a time: at most three, and each conditional on the revision
+        // read. A 412 means a send wrote the record since; a later poll retries.
+        for (const entry of plan.filter((item) => item.write)) {
+          try {
+            await storage.updateChunk(syncClient, campaignId, entry.chunk);
+          } catch (error) {
+            if (error.status !== 412) console.error(`Could not save chunk ${entry.chunk.key} of ${campaignId}:`, error);
+          }
         }
-      });
+      }
+      const now = Date.now();
+      statuses = Object.assign({}, ...chunks.map((chunk) => storage.chunkStatuses(chunk, now)));
     } else {
-      campaignData.statuses = current[0];
+      // An older campaign keeps its statuses inline, on the Document.
+      statuses = campaignData.statuses || {};
+      if (refresh) {
+        const fetched = await classicMessages.fetchStatuses(client, storage.legacyPending(statuses, channel),
+          { deadline: startTime + FETCH_DEADLINE_MS });
+        statuses = storage.applyLegacy(statuses, fetched);
+        campaignData.statuses = statuses;
+      }
     }
 
-    campaignData.lastUpdated = checkedAt;
-
-    // As refreshed, whether or not each bucket's write landed.
-    const counts = classicMessages.tally(statuses);
+    const counts = storage.tally(statuses);
     campaignData.sent = counts.sent;
     campaignData.delivered = counts.delivered;
     campaignData.read = counts.read;
@@ -162,13 +150,16 @@ exports.handler = async function(context, event, callback) {
     campaignData.pending = counts.pending;
     campaignData.unconfirmed = counts.unconfirmed;
 
-    // Conditional on the revision read above. A send that checkpointed since
-    // then owns startIndex, and writing this older copy over it would move the
-    // index back. Losing this write costs a stale counter until the next poll.
-    try {
-      await syncClient.documents(campaignId).update({ data: campaignData, ifMatch: revision });
-    } catch (error) {
-      if (error.status !== 412) throw error;
+    if (refresh) {
+      campaignData.lastUpdated = checkedAt;
+      // Conditional on the revision read above. A send that saved progress
+      // since then owns startIndex; losing this write costs a stale counter
+      // until the next poll.
+      try {
+        await syncClient.documents(campaignId).update({ data: campaignData, ifMatch: revision });
+      } catch (error) {
+        if (error.status !== 412) throw error;
+      }
     }
 
     const statusesFit = Buffer.byteLength(JSON.stringify(statuses), 'utf8') <= MAX_STATUSES_BYTES;

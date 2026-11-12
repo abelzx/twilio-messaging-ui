@@ -55,7 +55,7 @@ exports.handler = async function(context, event, callback) {
 
       // `!campaignData` guard so one malformed document skips itself rather than
       // throwing and turning the caller's whole campaign list into a 500. Same
-      // shape as the checks in check-status.js and resume-execution.js.
+      // shape as the checks in check-status.js and send-messages.js.
       if (!campaignData || campaignData.ownerKey !== ownerKey) {
         continue;
       }
@@ -118,9 +118,10 @@ exports.handler = async function(context, event, callback) {
         read: campaignData.read || read,
         startIndex: campaignData.startIndex || 0,
         isComplete: (campaignData.startIndex || 0) >= (campaignData.totalMessages || 0),
-        // False for older campaigns and for ones whose upload was cut off;
-        // see resume-execution.js.
-        resumable: storage.isFullyStored(campaignData),
+        // Continued by sending the same list again, recognised by fingerprint.
+        // Older campaigns cannot be continued.
+        resumable: storage.isLean(campaignData) && (campaignData.startIndex || 0) < (campaignData.totalMessages || 0),
+        fingerprint: storage.isLean(campaignData) ? campaignData.fingerprint || null : null,
         createdAt: campaignData.createdAt,
         lastUpdated: campaignData.lastUpdated,
         campaignName: campaignData.campaignName || null,
