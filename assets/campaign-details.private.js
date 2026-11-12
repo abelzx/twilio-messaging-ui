@@ -216,7 +216,7 @@ function resolveDetails(campaignData) {
   const data = asObject(campaignData) || {};
   const bulk = data.mode === 'bulk';
   const stored = asObject(data.details);
-  // A bucketed classic campaign stores what every message had in common as
+  // A lean classic campaign stores what every message had in common as
   // `shared`. An older one held its whole list, so messages[0] stands in.
   const first = (!bulk && (asObject(data.shared) ||
     (Array.isArray(data.messages) && asObject(data.messages[0])))) || {};

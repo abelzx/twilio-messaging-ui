@@ -17,10 +17,9 @@ let currentCampaignId = null;
 // opened while the toggle reads "classic" must still be polled as bulk, or its
 // auto-refresh timer would call check-status and get a 409 every 5 seconds.
 let currentCampaignMode = 'classic';
-// The classic campaign this tab is sending or resuming, if any. The campaign
+// The classic campaign this tab is sending or continuing, if any. The campaign
 // list offers no Resume button for it while the send is running.
 let activeSendCampaignId = null;
-let resumeInterval = null;
 let statusRefreshInterval = null;
 // True while a status poll is in flight, so the 5-second timer and the send
 // loop never run two at once.
@@ -48,9 +47,10 @@ let displayedCampaign = null;
 
 /**
  * A real Twilio message SID: two-letter prefix plus 32 hex. Sends Twilio
- * rejected outright never got one, so send-messages.js records them under a
- * synthetic "failed-<n>" key; this tells the two apart for display. Mirrors the
- * same constant in functions/check-status.js.
+ * rejected outright never got one, so check-status reports them under a
+ * synthetic "failed-<n>" key, and recipients with no saved result under
+ * "unconfirmed-<n>"; this tells them apart for display. Mirrors MESSAGE_SID in
+ * assets/classic-campaign.private.js.
  */
 const MESSAGE_SID = /^[A-Z]{2}[0-9a-f]{32}$/i;
 
@@ -732,10 +732,6 @@ function handleLogout() {
     currentCampaignId = null;
     currentCampaignMode = 'classic';
     loadedCampaigns = [];
-    if (resumeInterval) {
-        clearInterval(resumeInterval);
-        resumeInterval = null;
-    }
     if (statusRefreshInterval) {
         clearInterval(statusRefreshInterval);
         statusRefreshInterval = null;
@@ -842,7 +838,7 @@ function sendNoteIdleText() {
 }
 
 const SEND_NOTE_ACTIVE = 'Sending — keep this tab open. Closing it stops the campaign, '
-    + 'though progress is saved and you can resume from Campaigns.';
+    + 'though progress is saved: send the same list again to continue it.';
 
 // Bulk has no chunk loop and no client-driven checkpoint to lose, so the
 // in-flight note only needs to cover the brief window of the single request.
@@ -2146,8 +2142,7 @@ function displayCampaigns(campaigns) {
     campaigns.forEach(campaign => {
         const isActive = campaign.campaignId === currentCampaignId;
         // Progress is how far through the recipient list we are, not a ratio of
-        // send attempts — a resent chunk would otherwise push this past 100%.
-        // Bulk rows have no startIndex, and their `sent` deliberately excludes
+        // send attempts. Bulk rows have no startIndex, and their `sent` deliberately excludes
         // failed/unaddressable recipients while totalMessages counts everyone —
         // so a finished bulk campaign with any failures would otherwise read
         // under 100% next to a "Complete" badge. totalMessages - pending counts
@@ -2161,11 +2156,9 @@ function displayCampaigns(campaigns) {
         const progress = campaign.totalMessages > 0
             ? Math.min(100, (processed / campaign.totalMessages) * 100).toFixed(1)
             : 0;
-        // Total is the campaign's message count. That normally equals the number of
-        // recipients, but a resent chunk creates more messages than recipients, and
-        // the delivery table lists every one — so show the larger of the two. The
-        // progress bar above deliberately keeps dividing by totalMessages, or a
-        // finished campaign with a resend would read 60% instead of 100%.
+        // Total is the campaign's message count, or its sends where a campaign
+        // saved in an older layout recorded more; the delivery table lists every
+        // one. The progress bar above keeps dividing by totalMessages.
         const messageCount = Math.max(campaign.totalMessages || 0, campaign.sent || 0);
         
         const createdDate = campaign.createdAt 
