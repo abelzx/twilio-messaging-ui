@@ -818,9 +818,9 @@ const SEND_NOTE_ACTIVE_BULK = 'Submitting to Twilio…';
 /**
  * Single owner of the Send button's state, and of the advisory beneath it.
  *
- * The chunk loop lives in sendMessagesBatch() in this file, not on the server:
- * each round trip sends what fits in one 9-second Function invocation and the
- * browser initiates the next. Credentials live only in sessionStorage, so
+ * The send loop lives in sendMessagesBatch() in this file, not on the server:
+ * each round trip sends one slice of the list, starting no chunk after 7
+ * seconds, and the browser sends the next. Credentials live only in sessionStorage, so
  * nothing server-side could continue the campaign on its own. Closing the tab
  * therefore halts sending — hence the promotion to a warning while in flight.
  *

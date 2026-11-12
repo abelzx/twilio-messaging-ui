@@ -98,7 +98,7 @@ While a file is loaded it is the single source of truth: the Recipients box and 
 
 Rows with a problem are skipped and listed by line number — a missing number, or a column count that doesn't match the header — and the rest still send. A blank variable cell sends as empty text rather than falling back to the template's sample value, which would put someone else's placeholder data in a real message. A blank `Body` cell does fall back to the message body typed above, and the summary says how many rows that affected.
 
-> **On Programmable Messaging, keep the tab open while sending.** The chunk loop runs in your browser, not on Twilio. Each request sends what fits in one 9-second Function invocation and returns; the page then initiates the next. Your credentials live only in this tab, so nothing server-side can carry the campaign on by itself.
+> **On Programmable Messaging, keep the tab open while sending.** The send loop runs in your browser, not on Twilio. Each request sends one slice of the list, starting no chunk after 7 seconds, and returns; the page then sends the next slice. Your credentials live only in this tab, so nothing server-side can carry the campaign on by itself.
 >
 > This does not apply in Bulk Messaging mode: one request covers the whole campaign (up to 10,000 recipients), Twilio processes it after that, and you can close the tab as soon as the request is accepted.
 >

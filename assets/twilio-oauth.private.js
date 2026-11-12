@@ -146,14 +146,14 @@ function withDeadline(promise, ms, message) {
  * token endpoint strands the whole invocation: the platform kills it and the
  * caller gets no response at all rather than a readable error.
  *
- * That matters most in `send-messages.js`, which calls
- * this once per 100-message chunk — roughly 50 times for a 5,000-message
- * campaign, each one a fresh chance to lose an invocation. Worse, a kill
- * mid-chunk can leave messages sent but not yet recorded in Sync, so the
- * browser's retry re-sends them and a recipient gets the message twice.
+ * That matters most in `send-messages.js`, which calls this once per slice of
+ * up to 1,024 recipients — about ten times for a 10,000-recipient campaign,
+ * each a fresh chance to lose an invocation. A lost invocation no longer risks
+ * a duplicate, because every chunk is claimed in Sync before it is sent, but
+ * the chunk it was sending is left "not confirmed".
  *
- * Bounding it here rather than in each Function is deliberate: all six callers
- * inherit the protection, including any added later.
+ * Bounding it here rather than in each Function is deliberate: every caller
+ * inherits the protection, including any added later.
  */
 async function authenticateWithToken(creds, timeoutMs = TOKEN_DEADLINE_MS) {
   const { client, authStrategy } = createOAuthClient(creds);
