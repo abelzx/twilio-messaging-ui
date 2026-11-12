@@ -74,8 +74,21 @@ const MESSAGE_SID = /^[A-Z]{2}[0-9a-f]{32}$/i;
 
 const KEY_DIGITS = 7;
 
+const NOT_FOUND = 20404;
+const ITEM_EXISTS = 54208;
+const NAME_TAKEN = 54301;
+
 function byteSize(value) {
   return Buffer.byteLength(JSON.stringify(value), 'utf8');
+}
+
+function isNotFound(error) {
+  return Boolean(error) && (error.status === 404 || error.code === NOT_FOUND);
+}
+
+/** Sync refused a write for its rate, even after the client's own retries. */
+function isRateLimited(error) {
+  return Boolean(error) && (error.status === 429 || error.code === 20429);
 }
 
 function chunkKey(start) {
@@ -294,6 +307,161 @@ function tally(statuses) {
   return counts;
 }
 
+/** Creates the campaign's chunk Map. One left by an earlier attempt is reused. */
+async function createChunksMap(syncClient, campaignId) {
+  try {
+    await syncClient.syncMaps.create({ uniqueName: chunksMapName(campaignId) });
+  } catch (error) {
+    if (error.code !== NAME_TAKEN) throw error;
+  }
+}
+
+/**
+ * Claims the chunk starting at `start` before any of it is sent, by creating
+ * its record holding the recipients' numbers. Sync refuses a key that exists,
+ * so resolves to false when the chunk is already claimed, by another sender or
+ * by an earlier attempt that may have sent it.
+ */
+async function claimChunk(syncClient, campaignId, start, messages, claimedAt) {
+  try {
+    await syncClient.syncMaps(chunksMapName(campaignId)).syncMapItems.create({
+      key: chunkKey(start),
+      data: { claimedAt, to: messages.map((message) => message.to) },
+    });
+    return true;
+  } catch (error) {
+    if (error.code === ITEM_EXISTS) return false;
+    throw error;
+  }
+}
+
+/** Records a sent chunk's rows over its claim. */
+async function recordChunk(syncClient, campaignId, start, { claimedAt, to }, rows, sentAt) {
+  await syncClient.syncMaps(chunksMapName(campaignId)).syncMapItems(chunkKey(start)).update({
+    data: { claimedAt, to, sentAt, rows },
+  });
+}
+
+/** Every chunk record in send order, or [] when the Map is missing. */
+async function readChunks(syncClient, campaignId) {
+  let items;
+  try {
+    items = await syncClient.syncMaps(chunksMapName(campaignId)).syncMapItems.list({ pageSize: 100 });
+  } catch (error) {
+    if (isNotFound(error)) return [];
+    throw error;
+  }
+  return items.map((item) => ({ ...(item.data || {}), key: item.key, start: Number(item.key), revision: item.revision }));
+}
+
+/**
+ * Writes a refreshed chunk record back, conditional on the revision it was
+ * read at: a 412 means something wrote it since.
+ */
+async function updateChunk(syncClient, campaignId, chunk) {
+  const { claimedAt, to, sentAt, rows, checkedAt, settled } = chunk;
+  await syncClient.syncMaps(chunksMapName(campaignId)).syncMapItems(chunk.key).update({
+    data: { claimedAt, to, sentAt, rows, checkedAt, settled },
+    ...(chunk.revision ? { ifMatch: chunk.revision } : {}),
+  });
+}
+
+/**
+ * Sends `messages`, the slice of the campaign starting at `offset`, chunk by
+ * chunk until the slice is done or `deadline` passes: claiming each chunk,
+ * sending it, recording its rows. A chunk already claimed is skipped, uncounted,
+ * because it may have been sent. Chunk starts are at least `interval` apart,
+ * to stay under the Map's write rate.
+ *
+ * `send(messages, startIndex)` is classic-messages.js sendChunk, passed in
+ * because deployed assets cannot require each other. `campaignData` is the
+ * Document's data, updated in place and written once, at the end.
+ *
+ * Resolves to { resumeFrom, checkpointFailed, throttled }: where the next call
+ * starts; whether a result or the Document could not be saved; and whether Sync
+ * refused a write for its rate, so the caller should wait before the next call.
+ * A sent chunk whose rows cannot be recorded keeps its claim, so its recipients
+ * show as not confirmed rather than disappearing. Throws only when the first
+ * claim fails for a reason other than the rate.
+ */
+async function runChunks({
+  syncClient, campaignId, campaignData, messages, offset, deadline, send,
+  now = Date.now, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), interval = CHUNK_INTERVAL_MS,
+}) {
+  const end = offset + messages.length;
+  let currentIndex = offset;
+  let checkpointFailed = false;
+  let throttled = false;
+
+  while (currentIndex < end && now() < deadline) {
+    const chunkStart = currentIndex;
+    const started = now();
+    const batch = messages.slice(chunkStart - offset, chunkStart - offset + CHUNK_SIZE);
+    const claimedAt = new Date(started).toISOString();
+
+    let claimed;
+    try {
+      claimed = await claimChunk(syncClient, campaignId, chunkStart, batch, claimedAt);
+    } catch (error) {
+      if (isRateLimited(error)) {
+        throttled = true;
+        break;
+      }
+      if (currentIndex === offset) throw error;
+      console.error(`Could not claim ${campaignId} at index ${chunkStart}:`, error);
+      break;
+    }
+    currentIndex += batch.length;
+
+    if (claimed) {
+      const results = await send(batch, chunkStart);
+      const accepted = results.filter((result) => result.success).length;
+      campaignData.sent = (campaignData.sent || 0) + accepted;
+      campaignData.failed = (campaignData.failed || 0) + (results.length - accepted);
+      try {
+        await recordChunk(syncClient, campaignId, chunkStart,
+          { claimedAt, to: batch.map((message) => message.to) }, rowsFor(results), new Date(now()).toISOString());
+      } catch (error) {
+        console.error(`Could not record ${campaignId} at index ${chunkStart}:`, error);
+        checkpointFailed = true;
+        throttled = throttled || isRateLimited(error);
+        break;
+      }
+    }
+
+    const elapsed = now() - started;
+    if (currentIndex < end && elapsed < interval) await sleep(interval - elapsed);
+  }
+
+  // Once per call. With claims guarding every chunk, a stale stored index can
+  // only make a later call skip chunks already claimed, never re-send them.
+  campaignData.startIndex = Math.max(campaignData.startIndex || 0, currentIndex);
+  campaignData.pending = Math.max(0, campaignData.totalMessages - (campaignData.sent || 0) - (campaignData.failed || 0));
+  campaignData.lastUpdated = new Date(now()).toISOString();
+  try {
+    await syncClient.documents(campaignId).update({ data: campaignData });
+  } catch (error) {
+    console.error(`Could not save progress for ${campaignId} at index ${currentIndex}:`, error);
+    checkpointFailed = true;
+  }
+
+  return { resumeFrom: currentIndex, checkpointFailed, throttled };
+}
+
+/** The 200 body of send-messages.js. */
+function progressBody(campaignId, campaignData, outcome) {
+  return {
+    success: true,
+    campaignId,
+    totalMessages: campaignData.totalMessages,
+    resumeFrom: outcome.resumeFrom,
+    isComplete: outcome.resumeFrom >= campaignData.totalMessages,
+    checkpointFailed: outcome.checkpointFailed,
+    throttled: outcome.throttled,
+    stats: { sent: campaignData.sent, failed: campaignData.failed },
+  };
+}
+
 module.exports = {
   STORAGE,
   CHUNK_SIZE,
@@ -315,4 +483,11 @@ module.exports = {
   legacyPending,
   applyLegacy,
   tally,
+  createChunksMap,
+  claimChunk,
+  recordChunk,
+  readChunks,
+  updateChunk,
+  runChunks,
+  progressBody,
 };

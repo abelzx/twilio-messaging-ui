@@ -202,3 +202,239 @@ test('a full chunk record stays under 16 KiB, and a claim under 10 KiB, on the l
   };
   assert.ok(size(full) < 16 * 1024, `record is ${size(full)} bytes`);
 });
+
+function syncError(status, code) {
+  return Object.assign(new Error(`Sync ${status}`), { status, code });
+}
+
+/**
+ * Just enough of twilio-node's Sync surface: `syncMaps` and `syncMapItems` are
+ * callable and carry methods, as in the SDK. Items carry a revision; update
+ * honours `ifMatch`. `fail` holds the next errors per operation.
+ */
+function fakeSync() {
+  const state = { maps: {}, documents: {}, calls: [], fail: { create: [], update: [], document: [] } };
+  const take = (op) => state.fail[op].shift();
+  const itemsOf = (name) => {
+    if (!state.maps[name]) throw syncError(404, 20404);
+    return state.maps[name];
+  };
+  const syncMaps = (name) => {
+    const syncMapItems = (key) => ({
+      update: async ({ data, ifMatch }) => {
+        state.calls.push(['update', key]);
+        const error = take('update');
+        if (error) throw error;
+        const items = itemsOf(name);
+        if (!(key in items)) throw syncError(404, 20404);
+        if (ifMatch && ifMatch !== items[key].revision) throw syncError(412, 54103);
+        items[key] = { data, revision: String(Number(items[key].revision) + 1) };
+      },
+    });
+    syncMapItems.create = async ({ key, data }) => {
+      state.calls.push(['create', key]);
+      const error = take('create');
+      if (error) throw error;
+      const items = itemsOf(name);
+      if (key in items) throw syncError(409, 54208);
+      items[key] = { data, revision: '0' };
+    };
+    syncMapItems.list = async () => {
+      const items = itemsOf(name);
+      return Object.keys(items).sort().map((key) => ({ key, data: items[key].data, revision: items[key].revision }));
+    };
+    return { syncMapItems };
+  };
+  syncMaps.create = async ({ uniqueName }) => {
+    if (state.maps[uniqueName]) throw syncError(409, 54301);
+    state.maps[uniqueName] = {};
+  };
+  const documents = (name) => ({
+    update: async ({ data }) => {
+      state.calls.push(['document', name]);
+      const error = take('document');
+      if (error) throw error;
+      state.documents[name] = JSON.parse(JSON.stringify(data));
+    },
+  });
+  return { client: { syncMaps, documents }, state };
+}
+
+/** A `send` that accepts every message except those `refuse(index)` picks. */
+function fakeSend(refuse = () => false) {
+  const chunks = [];
+  const send = async (batch, startIndex) => {
+    chunks.push([startIndex, batch.length]);
+    return batch.map((message, offset) => {
+      const index = startIndex + offset;
+      return refuse(index)
+        ? { index, success: false, error: 'Invalid To', errorCode: 21211, to: message.to }
+        : { index, success: true, sid: sid(index), status: 'queued', to: message.to };
+    });
+  };
+  return { send, chunks };
+}
+
+async function campaign(total) {
+  const sync = fakeSync();
+  await storage.createChunksMap(sync.client, 'campaign_1');
+  const list = messages(total);
+  const campaignData = storage.newCampaignData({
+    ownerKey: 'o', accountSid: 'AC1', totalMessages: total, fingerprint: 'f'.repeat(64),
+    shared: { from: FROM }, channel: 'sms', from: FROM, campaignName: null, details: null,
+    now: '2026-11-12T00:00:00.000Z',
+  });
+  return { ...sync, list, campaignData };
+}
+
+/** runChunks with no real waiting: `sleep` only records. */
+function run(ctx, overrides) {
+  const sleeps = [];
+  const promise = storage.runChunks({
+    syncClient: ctx.client, campaignId: 'campaign_1', campaignData: ctx.campaignData,
+    messages: ctx.list, offset: 0, deadline: Infinity, sleep: async (ms) => { sleeps.push(ms); },
+    ...overrides,
+  });
+  return { promise, sleeps };
+}
+
+test('createChunksMap tolerates a Map left by an earlier attempt', async () => {
+  const { client, state } = fakeSync();
+  await storage.createChunksMap(client, 'campaign_1');
+  await storage.createChunksMap(client, 'campaign_1');
+  assert.deepStrictEqual(Object.keys(state.maps), ['campaign_1_chunks']);
+});
+
+test('runChunks claims, sends and records each chunk, and writes the Document once', async () => {
+  const ctx = await campaign(300);
+  const { send, chunks } = fakeSend((i) => i === 5);
+  const { promise } = run(ctx, { send });
+  const outcome = await promise;
+  assert.deepStrictEqual(chunks, [[0, 128], [128, 128], [256, 44]]);
+  assert.deepStrictEqual(outcome, { resumeFrom: 300, checkpointFailed: false, throttled: false });
+  const map = ctx.state.maps.campaign_1_chunks;
+  assert.deepStrictEqual(Object.keys(map), ['0000000', '0000128', '0000256']);
+  assert.strictEqual(map['0000000'].data.to.length, 128);
+  assert.deepStrictEqual(map['0000000'].data.rows[5], [null, 'failed', 21211, null]);
+  assert.deepStrictEqual(map['0000256'].data.rows[0], [sid(256), 'queued', null, null]);
+  assert.strictEqual(ctx.state.calls.filter(([op]) => op === 'document').length, 1);
+  assert.strictEqual(ctx.state.documents.campaign_1.startIndex, 300);
+  assert.strictEqual(ctx.state.documents.campaign_1.sent, 299);
+  assert.strictEqual(ctx.state.documents.campaign_1.failed, 1);
+});
+
+test('runChunks sends a later slice under its own keys', async () => {
+  const ctx = await campaign(400);
+  const { send, chunks } = fakeSend();
+  const { promise } = run(ctx, { send, messages: ctx.list.slice(256), offset: 256 });
+  const outcome = await promise;
+  assert.deepStrictEqual(chunks, [[256, 128], [384, 16]]);
+  assert.strictEqual(outcome.resumeFrom, 400);
+  assert.deepStrictEqual(Object.keys(ctx.state.maps.campaign_1_chunks), ['0000256', '0000384']);
+});
+
+test('a chunk already claimed is skipped, not sent again', async () => {
+  const ctx = await campaign(300);
+  ctx.state.maps.campaign_1_chunks['0000000'] = { data: { claimedAt: 'x', to: [] }, revision: '0' };
+  const { send, chunks } = fakeSend();
+  const { promise } = run(ctx, { send });
+  const outcome = await promise;
+  assert.deepStrictEqual(chunks, [[128, 128], [256, 44]]);
+  assert.strictEqual(outcome.resumeFrom, 300);
+  assert.strictEqual(ctx.state.documents.campaign_1.sent, 172);
+});
+
+test('chunks are paced, and none starts after the deadline', async () => {
+  const ctx = await campaign(400);
+  let clock = 0;
+  const { send, chunks } = fakeSend();
+  // The fake clock moves only while sending, 300 ms a chunk; sleeps are recorded, not waited.
+  const timedSend = async (batch, start) => { clock += 300; return send(batch, start); };
+  const { promise, sleeps } = run(ctx, { send: timedSend, now: () => clock, interval: 1000, deadline: 700 });
+  const outcome = await promise;
+  // Chunks start at 0, 300 and 600; at 900 the deadline has passed.
+  assert.deepStrictEqual(chunks, [[0, 128], [128, 128], [256, 128]]);
+  assert.deepStrictEqual(sleeps, [700, 700, 700]);
+  assert.strictEqual(outcome.resumeFrom, 384);
+
+  const late = await campaign(400);
+  const { promise: stopped } = run(late, { send: fakeSend().send, now: () => 2000, deadline: 1500 });
+  assert.strictEqual((await stopped).resumeFrom, 0);
+});
+
+test('no pause follows the last chunk of a slice', async () => {
+  const ctx = await campaign(200);
+  let clock = 0;
+  const { send } = fakeSend();
+  const { promise, sleeps } = run(ctx, {
+    send: async (batch, start) => { clock += 100; return send(batch, start); },
+    now: () => clock,
+    interval: 1000,
+  });
+  await promise;
+  assert.deepStrictEqual(sleeps, [900]);
+});
+
+test('a claim refused for Sync\'s rate stops the call without failing it', async () => {
+  const ctx = await campaign(300);
+  ctx.state.fail.create.push(undefined, syncError(429, 20429));
+  const { send, chunks } = fakeSend();
+  const { promise } = run(ctx, { send });
+  const outcome = await promise;
+  assert.deepStrictEqual(chunks, [[0, 128]]);
+  assert.deepStrictEqual(outcome, { resumeFrom: 128, checkpointFailed: false, throttled: true });
+  assert.strictEqual(ctx.state.documents.campaign_1.startIndex, 128);
+});
+
+test('a claim error before anything was sent fails the call; after, it ends it', async (t) => {
+  t.mock.method(console, 'error', () => {});
+  const before = await campaign(300);
+  before.state.fail.create.push(syncError(500, 20500));
+  await assert.rejects(run(before, { send: fakeSend().send }).promise, /Sync 500/);
+
+  const after = await campaign(300);
+  after.state.fail.create.push(undefined, syncError(500, 20500));
+  const outcome = await run(after, { send: fakeSend().send }).promise;
+  assert.strictEqual(outcome.resumeFrom, 128);
+});
+
+test('a result that cannot be recorded leaves the claim, and says so', async (t) => {
+  t.mock.method(console, 'error', () => {});
+  const ctx = await campaign(300);
+  ctx.state.fail.update.push(syncError(429, 20429));
+  const { send, chunks } = fakeSend();
+  const outcome = await run(ctx, { send }).promise;
+  assert.deepStrictEqual(chunks, [[0, 128]]);
+  assert.deepStrictEqual(outcome, { resumeFrom: 128, checkpointFailed: true, throttled: true });
+  assert.strictEqual(ctx.state.maps.campaign_1_chunks['0000000'].data.rows, undefined);
+  assert.strictEqual(ctx.state.maps.campaign_1_chunks['0000000'].data.to.length, 128);
+});
+
+test('a failed Document write is reported, and the progress still returned', async (t) => {
+  t.mock.method(console, 'error', () => {});
+  const ctx = await campaign(200);
+  ctx.state.fail.document.push(syncError(500, 20500));
+  const outcome = await run(ctx, { send: fakeSend().send }).promise;
+  assert.deepStrictEqual(outcome, { resumeFrom: 200, checkpointFailed: true, throttled: false });
+});
+
+test('readChunks and updateChunk round-trip a record, conditional on its revision', async () => {
+  const ctx = await campaign(200);
+  await run(ctx, { send: fakeSend().send }).promise;
+  const chunks = await storage.readChunks(ctx.client, 'campaign_1');
+  assert.deepStrictEqual(chunks.map((c) => [c.key, c.start, c.revision]), [['0000000', 0, '1'], ['0000128', 128, '1']]);
+  await storage.updateChunk(ctx.client, 'campaign_1', { ...chunks[0], checkedAt: 'now' });
+  assert.strictEqual(ctx.state.maps.campaign_1_chunks['0000000'].data.checkedAt, 'now');
+  await assert.rejects(storage.updateChunk(ctx.client, 'campaign_1', chunks[0]), /Sync 412/);
+  assert.deepStrictEqual(await storage.readChunks(fakeSync().client, 'campaign_9'), []);
+});
+
+test('progressBody reports progress the way the browser reads it', () => {
+  assert.deepStrictEqual(
+    storage.progressBody('campaign_1', { totalMessages: 300, sent: 128, failed: 0 }, { resumeFrom: 128, checkpointFailed: false, throttled: true }),
+    {
+      success: true, campaignId: 'campaign_1', totalMessages: 300, resumeFrom: 128, isComplete: false,
+      checkpointFailed: false, throttled: true, stats: { sent: 128, failed: 0 },
+    }
+  );
+});
