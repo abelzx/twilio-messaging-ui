@@ -47,6 +47,12 @@ const CHUNK_SIZE = 128;
  */
 const CHUNK_INTERVAL_MS = 1100;
 
+/**
+ * How long a chunk is assumed to take before one has been timed in this call.
+ * Each chunk is then assumed to take as long as the longest so far.
+ */
+const FIRST_CHUNK_ESTIMATE_MS = 2500;
+
 /** Budget for the display fields stored once on the Document. */
 const SHARED_MAX_BYTES = 4 * 1024;
 
@@ -368,10 +374,12 @@ async function updateChunk(syncClient, campaignId, chunk) {
 
 /**
  * Sends `messages`, the slice of the campaign starting at `offset`, chunk by
- * chunk until the slice is done or `deadline` passes: claiming each chunk,
- * sending it, recording its rows. A chunk already claimed is skipped, uncounted,
- * because it may have been sent. Chunk starts are at least `interval` apart,
- * to stay under the Map's write rate.
+ * chunk until the slice is done, `deadline` passes, or the next chunk would
+ * end after `finishBy` if it took as long as the longest so far: claiming each
+ * chunk, sending it, recording its rows. A chunk already claimed is skipped,
+ * uncounted, because it may have been sent. Chunk starts are at least
+ * `interval` apart, to stay under the Map's write rate; there is no wait when
+ * the next chunk could not start after it.
  *
  * `send(messages, startIndex)` is classic-messages.js sendChunk, passed in
  * because deployed assets cannot require each other. `campaignData` is the
@@ -385,15 +393,17 @@ async function updateChunk(syncClient, campaignId, chunk) {
  * claim fails for a reason other than the rate.
  */
 async function runChunks({
-  syncClient, campaignId, campaignData, messages, offset, deadline, send,
+  syncClient, campaignId, campaignData, messages, offset, deadline, finishBy = Infinity, send,
   now = Date.now, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), interval = CHUNK_INTERVAL_MS,
 }) {
   const end = offset + messages.length;
   let currentIndex = offset;
   let checkpointFailed = false;
   let throttled = false;
+  let longest = null;
+  const canStart = (at) => at < deadline && at + (longest === null ? FIRST_CHUNK_ESTIMATE_MS : longest) <= finishBy;
 
-  while (currentIndex < end && now() < deadline) {
+  while (currentIndex < end && canStart(now())) {
     const chunkStart = currentIndex;
     const started = now();
     const batch = messages.slice(chunkStart - offset, chunkStart - offset + CHUNK_SIZE);
@@ -414,23 +424,37 @@ async function runChunks({
     currentIndex += batch.length;
 
     if (claimed) {
+      const sending = now();
       const results = await send(batch, chunkStart);
+      const recording = now();
       const accepted = results.filter((result) => result.success).length;
       campaignData.sent = (campaignData.sent || 0) + accepted;
       campaignData.failed = (campaignData.failed || 0) + (results.length - accepted);
+      let recordError = null;
       try {
         await recordChunk(syncClient, campaignId, chunkStart,
           { claimedAt, to: batch.map((message) => message.to) }, rowsFor(results), new Date(now()).toISOString());
       } catch (error) {
-        console.error(`Could not record ${campaignId} at index ${chunkStart}:`, error);
+        recordError = error;
+      }
+      const done = now();
+      // Read in the Function logs to see where a call's time goes.
+      console.log(`chunk ${chunkStart} of ${campaignId}: claim ${sending - started} ms, `
+        + `send ${recording - sending} ms, record ${done - recording} ms`);
+      if (recordError) {
+        console.error(`Could not record ${campaignId} at index ${chunkStart}:`, recordError);
         checkpointFailed = true;
-        throttled = throttled || isRateLimited(error);
+        throttled = throttled || isRateLimited(recordError);
         break;
       }
+      longest = Math.max(longest || 0, done - started);
     }
 
     const elapsed = now() - started;
-    if (currentIndex < end && elapsed < interval) await sleep(interval - elapsed);
+    if (currentIndex < end && elapsed < interval) {
+      if (!canStart(now() + interval - elapsed)) break;
+      await sleep(interval - elapsed);
+    }
   }
 
   // Once per call. With claims guarding every chunk, a stale stored index can
@@ -466,6 +490,7 @@ module.exports = {
   STORAGE,
   CHUNK_SIZE,
   CHUNK_INTERVAL_MS,
+  FIRST_CHUNK_ESTIMATE_MS,
   SHARED_MAX_BYTES,
   CLAIM_SENDING_MS,
   chunkKey,

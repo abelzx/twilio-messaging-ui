@@ -20,8 +20,17 @@ const classicMessages = require(Runtime.getAssets()['/classic-messages.js'].path
  */
 const SEND_DEADLINE_MS = 7000;
 
-/** No send or 429 retry starts after this. */
-const RETRY_DEADLINE_MS = 9000;
+/**
+ * Nor does one start that would end after this, if it took as long as the
+ * longest chunk so far in the call: slow sends can make a chunk take seconds.
+ */
+const FINISH_BY_MS = 9000;
+
+/**
+ * No send or 429 retry starts after this: a create started at the cutoff must
+ * still finish, then the record and Document writes.
+ */
+const RETRY_DEADLINE_MS = 8500;
 
 const FINGERPRINT = /^[0-9a-f]{64}$/;
 
@@ -162,6 +171,7 @@ exports.handler = async function(context, event, callback) {
       messages,
       offset,
       deadline: startTime + SEND_DEADLINE_MS,
+      finishBy: startTime + FINISH_BY_MS,
       send: (batch, index) => classicMessages.sendChunk(client, batch, {
         startIndex: index,
         channel: campaignData.channel,

@@ -14,8 +14,11 @@
 
 const MESSAGING_SERVICE_SID = /^MG[0-9a-f]{32}$/i;
 
-/** Sends in flight at once, within one chunk. */
-const SEND_CONCURRENCY = 64;
+/**
+ * Sends in flight at once, within one chunk. The SDK's client opens at most 20
+ * sockets to a host, so any more would only queue behind them.
+ */
+const SEND_CONCURRENCY = 20;
 
 /** Status fetches in flight at once. */
 const FETCH_CONCURRENCY = 20;

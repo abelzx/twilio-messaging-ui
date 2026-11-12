@@ -210,11 +210,15 @@ function syncError(status, code) {
 /**
  * Just enough of twilio-node's Sync surface: `syncMaps` and `syncMapItems` are
  * callable and carry methods, as in the SDK. Items carry a revision; update
- * honours `ifMatch`. `fail` holds the next errors per operation.
+ * honours `ifMatch`. `fail` holds the next errors per operation; `onCall(op)`
+ * runs on each write, so a test can move its clock.
  */
 function fakeSync() {
-  const state = { maps: {}, documents: {}, calls: [], fail: { create: [], update: [], document: [] } };
-  const take = (op) => state.fail[op].shift();
+  const state = { maps: {}, documents: {}, calls: [], fail: { create: [], update: [], document: [] }, onCall: () => {} };
+  const take = (op) => {
+    state.onCall(op);
+    return state.fail[op].shift();
+  };
   const itemsOf = (name) => {
     if (!state.maps[name]) throw syncError(404, 20404);
     return state.maps[name];
@@ -287,15 +291,34 @@ async function campaign(total) {
   return { ...sync, list, campaignData };
 }
 
-/** runChunks with no real waiting: `sleep` only records. */
-function run(ctx, overrides) {
+/**
+ * runChunks with no real waiting: `sleep` records, then runs `overrides.sleep`
+ * if given. Its console.log lines are collected in `logs`, not printed.
+ */
+function run(ctx, overrides = {}) {
   const sleeps = [];
+  const logs = [];
+  const log = console.log;
+  console.log = (...args) => { logs.push(args.join(' ')); };
+  const { sleep = async () => {}, ...rest } = overrides;
   const promise = storage.runChunks({
     syncClient: ctx.client, campaignId: 'campaign_1', campaignData: ctx.campaignData,
-    messages: ctx.list, offset: 0, deadline: Infinity, sleep: async (ms) => { sleeps.push(ms); },
-    ...overrides,
-  });
-  return { promise, sleeps };
+    messages: ctx.list, offset: 0, deadline: Infinity,
+    ...rest,
+    sleep: async (ms) => { sleeps.push(ms); await sleep(ms); },
+  }).finally(() => { console.log = log; });
+  return { promise, sleeps, logs };
+}
+
+/** A fake clock that moves `perChunk` ms while each chunk is sent, and while sleeping. */
+function fakeClock(send, perChunk) {
+  const clock = { t: 0 };
+  return {
+    clock,
+    now: () => clock.t,
+    send: async (batch, start) => { clock.t += perChunk; return send(batch, start); },
+    sleep: async (ms) => { clock.t += ms; },
+  };
 }
 
 test('createChunksMap tolerates a Map left by an earlier attempt', async () => {
@@ -345,21 +368,69 @@ test('a chunk already claimed is skipped, not sent again', async () => {
 });
 
 test('chunks are paced, and none starts after the deadline', async () => {
-  const ctx = await campaign(400);
-  let clock = 0;
+  const ctx = await campaign(600);
   const { send, chunks } = fakeSend();
-  // The fake clock moves only while sending, 300 ms a chunk; sleeps are recorded, not waited.
-  const timedSend = async (batch, start) => { clock += 300; return send(batch, start); };
-  const { promise, sleeps } = run(ctx, { send: timedSend, now: () => clock, interval: 1000, deadline: 700 });
+  // 300 ms a chunk, and the clock moves while sleeping too.
+  const timed = fakeClock(send, 300);
+  const { promise, sleeps } = run(ctx, { ...timed, interval: 1000, deadline: 2500 });
   const outcome = await promise;
-  // Chunks start at 0, 300 and 600; at 900 the deadline has passed.
+  // Chunks start at 0, 1000 and 2000; the next would start at 3000, past the
+  // deadline, so there is no pause after the third.
   assert.deepStrictEqual(chunks, [[0, 128], [128, 128], [256, 128]]);
-  assert.deepStrictEqual(sleeps, [700, 700, 700]);
+  assert.deepStrictEqual(sleeps, [700, 700]);
   assert.strictEqual(outcome.resumeFrom, 384);
 
   const late = await campaign(400);
   const { promise: stopped } = run(late, { send: fakeSend().send, now: () => 2000, deadline: 1500 });
   assert.strictEqual((await stopped).resumeFrom, 0);
+});
+
+test('no chunk starts that would run past finishBy, by the longest chunk so far', async () => {
+  // 3,000 ms a send: the first chunk starts on the 2,500 ms first estimate,
+  // and then the next would end at 6,000.
+  const slow = await campaign(400);
+  const { send, chunks } = fakeSend();
+  const outcome = await run(slow, { ...fakeClock(send, 3000), finishBy: 5000 }).promise;
+  assert.deepStrictEqual(chunks, [[0, 128]]);
+  assert.strictEqual(outcome.resumeFrom, 128);
+  assert.strictEqual(slow.state.documents.campaign_1.startIndex, 128);
+
+  // Measured, not the first estimate: 3,000 + 2,500 would fit in 5,600.
+  const measured = await campaign(400);
+  const second = fakeSend();
+  await run(measured, { ...fakeClock(second.send, 3000), finishBy: 5600 }).promise;
+  assert.deepStrictEqual(second.chunks, [[0, 128]]);
+
+  const none = await campaign(400);
+  const third = fakeSend();
+  assert.strictEqual((await run(none, { ...fakeClock(third.send, 0), finishBy: 2000 }).promise).resumeFrom, 0);
+  assert.deepStrictEqual(third.chunks, []);
+});
+
+test('no pacing sleep when the next chunk could not start after it', async () => {
+  const ctx = await campaign(600);
+  const { send, chunks } = fakeSend();
+  const { promise, sleeps } = run(ctx, { ...fakeClock(send, 300), interval: 1000, finishBy: 2800 });
+  const outcome = await promise;
+  // Chunks start at 0, 1000 and 2000; one starting at 3000 would end past 2800.
+  assert.deepStrictEqual(chunks, [[0, 128], [128, 128], [256, 128]]);
+  assert.deepStrictEqual(sleeps, [700, 700]);
+  assert.strictEqual(outcome.resumeFrom, 384);
+});
+
+test('each claimed chunk logs its claim, send and record times, and no numbers', async () => {
+  const ctx = await campaign(300);
+  ctx.state.maps.campaign_1_chunks['0000128'] = { data: { claimedAt: 'x', to: [] }, revision: '0' };
+  const { send } = fakeSend();
+  const timed = fakeClock(send, 300);
+  ctx.state.onCall = (op) => { timed.clock.t += op === 'create' ? 20 : op === 'update' ? 40 : 0; };
+  const { promise, logs } = run(ctx, timed);
+  await promise;
+  // The chunk at 128 was claimed already, so it was not sent and is not logged.
+  assert.deepStrictEqual(logs, [
+    'chunk 0 of campaign_1: claim 20 ms, send 300 ms, record 40 ms',
+    'chunk 256 of campaign_1: claim 20 ms, send 300 ms, record 40 ms',
+  ]);
 });
 
 test('no pause follows the last chunk of a slice', async () => {
