@@ -1,45 +1,32 @@
 /**
- * Sync storage for a classic (Programmable Messaging) campaign, and the chunk
- * loop that sends from it.
+ * Sync records for a classic (Programmable Messaging) campaign, and the chunk
+ * loop that sends it.
  *
- * A classic campaign used to live in one Sync Document holding its whole
- * recipient list and every message status. A Document holds at most 16 KiB, so
- * campaigns of about 50 recipients and up failed: creation failed outright, or
- * a checkpoint failed after its chunk had already been sent, and the retry sent
- * that chunk again. See docs/superpowers/specs/2026-09-02-sync-storage-ceiling-design.md.
+ * Sync is written as little as possible. Measured on 2026-11-12, a Map took 22
+ * of 48 writes of 9 KB sent 8 at a time and refused the rest, and took 20 of 20
+ * at 2 a second: about 20 writes of a few KB per 10-second window. So only what
+ * Twilio cannot tell us is stored:
  *
- * The Document now holds only what does not grow with the campaign. The two
- * lists live in Sync Maps, split into buckets:
+ *   campaign_<id>         Document  owner, list fingerprint, counters, startIndex, display fields
+ *   campaign_<id>_chunks  Map       chunk start -> { claimedAt, to, sentAt, rows, checkedAt, settled }
  *
- *   campaign_<id>             Document  owner, counters, storedCount, startIndex, shared fields
- *   campaign_<id>_recipients  Map       key -> { recipients: [...] }      up to 128 recipients
- *   campaign_<id>_statuses    Map       key -> { statuses, checkedAt }    up to 32 statuses
- *                                       (a claim: { statuses, claimedAt }, up to 128 placeholders)
+ * The recipient list is not stored. The browser holds it and sends it slice by
+ * slice; resuming means sending the same list again, which its fingerprint, a
+ * SHA-256 of the messages stored on the Document, must match. Statuses come
+ * from Twilio; a chunk's record is rewritten only when a poll refreshes it.
  *
- * A key is the index of the first recipient its item covers, zero-padded so
- * that Sync's ascending key order is send order. A chunk is one recipient
- * bucket, so startIndex is always a recipient bucket key. The chunk's statuses
- * go in status buckets keyed at its start, start + 32, start + 64 and
- * start + 96, so no status bucket is written by two chunks.
+ * Chunks are fixed: chunk k is recipients 128k to 128k + 127, keyed by its
+ * first index, zero-padded so that Sync's key order is send order. Before a
+ * chunk is sent its record is created holding the recipients' numbers. Sync
+ * refuses a key that exists, so a chunk is sent at most once, by whichever
+ * sender created its record. After the send the record is updated with one row
+ * per recipient, in the order of `to`:
  *
- * A chunk is claimed before it is sent, by creating its first status bucket
- * holding an `unconfirmed-<index>` placeholder for every recipient in the
- * chunk. That is one write, so a claim is all or nothing. Sync refuses to
- * create a key twice, so only one sender can claim a chunk, and a chunk already
- * claimed is skipped: no chunk is sent twice, whether by two tabs, a resume
- * clicked mid-send, or a retry after a failed checkpoint. Once the chunk is
- * sent, its results replace the placeholders. A sender cut off in between
- * leaves them, so those recipients show as not confirmed: they may or may not
- * have been sent.
+ *   [sid or null, status, errorCode or null, updated (epoch seconds) or null]
  *
- * The recipient list arrives in slices, one per send-messages call, because a
- * Function request is capped at 1 MB. storedCount says how much has arrived.
- * Nothing is sent until all of it has, so a campaign whose upload was cut off
- * has sent nothing.
- *
- * Maps are created without a TTL, as Documents always have been: an expired Map
- * under a surviving Document would empty the delivery panel of a campaign that
- * still shows in the list.
+ * A record with no rows is a chunk whose result was never saved: it is being
+ * sent, or its send was cut off. Its recipients show as "sending", then as
+ * "not confirmed".
  *
  * This is a *private* asset. Require it as:
  *
@@ -48,74 +35,64 @@
 
 'use strict';
 
-/** Marks a Document laid out as above. One without it is the old, inline shape. */
-const STORAGE = 'buckets';
+/** Marks a Document laid out as above. Earlier layouts cannot be continued. */
+const STORAGE = 'lean';
 
-/** Recipients per recipient bucket, and so per chunk sent. */
-const RECIPIENT_BUCKET_MAX_ENTRIES = 128;
-
-/**
- * Bytes per recipient bucket. The same margin bulk-snapshot.js keeps under the
- * 16 KiB item limit, since the stored size can differ slightly from the size
- * sent. Long per-recipient bodies fill a bucket by size before count.
- */
-const RECIPIENT_BUCKET_MAX_BYTES = 9 * 1024;
+/** Recipients per chunk. Mirrors CHUNK_SIZE in app.js. */
+const CHUNK_SIZE = 128;
 
 /**
- * Entries per status bucket. An enriched status entry runs about 260 bytes, so
- * 32 of them is about 8.4 KiB, under the 10 KiB at which Sync throttles writes
- * to 2/s.
+ * Least time between chunk starts. A chunk writes its record twice, and a Map
+ * takes about 2 writes a second once its burst allowance is spent.
  */
-const STATUS_BUCKET_ENTRIES = 32;
+const CHUNK_INTERVAL_MS = 1100;
 
-/** Budget for the fields stored once on the Document instead of per recipient. */
+/** Budget for the display fields stored once on the Document. */
 const SHARED_MAX_BYTES = 4 * 1024;
 
-/** Sync writes in flight at once. Retries on 429 come from the client's autoRetry. */
-const WRITE_CONCURRENCY = 8;
+/**
+ * How long a claim with no result reads as still sending. A Function runs for
+ * at most 10 seconds, so after this no sender is left to record it.
+ */
+const CLAIM_SENDING_MS = 15000;
+
+/** Statuses that never change again. */
+const FINAL = new Set(['failed', 'undelivered', 'canceled', 'read']);
+
+/** Channels that report `read`, so `delivered` is not final on them. */
+const READ_RECEIPT_CHANNELS = new Set(['whatsapp', 'rcs', 'messenger']);
+
+/**
+ * Terminal failure. `undelivered` matters: Meta rejecting a WhatsApp template
+ * (error 63049) lands there, and reporting that as a success is worse than
+ * reporting nothing.
+ */
+const TERMINAL_FAILURE = new Set(['failed', 'undelivered']);
+
+/** A real Twilio message SID. Mirrors MESSAGE_SID in app.js. */
+const MESSAGE_SID = /^[A-Z]{2}[0-9a-f]{32}$/i;
 
 const KEY_DIGITS = 7;
-const NOT_FOUND = 20404;
-const ITEM_EXISTS = 54208;
-
-/** Keys a claimed chunk's placeholders, until its results replace them. */
-const PLACEHOLDER_PREFIX = 'unconfirmed-';
 
 function byteSize(value) {
   return Buffer.byteLength(JSON.stringify(value), 'utf8');
 }
 
-function isNotFound(error) {
-  return Boolean(error) && (error.status === 404 || error.code === NOT_FOUND);
-}
-
-const EMPTY_BUCKET_BYTES = byteSize({ recipients: [] });
-
-function bucketKey(start) {
+function chunkKey(start) {
   return String(start).padStart(KEY_DIGITS, '0');
 }
 
-function recipientsMapName(campaignId) {
-  return `${campaignId}_recipients`;
+function chunksMapName(campaignId) {
+  return `${campaignId}_chunks`;
 }
 
-function statusesMapName(campaignId) {
-  return `${campaignId}_statuses`;
-}
-
-function isBucketed(campaignData) {
+function isLean(campaignData) {
   return Boolean(campaignData) && campaignData.storage === STORAGE;
 }
 
-/** True once the whole recipient list is in Sync, so the campaign can be sent and resumed. */
-function isFullyStored(campaignData) {
-  return isBucketed(campaignData) && (campaignData.storedCount || 0) >= campaignData.totalMessages;
-}
-
 /**
- * Fields every message carries with the same value. They are stored once, on
- * the Document. A typed body or one template for the whole campaign is the
- * common case, and leaves each stored recipient as little more than `to`.
+ * Fields every message carries with the same value, for the campaign card and
+ * delivery panel (campaign-details.private.js reads them as `shared`).
  */
 function sharedFields(messages) {
   const shared = {};
@@ -132,94 +109,16 @@ function sharedFields(messages) {
 }
 
 /**
- * One recipient as stored: `to`, plus every field that differs from `shared`.
- * A shared field this message lacks is stored as null, which every send path
- * treats as absent. That only happens in a later slice, packed against the
- * fields the first slice shared.
- */
-function packRecipient(message, shared) {
-  const entry = { to: message.to };
-  for (const [field, value] of Object.entries(message)) {
-    if (field === 'to') continue;
-    if (field in shared && JSON.stringify(value) === JSON.stringify(shared[field])) continue;
-    entry[field] = value;
-  }
-  for (const field of Object.keys(shared)) {
-    if (!(field in message)) entry[field] = null;
-  }
-  return entry;
-}
-
-function unpackRecipient(entry, shared) {
-  return { ...shared, ...entry };
-}
-
-/**
- * Splits messages into recipient buckets of at most
- * RECIPIENT_BUCKET_MAX_ENTRIES recipients and RECIPIENT_BUCKET_MAX_BYTES bytes,
- * keyed from `startIndex`. A recipient bigger than that gets a bucket to
- * itself; Twilio's own body limits keep it under 16 KiB.
- */
-function packRecipients(messages, { shared = sharedFields(messages), startIndex = 0 } = {}) {
-  const buckets = [];
-  let current = null;
-  // Serialized size of { recipients: [...] } so far: the wrapper, each entry,
-  // and a comma between entries. Kept as a running total rather than
-  // re-serializing the bucket on every add.
-  let bytes = 0;
-
-  messages.forEach((message, offset) => {
-    const entry = packRecipient(message, shared);
-    const entryBytes = byteSize(entry);
-    if (current && current.recipients.length < RECIPIENT_BUCKET_MAX_ENTRIES &&
-        bytes + 1 + entryBytes <= RECIPIENT_BUCKET_MAX_BYTES) {
-      current.recipients.push(entry);
-      bytes += 1 + entryBytes;
-      return;
-    }
-    current = { start: startIndex + offset, recipients: [entry] };
-    buckets.push(current);
-    bytes = EMPTY_BUCKET_BYTES + entryBytes;
-  });
-
-  return { shared, buckets };
-}
-
-/**
- * One chunk's results as status entries. An accepted send is keyed by its SID.
- * A refused one has no SID, so it is keyed by its position. Without an entry a
- * refusal would be invisible, both in check-status.js's counters and in the
- * delivery table.
- */
-function statusEntries(results, sentAt) {
-  const entries = {};
-  for (const result of results) {
-    if (result.success) {
-      entries[result.sid] = { status: result.status, to: result.to, sentAt };
-    } else {
-      entries[`failed-${result.index}`] = {
-        status: 'failed',
-        to: result.to,
-        errorCode: result.errorCode || null,
-        errorMessage: result.error || 'Twilio rejected the message',
-        sentAt,
-      };
-    }
-  }
-  return entries;
-}
-
-/**
  * A new campaign's Document data. `accountSid` is for display only, never an
  * authorization key: ownership is `ownerKey` alone.
  */
-function newCampaignData({ ownerKey, accountSid, totalMessages, shared, channel, from, campaignName, details, now }) {
+function newCampaignData({ ownerKey, accountSid, totalMessages, fingerprint, shared, channel, from, campaignName, details, now }) {
   return {
     storage: STORAGE,
     ownerKey,
     accountSid,
     totalMessages,
-    storedCount: 0,
+    fingerprint,
     sent: 0,
     failed: 0,
     pending: totalMessages,
@@ -234,304 +133,186 @@ function newCampaignData({ ownerKey, accountSid, totalMessages, shared, channel,
   };
 }
 
-/** Runs `tasks` (functions returning promises) at most `limit` at a time. */
-async function inBatches(tasks, limit = WRITE_CONCURRENCY) {
-  const results = [];
-  for (let i = 0; i < tasks.length; i += limit) {
-    results.push(...(await Promise.all(tasks.slice(i, i + limit).map((task) => task()))));
-  }
-  return results;
+/** A sent chunk's results as rows, in recipient order. */
+function rowsFor(results) {
+  return results.map((result) => (result.success
+    ? [result.sid, result.status, null, null]
+    : [null, 'failed', result.errorCode || null, null]));
 }
 
-/** Creates an item, or overwrites it when the key is already taken. */
-async function putItem(items, key, data) {
-  try {
-    await items.create({ key, data });
-  } catch (error) {
-    if (error.code !== ITEM_EXISTS) throw error;
-    await items(key).update({ data });
-  }
+function epochSeconds(date) {
+  if (!date) return null;
+  const ms = new Date(date).getTime();
+  return Number.isFinite(ms) ? Math.floor(ms / 1000) : null;
 }
 
-async function createMaps(syncClient, campaignId) {
-  await syncClient.syncMaps.create({ uniqueName: recipientsMapName(campaignId) });
-  await syncClient.syncMaps.create({ uniqueName: statusesMapName(campaignId) });
+function isFinal(status, channel) {
+  const value = String(status || '').toLowerCase();
+  if (FINAL.has(value)) return true;
+  return value === 'delivered' && !READ_RECEIPT_CHANNELS.has(String(channel || '').toLowerCase());
 }
 
-/**
- * Stores one upload slice, starting at `startIndex`, packed against the
- * campaign's `shared` fields. Buckets are written in order, WRITE_CONCURRENCY
- * at a time. Once `deadline` passes no further batch starts, but the first
- * always does, so every call makes progress. Resolves to how many recipients
- * are now stored; the caller sends the next slice from there.
- */
-async function storeRecipients(syncClient, campaignId, messages, { startIndex, shared, deadline, now = Date.now }) {
-  const { buckets } = packRecipients(messages, { shared, startIndex });
-  const items = syncClient.syncMaps(recipientsMapName(campaignId)).syncMapItems;
-  let stored = startIndex;
-
-  for (let i = 0; i < buckets.length; i += WRITE_CONCURRENCY) {
-    if (i > 0 && now() >= deadline) break;
-    const batch = buckets.slice(i, i + WRITE_CONCURRENCY);
-    await Promise.all(batch.map((bucket) =>
-      putItem(items, bucketKey(bucket.start), { recipients: bucket.recipients })));
-    const last = batch[batch.length - 1];
-    stored = last.start + last.recipients.length;
-  }
-
-  return stored;
-}
-
-/** The recipient bucket keyed `start`, or null when no bucket starts there. */
-async function readRecipientBucket(syncClient, campaignId, start) {
-  try {
-    const item = await syncClient.syncMaps(recipientsMapName(campaignId)).syncMapItems(bucketKey(start)).fetch();
-    return { start, recipients: (item.data && item.data.recipients) || [] };
-  } catch (error) {
-    if (isNotFound(error)) return null;
-    throw error;
-  }
-}
-
-/** One chunk's recipients or results, split into the status buckets they belong in. */
-function statusGroups(chunkStart, list) {
-  const groups = [];
-  for (let i = 0; i < list.length; i += STATUS_BUCKET_ENTRIES) {
-    groups.push({ start: chunkStart + i, slice: list.slice(i, i + STATUS_BUCKET_ENTRIES) });
-  }
-  return groups;
+/** Positions, within the chunk, of messages whose status can still change. */
+function pendingRows(chunk, channel) {
+  return (chunk.rows || []).flatMap((row, i) => (row[0] && !isFinal(row[1], channel) ? [i] : []));
 }
 
 /**
- * Placeholder status entries for recipients, until their results are saved.
- * The key prefix says what they are, so each holds only `to`.
+ * The chunks to refresh this poll: those with a status that can still change,
+ * least recently checked first (never checked before any), at most `limit`.
+ * `takingTurns` is true when some were left for a later poll.
  */
-function placeholderEntries(start, list) {
-  const entries = {};
-  list.forEach((item, offset) => {
-    entries[`${PLACEHOLDER_PREFIX}${start + offset}`] = { to: item.to };
+function selectChunks(chunks, channel, limit) {
+  const candidates = chunks
+    .filter((chunk) => pendingRows(chunk, channel).length)
+    .sort((a, b) => String(a.checkedAt || '').localeCompare(String(b.checkedAt || '')));
+  return { selected: candidates.slice(0, limit), takingTurns: candidates.length > limit };
+}
+
+/**
+ * A chunk with fetched statuses applied. `changed` is whether any row moved;
+ * `complete` whether every pending row was reached (a fetch that failed counts
+ * as reached: it is retried on the chunk's next turn); `settled` on the new
+ * chunk whether no row can change any more.
+ */
+function applyFetched(chunk, fetched, channel) {
+  let changed = false;
+  let complete = true;
+  const rows = (chunk.rows || []).map((row) => {
+    const [messageSid, status] = row;
+    if (!messageSid || isFinal(status, channel)) return row;
+    const result = fetched.get(messageSid);
+    if (!result) {
+      complete = false;
+      return row;
+    }
+    if (result.error) return row;
+    const next = [messageSid, result.status, result.errorCode == null ? null : result.errorCode, epochSeconds(result.dateUpdated)];
+    if (JSON.stringify(next) !== JSON.stringify(row)) changed = true;
+    return next;
   });
-  return entries;
+  const settled = rows.every(([messageSid, status]) => !messageSid || isFinal(status, channel));
+  return { chunk: { ...chunk, rows, settled }, changed, complete };
 }
 
 /**
- * Claims the chunk of `recipients` starting at `chunkStart`, before any of it is
- * sent, by creating its first status bucket with a placeholder for every
- * recipient. Sync refuses a key that exists, so resolves to false when the
- * chunk is already claimed, by another sender or by an earlier attempt that may
- * have sent it.
+ * What to write back for each chunk selectChunks chose. A chunk is stamped
+ * `checkedAt` only when complete, so one cut off by the fetch deadline stays at
+ * the front of the queue. It is written when a row changed or, while chunks are
+ * taking turns, when complete, to record its turn. Chunks take turns too when
+ * any was cut off, or the same ones would be fetched first on every poll.
  */
-async function claimChunk(syncClient, campaignId, chunkStart, recipients, claimedAt) {
-  try {
-    await syncClient.syncMaps(statusesMapName(campaignId)).syncMapItems.create({
-      key: bucketKey(chunkStart),
-      data: { statuses: placeholderEntries(chunkStart, recipients), claimedAt },
-    });
-    return true;
-  } catch (error) {
-    if (error.code === ITEM_EXISTS) return false;
-    throw error;
-  }
-}
-
-/**
- * Records a sent chunk's results over its claim. The status buckets after the
- * first are written first, created or overwritten. The claim is updated last,
- * to the first bucket's results plus the placeholders of any bucket that could
- * not be written, so no recipient drops off the record. If that update fails,
- * every placeholder stays. Resolves to the first failure, or null.
- */
-async function recordChunk(syncClient, campaignId, chunkStart, results, sentAt) {
-  const items = syncClient.syncMaps(statusesMapName(campaignId)).syncMapItems;
-  const [first, ...rest] = statusGroups(chunkStart, results);
-  const writes = await Promise.allSettled(rest.map((group) =>
-    putItem(items, bucketKey(group.start), { statuses: statusEntries(group.slice, sentAt) })));
-
-  let failure = null;
-  const statuses = statusEntries(first.slice, sentAt);
-  writes.forEach((write, i) => {
-    if (write.status === 'fulfilled') return;
-    failure = failure || write.reason;
-    Object.assign(statuses, placeholderEntries(rest[i].start, rest[i].slice));
-  });
-  try {
-    await items(bucketKey(chunkStart)).update({ data: { statuses } });
-  } catch (error) {
-    failure = failure || error;
-  }
-  return failure;
-}
-
-/**
- * Every status bucket in send order, or [] when the Map is missing. A bucket
- * not yet refreshed by check-status.js has a null `checkedAt`; only a claim not
- * yet replaced has a `claimedAt`. `revision` lets updateStatusBucket write only
- * over the bucket as it was read.
- */
-async function readStatusBuckets(syncClient, campaignId) {
-  let items;
-  try {
-    items = await syncClient.syncMaps(statusesMapName(campaignId)).syncMapItems.list({ pageSize: 100 });
-  } catch (error) {
-    if (isNotFound(error)) return [];
-    throw error;
-  }
-  return items.map((item) => ({
-    key: item.key,
-    statuses: (item.data && item.data.statuses) || {},
-    checkedAt: (item.data && item.data.checkedAt) || null,
-    claimedAt: (item.data && item.data.claimedAt) || null,
-    revision: item.revision,
+function refreshPlan(selected, fetched, { channel, takingTurns, checkedAt }) {
+  const applied = selected.map((chunk) => applyFetched(chunk, fetched, channel));
+  const rotating = takingTurns || !applied.every((entry) => entry.complete);
+  return applied.map(({ chunk, changed, complete }) => ({
+    chunk: { ...chunk, checkedAt: complete ? checkedAt : chunk.checkedAt },
+    write: changed || (rotating && complete),
   }));
 }
 
 /**
- * Replaces one status bucket after check-status.js refreshed it. Given the
- * `revision` it was read at, the write fails with a 412 if anything wrote the
- * bucket since.
+ * One chunk as the delivery table reads it: entries keyed by message SID, by
+ * `failed-<index>` for a send Twilio refused, or by `unconfirmed-<index>` for a
+ * recipient whose result was never saved.
  */
-async function updateStatusBucket(syncClient, campaignId, key, statuses, checkedAt, revision) {
-  await syncClient.syncMaps(statusesMapName(campaignId)).syncMapItems(key).update({
-    data: { statuses, checkedAt },
-    ...(revision ? { ifMatch: revision } : {}),
+function chunkStatuses(chunk, now = Date.now()) {
+  const statuses = {};
+  const to = chunk.to || [];
+  if (!chunk.rows) {
+    const sending = Boolean(chunk.claimedAt) && now - Date.parse(chunk.claimedAt) < CLAIM_SENDING_MS;
+    to.forEach((number, i) => {
+      statuses[`unconfirmed-${chunk.start + i}`] = { to: number, status: sending ? 'sending' : 'unconfirmed' };
+    });
+    return statuses;
+  }
+  chunk.rows.forEach(([messageSid, status, errorCode, updated], i) => {
+    statuses[messageSid || `failed-${chunk.start + i}`] = {
+      to: to[i] || null,
+      status,
+      errorCode,
+      sentAt: chunk.sentAt || null,
+      dateUpdated: updated ? new Date(updated * 1000).toISOString() : null,
+      delivered: status === 'delivered' || status === 'read',
+      read: status === 'read',
+    };
   });
+  return statuses;
+}
+
+/** SIDs in an older campaign's inline statuses whose status can still change. */
+function legacyPending(statuses, channel) {
+  return Object.keys(statuses).filter((key) =>
+    MESSAGE_SID.test(key) && !isFinal((statuses[key] || {}).status, channel));
+}
+
+/** An older campaign's inline statuses with fetched results applied. */
+function applyLegacy(statuses, fetched) {
+  const next = { ...statuses };
+  for (const [messageSid, result] of fetched) {
+    const before = next[messageSid];
+    if (!before || result.error) continue;
+    next[messageSid] = {
+      ...before,
+      status: result.status,
+      errorCode: result.errorCode,
+      errorMessage: result.errorMessage,
+      dateSent: result.dateSent,
+      dateUpdated: result.dateUpdated,
+      // Kept once set: older campaigns had these flags from the webhook.
+      delivered: Boolean(before.delivered) || result.status === 'delivered' || result.status === 'read',
+      read: Boolean(before.read) || result.status === 'read',
+    };
+  }
+  return next;
 }
 
 /**
- * Sends from `startIndex` until the campaign is done or `deadline` passes, one
- * recipient bucket per chunk: claiming each chunk, sending it, then recording
- * its statuses and checkpoint. A chunk already claimed is skipped, uncounted,
- * because it may have been sent.
- *
- * `send(messages, startIndex)` sends one chunk and resolves to one result per
- * message (classic-messages.js sendChunk). It is passed in because assets
- * cannot require each other once deployed. `campaignData` is the Document's
- * data and is updated in place.
- *
- * A failed checkpoint does not fail the call. By then the chunk has been sent,
- * and failing would only send the browser back for a chunk that its claim now
- * skips. The loop stops and reports `checkpointFailed`, and `resumeFrom` still
- * moves past the chunk. The Document write is attempted even when a status
- * write failed, so the stored index advances whenever it can. The cost is that
- * chunk's statuses, which stay "not confirmed", and its share of the counters
- * if the Document write was the one that failed.
+ * The derived counters, from the statuses as the delivery table reads them.
+ * This is the only place that counts per-message status, so a badge and a
+ * counter cannot disagree. `sent` is every send Twilio accepted; `failed`
+ * includes the sends it refused; `pending` is accepted and not yet delivered or
+ * failed, or still being sent; `unconfirmed` is recipients whose result was
+ * never saved.
  */
-async function runChunks({ syncClient, campaignId, campaignData, startIndex, deadline, send, now = Date.now }) {
-  const shared = campaignData.shared || {};
-  let currentIndex = startIndex;
-  let results = [];
-  let checkpointFailed = false;
-
-  while (currentIndex < campaignData.totalMessages && now() < deadline) {
-    const chunkStart = currentIndex;
-    let bucket;
-    let claimed;
-    try {
-      bucket = await readRecipientBucket(syncClient, campaignId, chunkStart);
-      if (!bucket || !bucket.recipients.length) {
-        throw new Error(`No stored recipients start at index ${chunkStart}`);
-      }
-      claimed = await claimChunk(syncClient, campaignId, chunkStart, bucket.recipients, new Date(now()).toISOString());
-    } catch (error) {
-      if (currentIndex === startIndex) throw error;
-      // This call has sent or skipped chunks, and its progress is saved below or
-      // already checkpointed. The next call meets the same error at once.
-      console.error(`Could not read or claim recipients for ${campaignId} at index ${chunkStart}:`, error);
-      break;
-    }
-
-    currentIndex += bucket.recipients.length;
-    if (!claimed) continue;
-
-    results = await send(bucket.recipients.map((entry) => unpackRecipient(entry, shared)), chunkStart);
-
-    const accepted = results.filter((result) => result.success).length;
-    campaignData.sent = (campaignData.sent || 0) + accepted;
-    campaignData.failed = (campaignData.failed || 0) + (results.length - accepted);
-    campaignData.pending = Math.max(0, campaignData.totalMessages - campaignData.sent - campaignData.failed);
-    campaignData.startIndex = currentIndex;
-    campaignData.lastUpdated = new Date(now()).toISOString();
-
-    let failure = await recordChunk(syncClient, campaignId, chunkStart, results, campaignData.lastUpdated);
-    try {
-      await syncClient.documents(campaignId).update({ data: campaignData });
-    } catch (error) {
-      failure = failure || error;
-    }
-    if (failure) {
-      console.error(`Checkpoint failed for ${campaignId} at index ${currentIndex}:`, failure);
-      checkpointFailed = true;
-      break;
+function tally(statuses) {
+  const counts = { sent: 0, delivered: 0, read: 0, failed: 0, pending: 0, unconfirmed: 0 };
+  for (const [key, entry] of Object.entries(statuses)) {
+    const status = String((entry && entry.status) || '').toLowerCase();
+    const isDelivered = Boolean(entry.delivered) || status === 'delivered' || status === 'read';
+    const isFailed = TERMINAL_FAILURE.has(status);
+    if (isDelivered) counts.delivered++;
+    if (entry.read || status === 'read') counts.read++;
+    if (isFailed) counts.failed++;
+    if (status === 'unconfirmed') counts.unconfirmed++;
+    if (status === 'sending') counts.pending++;
+    if (MESSAGE_SID.test(key)) {
+      counts.sent++;
+      if (!isDelivered && !isFailed) counts.pending++;
     }
   }
-
-  // The index can move past the last one saved without a checkpoint: a resume
-  // that starts past the stored index, after a failed checkpoint, or chunks
-  // skipped because they were already claimed. It must still be saved, or the
-  // campaign would show as in progress forever. After a failed checkpoint the
-  // two are equal, so this does not retry it.
-  if (currentIndex > (campaignData.startIndex || 0)) {
-    campaignData.startIndex = currentIndex;
-    campaignData.lastUpdated = new Date(now()).toISOString();
-    try {
-      await syncClient.documents(campaignId).update({ data: campaignData });
-    } catch (error) {
-      console.error(`Checkpoint failed for ${campaignId} at index ${currentIndex}:`, error);
-      checkpointFailed = true;
-    }
-  }
-
-  return { resumeFrom: currentIndex, results, checkpointFailed };
-}
-
-/** The 200 body of send-messages.js and resume-execution.js. */
-function progressBody(campaignId, campaignData, startIndex, outcome) {
-  const isComplete = outcome.resumeFrom >= campaignData.totalMessages;
-  return {
-    success: true,
-    campaignId,
-    storedCount: campaignData.storedCount,
-    processed: outcome.resumeFrom - startIndex,
-    totalProcessed: outcome.resumeFrom,
-    totalMessages: campaignData.totalMessages,
-    isComplete,
-    hasMore: !isComplete,
-    resumeFrom: outcome.resumeFrom,
-    results: outcome.results,
-    checkpointFailed: outcome.checkpointFailed,
-    stats: {
-      sent: campaignData.sent,
-      failed: campaignData.failed,
-      pending: campaignData.pending,
-    },
-  };
+  return counts;
 }
 
 module.exports = {
   STORAGE,
-  RECIPIENT_BUCKET_MAX_ENTRIES,
-  RECIPIENT_BUCKET_MAX_BYTES,
-  STATUS_BUCKET_ENTRIES,
+  CHUNK_SIZE,
+  CHUNK_INTERVAL_MS,
   SHARED_MAX_BYTES,
-  WRITE_CONCURRENCY,
-  bucketKey,
-  recipientsMapName,
-  statusesMapName,
-  isBucketed,
-  isFullyStored,
+  CLAIM_SENDING_MS,
+  chunkKey,
+  chunksMapName,
+  isLean,
   sharedFields,
-  packRecipients,
-  unpackRecipient,
-  statusEntries,
   newCampaignData,
-  inBatches,
-  createMaps,
-  storeRecipients,
-  readRecipientBucket,
-  claimChunk,
-  recordChunk,
-  readStatusBuckets,
-  updateStatusBucket,
-  runChunks,
-  progressBody,
+  rowsFor,
+  isFinal,
+  pendingRows,
+  selectChunks,
+  applyFetched,
+  refreshPlan,
+  chunkStatuses,
+  legacyPending,
+  applyLegacy,
+  tally,
 };
