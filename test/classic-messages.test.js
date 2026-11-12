@@ -153,74 +153,7 @@ test('a 429 retry still sleeps when it ends before the deadline', async (t) => {
   assert.strictEqual(calls, 2);
 });
 
-test('pendingKeys skips refusals and settled statuses', () => {
-  const statuses = {
-    [sid(1)]: { status: 'queued' },
-    [sid(2)]: { status: 'delivered' },
-    [sid(3)]: { status: 'undelivered' },
-    'failed-4': { status: 'failed' },
-  };
-  assert.deepStrictEqual(classicMessages.pendingKeys(statuses, 'sms'), [sid(1)]);
-  assert.deepStrictEqual(classicMessages.pendingKeys(statuses, 'whatsapp'), [sid(1), sid(2)]);
-});
-
-test('refreshStatuses fetches only messages whose status can still change', async () => {
-  const fetched = [];
-  const client = fakeClient({
-    fetch: async (messageSid) => {
-      fetched.push(messageSid);
-      return { status: 'delivered', errorCode: null, errorMessage: null, dateSent: null, dateUpdated: null };
-    },
-  });
-  const statuses = {
-    [sid(1)]: { status: 'queued', to: '+1', sentAt: 'a' },
-    [sid(2)]: { status: 'delivered', to: '+2', sentAt: 'a' },
-    'failed-4': { status: 'failed', to: '+4', sentAt: 'a' },
-  };
-  const { statuses: next, changed } = await classicMessages.refreshStatuses(client, statuses, {
-    channel: 'sms', deadline: Infinity,
-  });
-  assert.deepStrictEqual(fetched, [sid(1)]);
-  assert.deepStrictEqual([...changed], [sid(1)]);
-  assert.strictEqual(next[sid(1)].status, 'delivered');
-  assert.strictEqual(next[sid(1)].delivered, true);
-  assert.strictEqual(next['failed-4'], statuses['failed-4']);
-});
-
-test('delivered can still become read on WhatsApp', async () => {
-  const client = fakeClient({ fetch: async () => ({ status: 'read' }) });
-  const { statuses: next } = await classicMessages.refreshStatuses(client, {
-    [sid(1)]: { status: 'delivered', sentAt: 'a' },
-  }, { channel: 'whatsapp', deadline: Infinity });
-  assert.strictEqual(next[sid(1)].read, true);
-});
-
-test('an unchanged status is not reported as changed', async () => {
-  const entry = {
-    status: 'sent', to: '+1', sentAt: 'a', errorCode: null, errorMessage: null,
-    dateSent: '2026-11-04T00:00:00.000Z', dateUpdated: '2026-11-04T00:00:01.000Z', delivered: false, read: false,
-  };
-  const client = fakeClient({
-    fetch: async () => ({
-      status: 'sent', errorCode: null, errorMessage: null,
-      dateSent: new Date(entry.dateSent), dateUpdated: new Date(entry.dateUpdated),
-    }),
-  });
-  const { changed } = await classicMessages.refreshStatuses(client, { [sid(1)]: entry }, {
-    channel: 'sms', deadline: Infinity,
-  });
-  assert.strictEqual(changed.size, 0);
-});
-
-test('refreshStatuses starts no fetch after the deadline', async () => {
-  const client = fakeClient({ fetch: async () => assert.fail('fetched after the deadline') });
-  const { changed } = await classicMessages.refreshStatuses(client, { [sid(1)]: { status: 'queued' } }, {
-    channel: 'sms', deadline: 0, now: () => 1,
-  });
-  assert.strictEqual(changed.size, 0);
-});
-
-test('refreshStatuses fetches in the given order, at most `concurrency` at once', async () => {
+test('fetchStatuses fetches each SID once, in order, at most `concurrency` at a time', async () => {
   let running = 0;
   let peak = 0;
   const order = [];
@@ -231,126 +164,24 @@ test('refreshStatuses fetches in the given order, at most `concurrency` at once'
       peak = Math.max(peak, running);
       await tick();
       running--;
-      return { status: 'delivered' };
+      return { status: 'delivered', errorCode: null, errorMessage: null, dateSent: null, dateUpdated: new Date(0) };
     },
   });
-  // Given newest first: the order is the caller's, not sentAt's.
-  const statuses = {};
-  for (let i = 9; i >= 0; i--) statuses[sid(i)] = { status: 'queued', sentAt: `2026-11-04T00:00:0${i}.000Z` };
-  const { fetched } = await classicMessages.refreshStatuses(client, statuses, {
-    channel: 'sms', deadline: Infinity, concurrency: 3,
-  });
+  const sids = Array.from({ length: 7 }, (_, i) => sid(i));
+  const fetched = await classicMessages.fetchStatuses(client, sids, { concurrency: 3 });
   assert.strictEqual(peak, 3);
-  assert.deepStrictEqual(order, Object.keys(statuses));
-  assert.deepStrictEqual([...fetched].sort(), Object.keys(statuses).sort());
-});
-
-test('refreshStatuses reports which keys it fetched before the deadline', async () => {
-  let clock = 0;
-  const client = fakeClient({ fetch: async () => { clock++; return { status: 'delivered' }; } });
-  const statuses = {};
-  for (let i = 0; i < 6; i++) statuses[sid(i)] = { status: 'queued' };
-  statuses['failed-6'] = { status: 'failed' };
-  const { fetched } = await classicMessages.refreshStatuses(client, statuses, {
-    channel: 'sms', deadline: 3, now: () => clock, concurrency: 1,
+  assert.deepStrictEqual(order, sids);
+  assert.deepStrictEqual(fetched.get(sid(0)), {
+    status: 'delivered', errorCode: null, errorMessage: null, dateSent: null, dateUpdated: new Date(0),
   });
-  assert.deepStrictEqual([...fetched], [sid(0), sid(1), sid(2)]);
 });
 
-test('selectRefreshBuckets takes buckets with a pending status, least recently checked first', () => {
-  const bucket = (key, checkedAt, statuses) => ({ key, checkedAt, statuses });
-  const queued = (n) => ({ [sid(n)]: { status: 'queued' } });
-  const buckets = [
-    bucket('0000000', '2026-11-04T00:00:02.000Z', queued(0)),
-    bucket('0000032', null, queued(32)),
-    bucket('0000064', '2026-11-04T00:00:01.000Z', queued(64)),
-    bucket('0000096', null, { [sid(96)]: { status: 'delivered' }, 'failed-97': { status: 'failed' } }),
-    bucket('0000128', null, { 'unconfirmed-128': { status: 'unconfirmed', to: '+1' } }),
-    bucket('0000160', null, queued(160)),
-  ];
-  const turns = classicMessages.selectRefreshBuckets(buckets, 'sms', 3);
-  assert.deepStrictEqual(turns.selected.map((b) => b.key), ['0000032', '0000160', '0000064']);
-  assert.strictEqual(turns.takingTurns, true);
-  const all = classicMessages.selectRefreshBuckets(buckets, 'sms', 4);
-  assert.deepStrictEqual(all.selected.map((b) => b.key), ['0000032', '0000160', '0000064', '0000000']);
-  assert.strictEqual(all.takingTurns, false);
-  // On WhatsApp a delivered message can still be read.
-  assert.ok(classicMessages.selectRefreshBuckets(buckets, 'whatsapp', 24).selected.some((b) => b.key === '0000096'));
-});
+test('fetchStatuses records a failed fetch, truncated, and starts none after the deadline', async () => {
+  const failing = fakeClient({ fetch: async () => { throw new Error('x'.repeat(500)); } });
+  const fetched = await classicMessages.fetchStatuses(failing, [sid(1)]);
+  assert.strictEqual(fetched.get(sid(1)).error.length, 64);
 
-test('bucketUpdates writes what changed, and stamps only buckets whose pending keys were all fetched', () => {
-  const a = { key: 'A', revision: '3', checkedAt: 'T0', statuses: { [sid(1)]: { status: 'sent' }, [sid(2)]: { status: 'sent' } } };
-  const b = { key: 'B', revision: '1', checkedAt: null, statuses: { [sid(3)]: { status: 'sent' } } };
-  const c = { key: 'C', revision: '2', checkedAt: 'T0', statuses: { [sid(4)]: { status: 'sent' }, 'failed-5': { status: 'failed' } } };
-  const refreshed = {
-    statuses: { ...a.statuses, [sid(1)]: { status: 'delivered' }, ...b.statuses, ...c.statuses },
-    changed: new Set([sid(1)]),
-    fetched: new Set([sid(1), sid(3), sid(4)]),
-  };
-  const summary = (updates) => updates.map((u) => [u.key, u.complete, u.write, u.checkedAt]);
-
-  // A changed but was cut off before sid(2), so it keeps its place at the front.
-  const turns = classicMessages.bucketUpdates([a, b, c], refreshed, { channel: 'sms', takingTurns: true, checkedAt: 'T9' });
-  assert.deepStrictEqual(summary(turns), [['A', false, true, 'T0'], ['B', true, true, 'T9'], ['C', true, true, 'T9']]);
-  assert.deepStrictEqual(turns[0].statuses, { [sid(1)]: { status: 'delivered' }, [sid(2)]: { status: 'sent' } });
-  assert.strictEqual(turns[0].revision, '3');
-
-  // Not taking turns, but A was cut off: B and C still take their turn, or the
-  // same buckets would be fetched first, and A cut off, on every poll.
-  const cutOff = classicMessages.bucketUpdates([a, b, c], refreshed, { channel: 'sms', takingTurns: false, checkedAt: 'T9' });
-  assert.deepStrictEqual(summary(cutOff), [['A', false, true, 'T0'], ['B', true, true, 'T9'], ['C', true, true, 'T9']]);
-
-  // Not taking turns and nothing cut off, an unchanged bucket is not written.
-  const all = { ...refreshed, fetched: new Set([sid(1), sid(2), sid(3), sid(4)]) };
-  const settled = classicMessages.bucketUpdates([a, b, c], all, { channel: 'sms', takingTurns: false, checkedAt: 'T9' });
-  assert.deepStrictEqual(summary(settled), [['A', true, true, 'T9'], ['B', true, false, 'T9'], ['C', true, false, 'T9']]);
-});
-
-test('a failed fetch keeps the entry and records why', async () => {
-  const client = fakeClient({ fetch: async () => { throw new Error('boom'); } });
-  const { statuses, changed } = await classicMessages.refreshStatuses(client, { [sid(1)]: { status: 'queued' } }, {
-    channel: 'sms', deadline: Infinity,
-  });
-  assert.deepStrictEqual(statuses[sid(1)], { status: 'queued', error: 'boom' });
-  assert.ok(changed.has(sid(1)));
-});
-
-test('a failed fetch records at most FETCH_ERROR_MAX_CHARS of why', async () => {
-  const message = `The requested resource /2010-04-01/Accounts/AC${'0'.repeat(32)}/Messages/${sid(1)}.json was not found`;
-  const client = fakeClient({ fetch: async () => { throw Object.assign(new Error(message), { status: 404, code: 20404 }); } });
-  const { statuses } = await classicMessages.refreshStatuses(client, { [sid(1)]: { status: 'queued' } }, {
-    channel: 'sms', deadline: Infinity,
-  });
-  assert.strictEqual(classicMessages.FETCH_ERROR_MAX_CHARS, 64);
-  assert.strictEqual(statuses[sid(1)].error, message.slice(0, 64));
-});
-
-test('placeholderStatuses reports a claim under 15 s old as sending, and an older one as unconfirmed', () => {
-  const statuses = { [sid(1)]: { status: 'queued' }, 'unconfirmed-1': { to: '+1' } };
-  const claimedAt = '2026-11-04T00:00:00.000Z';
-  const at = (ms) => classicMessages.placeholderStatuses(statuses, claimedAt, Date.parse(claimedAt) + ms);
-  assert.deepStrictEqual(at(14999)['unconfirmed-1'], { to: '+1', status: 'sending' });
-  assert.deepStrictEqual(at(15000)['unconfirmed-1'], { to: '+1', status: 'unconfirmed' });
-  assert.strictEqual(at(0)[sid(1)], statuses[sid(1)]);
-  // A claim replaced after its send, keeping a bucket's placeholders, has no claimedAt.
-  assert.deepStrictEqual(classicMessages.placeholderStatuses(statuses, null, 0)['unconfirmed-1'], { to: '+1', status: 'unconfirmed' });
-  assert.deepStrictEqual(statuses['unconfirmed-1'], { to: '+1' });
-});
-
-test('tally counts from the statuses, including refusals and recipients not confirmed', () => {
-  assert.deepStrictEqual(classicMessages.tally({
-    [sid(1)]: { status: 'delivered' },
-    [sid(2)]: { status: 'read' },
-    [sid(3)]: { status: 'undelivered' },
-    [sid(4)]: { status: 'failed' },
-    [sid(5)]: { status: 'sent', delivered: true },
-    [sid(6)]: { status: 'queued' },
-    [sid(7)]: { status: 'sent' },
-    'failed-8': { status: 'failed' },
-    // A placeholder as stored carries only `to`; its key says what it is.
-    'unconfirmed-9': { to: '+9' },
-    'unconfirmed-10': { status: 'unconfirmed', to: '+10' },
-    // Still being sent: pending, not yet unconfirmed.
-    'unconfirmed-11': { status: 'sending', to: '+11' },
-  }), { sent: 7, delivered: 3, read: 1, failed: 3, pending: 3, unconfirmed: 2 });
+  const never = fakeClient({ fetch: async () => assert.fail('fetched after the deadline') });
+  const none = await classicMessages.fetchStatuses(never, [sid(1)], { deadline: 0, now: () => 1 });
+  assert.strictEqual(none.size, 0);
 });

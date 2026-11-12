@@ -2,9 +2,8 @@
  * Programmable Messaging calls for a classic campaign: sending a chunk, and
  * refreshing the statuses of messages already sent.
  *
- * Messages are sent with no statusCallback. check-status.js re-fetches every
- * message whose status can still change, and the webhook that used to take
- * callbacks could not find a message once statuses moved into Sync buckets.
+ * Messages are sent with no statusCallback: check-status.js fetches the statuses
+ * that can still change (see classic-campaign.private.js for which).
  *
  * This is a *private* asset. Require it as:
  *
@@ -13,38 +12,7 @@
 
 'use strict';
 
-/**
- * A real Twilio message SID, as opposed to the "failed-<n>" key of a send
- * Twilio refused. Mirrors MESSAGE_SID in app.js.
- */
-const MESSAGE_SID = /^[A-Z]{2}[0-9a-f]{32}$/i;
 const MESSAGING_SERVICE_SID = /^MG[0-9a-f]{32}$/i;
-
-/**
- * Keys a recipient whose chunk was claimed but whose result was never saved
- * (see claimChunk in classic-campaign.private.js). Such an entry holds only
- * `to`: its status is implied by the key.
- */
-const PLACEHOLDER_PREFIX = 'unconfirmed-';
-
-/**
- * How long a claim's placeholders read as still sending. A Function runs for
- * at most 10 seconds, so after this no sender is left to replace them.
- */
-const CLAIM_SENDING_MS = 15000;
-
-/** Statuses that never change again. */
-const FINAL = new Set(['failed', 'undelivered', 'canceled', 'read']);
-
-/** Channels that report `read`, so `delivered` is not final on them. */
-const READ_RECEIPT_CHANNELS = new Set(['whatsapp', 'rcs', 'messenger']);
-
-/**
- * Terminal failure. `undelivered` matters: Meta rejecting a WhatsApp template
- * (error 63049) lands there, and reporting that as a success is worse than
- * reporting nothing.
- */
-const TERMINAL_FAILURE = new Set(['failed', 'undelivered']);
 
 /** Sends in flight at once, within one chunk. */
 const SEND_CONCURRENCY = 64;
@@ -53,9 +21,8 @@ const SEND_CONCURRENCY = 64;
 const FETCH_CONCURRENCY = 20;
 
 /**
- * Characters kept of why a status fetch failed. The page never shows it, and
- * twilio-node's messages run long (a 404's is about 140 characters), so 32 of
- * them beside long error messages could overflow a status bucket's 16 KiB.
+ * Characters kept of why a status fetch failed: enough to debug with, short
+ * enough to keep a response small.
  */
 const FETCH_ERROR_MAX_CHARS = 64;
 
@@ -101,8 +68,7 @@ async function retryWithExponentialBackoff(fn, options = {}) {
  * What client.messages.create() receives for one message. `from` is the
  * campaign's sender, used when the message carries none of its own;
  * `messagingServiceSid` is the deployment's MESSAGING_SERVICE_SID, Messenger's
- * fallback. A null field (see packRecipient in classic-campaign.private.js) is
- * treated as absent.
+ * fallback. A null field is treated as absent.
  */
 function messageParams(message, { channel, from, messagingServiceSid } = {}) {
   const params = {
@@ -207,165 +173,36 @@ async function sendChunk(client, messages, {
   return results;
 }
 
-/** An entry's status, lower-cased, with a placeholder's implied by its key. */
-function statusOf(key, entry) {
-  if (entry && entry.status) return String(entry.status).toLowerCase();
-  return key.startsWith(PLACEHOLDER_PREFIX) ? 'unconfirmed' : '';
-}
-
-function isFinal(entry, channel) {
-  const status = String((entry && entry.status) || '').toLowerCase();
-  if (FINAL.has(status)) return true;
-  return status === 'delivered' && !READ_RECEIPT_CHANNELS.has(String(channel || '').toLowerCase());
-}
-
-/** Keys of messages whose status can still change: real SIDs, not yet final. */
-function pendingKeys(statuses, channel) {
-  return Object.keys(statuses).filter((key) => MESSAGE_SID.test(key) && !isFinal(statuses[key], channel));
-}
-
 /**
- * The status buckets to refresh this poll: those with a status that can still
- * change, least recently checked first (never checked before any), at most
- * `limit`. `takingTurns` is true when some were left for a later poll.
+ * Fetches each message's current status from Twilio, in the order given,
+ * `concurrency` at a time, starting none once `deadline` has passed. Resolves
+ * to a Map from SID to its status fields, or to `{ error }` when the fetch
+ * failed. A SID missing from the Map was not reached; a later poll gets it.
  */
-function selectRefreshBuckets(buckets, channel, limit) {
-  const candidates = buckets
-    .filter((bucket) => pendingKeys(bucket.statuses, channel).length)
-    .sort((a, b) => String(a.checkedAt || '').localeCompare(String(b.checkedAt || '')));
-  return { selected: candidates.slice(0, limit), takingTurns: candidates.length > limit };
-}
-
-/**
- * Re-fetches from Twilio every message whose status can still change, in the
- * order given, `concurrency` at a time. No fetch starts once `deadline` has
- * passed; the rest wait for a later poll.
- *
- * Resolves to a new statuses map, the keys whose entry changed, so the caller
- * writes back only what moved, and the keys fetched at all.
- */
-async function refreshStatuses(client, statuses, {
-  channel, deadline, now = Date.now, concurrency = FETCH_CONCURRENCY,
-} = {}) {
-  const next = { ...statuses };
-  const changed = new Set();
-  const fetched = new Set();
-  const queue = pendingKeys(statuses, channel);
+async function fetchStatuses(client, sids, { deadline = Infinity, now = Date.now, concurrency = FETCH_CONCURRENCY } = {}) {
+  const fetched = new Map();
+  const queue = [...sids];
 
   const worker = async () => {
     while (queue.length && now() < deadline) {
       const messageSid = queue.shift();
-      fetched.add(messageSid);
-      const before = statuses[messageSid];
-      let after;
       try {
         const message = await client.messages(messageSid).fetch();
-        after = {
-          ...before,
+        fetched.set(messageSid, {
           status: message.status,
-          errorCode: message.errorCode,
-          errorMessage: message.errorMessage,
-          dateSent: message.dateSent,
-          dateUpdated: message.dateUpdated,
-          // Kept once set: older campaigns had these flags from the webhook.
-          delivered: Boolean(before.delivered) || message.status === 'delivered' || message.status === 'read',
-          read: Boolean(before.read) || message.status === 'read',
-        };
-        delete after.error;
+          errorCode: message.errorCode == null ? null : message.errorCode,
+          errorMessage: message.errorMessage || null,
+          dateSent: message.dateSent || null,
+          dateUpdated: message.dateUpdated || null,
+        });
       } catch (error) {
-        after = { ...before, error: String(error.message).slice(0, FETCH_ERROR_MAX_CHARS) };
-      }
-      // Compared as JSON, which is also how Sync stores the Dates the SDK returns.
-      if (JSON.stringify(after) !== JSON.stringify(before)) {
-        next[messageSid] = after;
-        changed.add(messageSid);
+        fetched.set(messageSid, { error: String(error.message).slice(0, FETCH_ERROR_MAX_CHARS) });
       }
     }
   };
 
   await Promise.all(Array.from({ length: concurrency }, worker));
-  return { statuses: next, changed, fetched };
+  return fetched;
 }
 
-/**
- * What to write back for each bucket selectRefreshBuckets chose, given what
- * refreshStatuses returned. A bucket is `complete` when every status in it that
- * could change was fetched; only then is it stamped `checkedAt`, so one cut off
- * by the fetch deadline stays at the front of the queue. A bucket is written
- * when an entry in it changed or, while buckets are taking turns, when it is
- * complete, to record that it has had its turn. Buckets take turns too when
- * any was cut off, or the same ones would be fetched first on every poll.
- */
-function bucketUpdates(selected, { statuses, changed, fetched }, { channel, takingTurns, checkedAt }) {
-  const isComplete = (bucket) => pendingKeys(bucket.statuses, channel).every((key) => fetched.has(key));
-  takingTurns = takingTurns || !selected.every(isComplete);
-  return selected.map((bucket) => {
-    const keys = Object.keys(bucket.statuses);
-    const complete = isComplete(bucket);
-    return {
-      ...bucket,
-      statuses: Object.fromEntries(keys.map((key) => [key, statuses[key]])),
-      checkedAt: complete ? checkedAt : bucket.checkedAt,
-      complete,
-      write: keys.some((key) => changed.has(key)) || (takingTurns && complete),
-    };
-  });
-}
-
-/**
- * One bucket's statuses with each placeholder given the status it is reported
- * with: `sending` while the bucket's claim is under CLAIM_SENDING_MS old, else
- * `unconfirmed`. A claim replaced after its send, keeping the placeholders of a
- * bucket it could not write, has no `claimedAt`, so those are unconfirmed.
- * Returns a new map, for the response only: placeholders are stored as `{ to }`.
- */
-function placeholderStatuses(statuses, claimedAt, now = Date.now()) {
-  const sending = Boolean(claimedAt) && now - Date.parse(claimedAt) < CLAIM_SENDING_MS;
-  const next = {};
-  for (const [key, entry] of Object.entries(statuses)) {
-    next[key] = key.startsWith(PLACEHOLDER_PREFIX)
-      ? { ...entry, status: sending ? 'sending' : 'unconfirmed' }
-      : entry;
-  }
-  return next;
-}
-
-/**
- * The derived counters. This is the only place that counts per-message
- * status, so a badge and a counter cannot disagree. `sent` is every send
- * Twilio accepted; `failed` includes the sends it refused; `pending` is
- * accepted and not yet delivered or failed, or still being sent; `unconfirmed`
- * is the recipients of a chunk whose results were never saved (see
- * classic-campaign.private.js).
- */
-function tally(statuses) {
-  const counts = { sent: 0, delivered: 0, read: 0, failed: 0, pending: 0, unconfirmed: 0 };
-  for (const [key, entry] of Object.entries(statuses)) {
-    const status = statusOf(key, entry);
-    const isDelivered = Boolean(entry.delivered) || status === 'delivered' || status === 'read';
-    const isFailed = TERMINAL_FAILURE.has(status);
-    if (isDelivered) counts.delivered++;
-    if (entry.read || status === 'read') counts.read++;
-    if (isFailed) counts.failed++;
-    if (status === 'unconfirmed') counts.unconfirmed++;
-    if (status === 'sending') counts.pending++;
-    if (MESSAGE_SID.test(key)) {
-      counts.sent++;
-      if (!isDelivered && !isFailed) counts.pending++;
-    }
-  }
-  return counts;
-}
-
-module.exports = {
-  FETCH_ERROR_MAX_CHARS,
-  messageParams,
-  retryWithExponentialBackoff,
-  sendChunk,
-  pendingKeys,
-  selectRefreshBuckets,
-  refreshStatuses,
-  bucketUpdates,
-  placeholderStatuses,
-  tally,
-};
+module.exports = { messageParams, retryWithExponentialBackoff, sendChunk, fetchStatuses };
