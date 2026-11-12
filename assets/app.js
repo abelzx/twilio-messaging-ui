@@ -84,8 +84,9 @@ const CHUNK_MAX_BYTES = 950 * 1024;
 const THROTTLE_RETRIES = 5;
 
 /**
- * Times in a row to retry a call that got no response, no JSON or a 5xx, 2, 4
- * then 8 seconds later. Sending a slice again is safe: claimed chunks are skipped.
+ * Times in a row to retry a call that got no response, no JSON, a 5xx, or no
+ * progress for no stated reason, 2, 4 then 8 seconds later. Sending a slice
+ * again is safe: claimed chunks are skipped.
  */
 const TRANSIENT_RETRIES = 3;
 
@@ -1601,6 +1602,12 @@ async function sendMessagesBatch(messages, channel, from, campaignName, details)
     let checkpointFailed = false;
     let waits = 0;
     let retries = 0;
+    // Sending a slice again is safe: claimed chunks are skipped.
+    const backOff = async (text) => {
+        retries++;
+        updateSendProgress(text, offset, total);
+        await sleep(1000 * 2 ** retries);
+    };
     try {
         while (offset < total) {
             updateSendProgress(`Sending… ${count(offset)} of ${count(total)}`, offset, total);
@@ -1628,9 +1635,7 @@ async function sendMessagesBatch(messages, channel, from, campaignName, details)
             // A 4xx is an answer, and sending it again would get the same one.
             const transient = !response || response.status >= 500 || (!data && response.status < 400);
             if (transient && retries < TRANSIENT_RETRIES) {
-                retries++;
-                updateSendProgress('Connection problem — retrying…', offset, total);
-                await sleep(1000 * 2 ** retries);
+                await backOff('Connection problem — retrying…');
                 continue;
             }
 
@@ -1648,6 +1653,11 @@ async function sendMessagesBatch(messages, channel, from, campaignName, details)
                 retries = 0;
             } else if (data.throttled && waits < THROTTLE_RETRIES) {
                 waits++;
+            } else if (!data.throttled && retries < TRANSIENT_RETRIES) {
+                // Neither progress nor throttling: the call ran out of time
+                // before its first chunk (a failed first claim is a 500).
+                await backOff('Twilio was slow to respond — retrying…');
+                continue;
             } else {
                 activeSendCampaignId = null;
                 await loadCampaigns();
