@@ -34,6 +34,9 @@ const RETRY_DEADLINE_MS = 8500;
 
 const FINGERPRINT = /^[0-9a-f]{64}$/;
 
+/** A new campaign's ID, as the browser makes it: `campaign_<Date.now()>`. */
+const NEW_CAMPAIGN_ID = /^campaign_\d{10,16}$/;
+
 const OLDER_FORMAT = 'This campaign was saved in an older format and cannot be continued. ' +
   'Check the Messaging logs in the Twilio Console for what was sent before sending the rest as a new campaign.';
 
@@ -129,6 +132,11 @@ exports.handler = async function(context, event, callback) {
       if (offset !== 0) {
         response.setStatusCode(404);
         response.setBody({ error: 'Campaign not found' });
+        return callback(null, response);
+      }
+      if (!NEW_CAMPAIGN_ID.test(campaignDocName)) {
+        response.setStatusCode(400);
+        response.setBody({ error: 'campaignId must be campaign_ followed by a timestamp' });
         return callback(null, response);
       }
       await storage.createChunksMap(syncClient, campaignDocName);

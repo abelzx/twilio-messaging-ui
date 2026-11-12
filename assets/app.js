@@ -446,6 +446,21 @@ function setupEventListeners() {
         refreshCampaignsBtn.addEventListener('click', loadCampaigns);
     }
 
+    // Campaign cards carry their ID in data- attributes rather than in inline
+    // onclick code, where an escaped quote is decoded back before the script runs.
+    const campaignsContent = document.getElementById('campaigns-content');
+    if (campaignsContent) {
+        campaignsContent.addEventListener('click', (event) => {
+            const item = event.target.closest('.campaign-item');
+            if (!item) return;
+            if (event.target.closest('.btn-resume-campaign')) {
+                resumeCampaignById(item.dataset.campaignId);
+                return;
+            }
+            viewCampaign(item.dataset.campaignId, item.dataset.mode);
+        });
+    }
+
     // Close message details button
     const closeMessageDetailsBtn = document.getElementById('close-message-details-btn');
     if (closeMessageDetailsBtn) {
@@ -1907,12 +1922,9 @@ async function refreshCurrentCampaign(options = {}) {
  * Classic campaigns are continued by sending the same list again (the server
  * keeps no copy of it), so the Resume button says how rather than doing it.
  */
-function resumeCampaignById(campaignId, event) {
+function resumeCampaignById(campaignId) {
     alert(RESUME_HOW);
 }
-
-// resumeCampaignById is reached from an onclick in the campaign list markup.
-window.resumeCampaignById = resumeCampaignById;
 
 // Campaign listing functions
 async function loadCampaigns() {
@@ -2123,9 +2135,9 @@ function displayCampaigns(campaigns) {
             && campaign.campaignId !== activeSendCampaignId;
 
         // Use campaign name if available, otherwise fall back to formatted timestamp
-        const displayName = campaign.campaignName ||
+        const displayName = escapeHtml(campaign.campaignName ||
             (campaign.createdAt ? new Date(campaign.createdAt).toLocaleString() :
-            campaign.campaignId.replace('campaign_', ''));
+            campaign.campaignId.replace('campaign_', '')));
 
         const summaryText = campaignSummaryText(campaign.summary);
 
@@ -2134,7 +2146,7 @@ function displayCampaigns(campaigns) {
             : '<span class="mode-badge mode-badge--classic">Classic</span> ';
 
         html += `
-            <div class="campaign-item ${isActive ? 'active' : ''}" onclick="viewCampaign('${campaign.campaignId}', '${campaign.mode || 'classic'}')">
+            <div class="campaign-item ${isActive ? 'active' : ''}" data-campaign-id="${escapeHtml(campaign.campaignId)}" data-mode="${campaign.mode === 'bulk' ? 'bulk' : 'classic'}">
                 <div class="campaign-header">
                     <div class="campaign-id">${modeBadge}${displayName}</div>
                     <div style="display: flex; gap: 8px; align-items: center;">
@@ -2142,7 +2154,7 @@ function displayCampaigns(campaigns) {
                             ${campaign.isComplete ? 'Complete' : 'In Progress'}
                         </div>
                         ${canResume ? `
-                            <button class="btn-resume-campaign" onclick="event.stopPropagation(); resumeCampaignById('${campaign.campaignId}', event);" title="Resume sending messages">
+                            <button type="button" class="btn-resume-campaign" title="Resume sending messages">
                                 Resume
                             </button>
                         ` : ''}
@@ -2725,7 +2737,3 @@ function stopStatusAutoRefresh() {
         statusRefreshInterval = null;
     }
 }
-
-// Make viewCampaign available globally
-window.viewCampaign = viewCampaign;
-
