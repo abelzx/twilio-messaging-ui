@@ -153,12 +153,14 @@ exports.handler = async function(context, event, callback) {
     if (refresh) {
       campaignData.lastUpdated = checkedAt;
       // Conditional on the revision read above. A send that saved progress
-      // since then owns startIndex; losing this write costs a stale counter
-      // until the next poll.
+      // since then owns startIndex; losing this write, to that (412) or to
+      // Sync's rate (429), costs a stale counter until the next poll.
       try {
         await syncClient.documents(campaignId).update({ data: campaignData, ifMatch: revision });
       } catch (error) {
-        if (error.status !== 412) throw error;
+        const throttled = error.status === 429 || error.code === 20429;
+        if (error.status !== 412 && !throttled) throw error;
+        if (throttled) console.error(`Could not save counters for ${campaignId}:`, error);
       }
     }
 
