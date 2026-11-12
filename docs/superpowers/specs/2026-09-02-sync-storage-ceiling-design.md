@@ -1,7 +1,7 @@
 # Lifting the classic path's Sync storage ceiling
 
 **Date:** 2026-09-02
-**Status:** Specified, not scheduled
+**Status:** Implemented 2026-11-04 with deviations; see `docs/superpowers/plans/2026-11-04-classic-sync-buckets.md`
 **Applies to:** the Programmable Messaging path only. Independent of `feat/bulk-messaging-api`.
 
 ## Problem
@@ -89,3 +89,19 @@ So this spec makes large campaigns *store* correctly and stop double-sending. It
 - A full-bucket status payload measured against 10 KiB, so the throttling assumption is asserted rather than assumed.
 - A campaign of 500 recipients sent end to end, with per-message statuses read back complete.
 - A legacy document with inline `statuses` still renders and still resumes.
+
+## Implementation notes (2026-11-04)
+
+Implemented with these deviations, each argued in the plan:
+
+- Recipient buckets hold up to 128 recipients and 9 KiB; status buckets hold 32, keyed within each recipient bucket. Fields shared by every message are stored once on the Document.
+- The browser uploads the list in slices under the 1 MB Function request cap, and nothing is sent until all of it is stored.
+- The polling ceiling was brought into scope: a rotating window of 24 status buckets per poll, parallel and time-boxed fetches, final statuses skipped. Past ~13,000 messages the poll returns counts without the per-message list, to fit the 4 MB response cap.
+- No TTL on the Maps, matching the Documents.
+- Legacy documents render but cannot be resumed, because their stored index can be behind what was sent.
+- `check-status` writes the Document conditionally on its revision.
+- No hard recipient limit. Above 1,000 the page suggests Bulk Messaging.
+
+## Lean records (2026-11-12)
+
+The bucketed layout failed live: uploading 2,000 recipients with their own bodies hit `Rate limit exceeded for write-map-…_recipients`. Measured, a Map accepts about 2 writes a second of items over 1 KiB, after a burst of about 20 — not the 20 a second the docs give for small items. The layout was replaced by lean records (plan `2026-11-12-classic-lean-sync.md`): the list stays in the browser and is sent slice by slice; Sync holds one claimed-then-recorded record per 128-recipient chunk and the campaign's fingerprint; statuses come from Twilio, with at most 3 records rewritten per poll.

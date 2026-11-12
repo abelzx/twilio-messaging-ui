@@ -173,6 +173,7 @@
                                         <textarea id="recipients" rows="6" required
                                                   placeholder="+6512345678&#10;+6598765432&#10;+6587654321"></textarea>
                                         <small id="recipients-help">Enter numbers in E.164 format (+6512345678), one per line or comma-separated</small>
+                                        <p id="classic-limit-notice" class="limit-notice" role="status" hidden></p>
                                     </div>
 
                                     <div class="form-group bulk-only" id="schedule-group" hidden>
@@ -190,6 +191,11 @@
                                     </div>
 
                                     <button type="submit" class="btn btn-primary" id="send-btn">Send Messages</button>
+                                    <div id="send-progress" class="send-progress" role="status" aria-live="polite" hidden>
+                                        <span class="spinner" aria-hidden="true"></span>
+                                        <span id="send-progress-text" class="send-progress__text">Preparing…</span>
+                                        <progress id="send-progress-bar" class="send-progress__bar" max="1" aria-label="Sending progress"></progress>
+                                    </div>
                                     <!-- The chunk loop runs in this tab (see sendMessagesBatch in
                                          app.js), so closing it halts the campaign. app.js promotes
                                          this note to a live warning while a send is in flight. -->

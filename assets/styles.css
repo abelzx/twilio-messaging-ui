@@ -1502,6 +1502,58 @@ input::placeholder, textarea::placeholder { color: var(--text-muted); }
     font-weight: 500;
 }
 
+/* Under Recipients when a Programmable Messaging campaign is over the
+   suggested size. Advice, not an error: the same tinted box as
+   .send-note--active, with the text kept --text for the same contrast reason. */
+.limit-notice {
+    margin: 8px 0 0;
+    padding: 10px 12px;
+    border-radius: var(--radius);
+    border: 1px solid rgba(228, 98, 22, 0.35);
+    background: rgba(228, 98, 22, 0.08);
+    color: var(--text);
+    font-size: 12px;
+    line-height: 1.5;
+}
+
+/* Beside Send while a campaign goes out: what is happening, and how far it is.
+   The bar is indeterminate (no value) until there is a count to show. */
+.send-progress {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 10px;
+    font-size: 13px;
+    color: var(--text);
+}
+
+.send-progress[hidden] { display: none; }
+
+.send-progress__text { white-space: nowrap; }
+
+.send-progress__bar {
+    flex: 1;
+    min-width: 80px;
+    height: 8px;
+    accent-color: var(--accent);
+}
+
+.spinner {
+    flex: none;
+    width: 16px;
+    height: 16px;
+    border: 2px solid var(--border-strong);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin { to { transform: rotate(360deg); } }
+
+@media (prefers-reduced-motion: reduce) {
+    .spinner { animation: none; }
+}
+
 /* Above the delivery table when its rows are not live from Twilio. The same
    tinted box as .send-note--active, for the same contrast reason. */
 .details-note {

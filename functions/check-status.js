@@ -7,15 +7,31 @@ const twilio = require('twilio');
 const oauth = require(Runtime.getAssets()['/twilio-oauth.js'].path);
 const campaignDetails = require(Runtime.getAssets()['/campaign-details.js'].path);
 const { templateNames } = require(Runtime.getAssets()['/template-names.js'].path);
+const storage = require(Runtime.getAssets()['/classic-campaign.js'].path);
+const classicMessages = require(Runtime.getAssets()['/classic-messages.js'].path);
 
 /**
- * A real Twilio message SID: two-letter prefix (SM, MM) plus 32 hex. Used to
- * tell fetchable messages apart from the synthetic "failed-<n>" keys that
- * record a send Twilio refused before issuing a SID.
+ * How far into the invocation a status fetch may still start. The token
+ * exchange can take up to 4s of the 10s ceiling, and the writes after the
+ * fetches need the rest. Messages not reached are fetched on a later poll.
  */
-const MESSAGE_SID = /^[A-Z]{2}[0-9a-f]{32}$/i;
+const FETCH_DEADLINE_MS = 6500;
+
+/**
+ * Chunks refreshed per poll: up to 384 fetches and 3 writes, leaving most of the
+ * chunk Map's write rate (about 2 a second) to sending. A larger campaign's
+ * chunks take turns, least recently checked first, over several polls.
+ */
+const MAX_REFRESH_CHUNKS = 3;
+
+/**
+ * A Function response is capped at 4 MB. Past this, roughly 13,000 messages,
+ * the counts are sent without the per-message list.
+ */
+const MAX_STATUSES_BYTES = 3.5 * 1024 * 1024;
 
 exports.handler = async function(context, event, callback) {
+  const startTime = Date.now();
   const response = new Twilio.Response();
   response.appendHeader('Access-Control-Allow-Origin', '*');
   response.appendHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
@@ -47,7 +63,7 @@ exports.handler = async function(context, event, callback) {
 
   try {
     // The runtime client is used for Sync only, never for the user's account.
-    const runtimeClient = twilio(context.ACCOUNT_SID, context.AUTH_TOKEN);
+    const runtimeClient = twilio(context.ACCOUNT_SID, context.AUTH_TOKEN, { autoRetry: true, maxRetries: 3 });
     const syncServiceSid = context.SYNC_SERVICE_SID || await oauth.getOrCreateSyncService(runtimeClient);
     const syncClient = runtimeClient.sync.v1.services(syncServiceSid);
 
@@ -55,9 +71,11 @@ exports.handler = async function(context, event, callback) {
     // than secret. Answer 404 both when the document is absent and when it
     // belongs to someone else — a 403 would confirm that a guessed ID exists.
     let campaignData = null;
+    let revision = null;
     try {
       const campaignDoc = await syncClient.documents(campaignId).fetch();
       campaignData = campaignDoc.data;
+      revision = campaignDoc.revision;
     } catch (error) {
       // 20404 is "document not found"; anything else is a real failure.
       if (error.status !== 404 && error.code !== 20404) {
@@ -83,80 +101,70 @@ exports.handler = async function(context, event, callback) {
       return callback(null, response);
     }
 
-    // Update message statuses from Twilio
-    // Merge with existing webhook data to preserve delivered/read flags
-    const statusUpdates = {};
-    for (const [sid, statusInfo] of Object.entries(campaignData.statuses || {})) {
-      // Sends Twilio rejected outright have no SID and are keyed "failed-<n>"
-      // by send-messages.js. There is nothing to fetch, and asking would turn a
-      // recorded rejection into a generic lookup error, losing the real reason.
-      // Their stored status is already terminal, so the counter below sees them.
-      if (!MESSAGE_SID.test(sid)) {
-        statusUpdates[sid] = statusInfo;
-        continue;
-      }
+    // `refresh: false` reads only: the page sends it while this tab is sending,
+    // so polls take nothing from the chunk Map's write rate.
+    const refresh = event.refresh !== false && event.refresh !== 'false';
+    const channel = campaignData.channel;
+    const checkedAt = new Date().toISOString();
+    let statuses;
 
+    if (storage.isLean(campaignData)) {
+      const chunks = await storage.readChunks(syncClient, campaignId);
+      if (refresh) {
+        const { selected, takingTurns } = storage.selectChunks(chunks, channel, MAX_REFRESH_CHUNKS);
+        const sids = selected.flatMap((chunk) => storage.pendingRows(chunk, channel).map((i) => chunk.rows[i][0]));
+        const fetched = await classicMessages.fetchStatuses(client, sids, { deadline: startTime + FETCH_DEADLINE_MS });
+        const plan = storage.refreshPlan(selected, fetched, { channel, takingTurns, checkedAt });
+        const refreshed = new Map(plan.map((entry) => [entry.chunk.key, entry.chunk]));
+        chunks.forEach((chunk, i) => {
+          if (refreshed.has(chunk.key)) chunks[i] = refreshed.get(chunk.key);
+        });
+        // One at a time: at most three, and each conditional on the revision
+        // read. A 412 means a send wrote the record since; a later poll retries.
+        for (const entry of plan.filter((item) => item.write)) {
+          try {
+            await storage.updateChunk(syncClient, campaignId, entry.chunk);
+          } catch (error) {
+            if (error.status !== 412) console.error(`Could not save chunk ${entry.chunk.key} of ${campaignId}:`, error);
+          }
+        }
+      }
+      const now = Date.now();
+      statuses = Object.assign({}, ...chunks.map((chunk) => storage.chunkStatuses(chunk, now)));
+    } else {
+      // An older campaign keeps its statuses inline, on the Document.
+      statuses = campaignData.statuses || {};
+      if (refresh) {
+        const fetched = await classicMessages.fetchStatuses(client, storage.legacyPending(statuses, channel),
+          { deadline: startTime + FETCH_DEADLINE_MS });
+        statuses = storage.applyLegacy(statuses, fetched);
+        campaignData.statuses = statuses;
+      }
+    }
+
+    const counts = storage.tally(statuses);
+    campaignData.sent = counts.sent;
+    campaignData.delivered = counts.delivered;
+    campaignData.read = counts.read;
+    campaignData.failed = counts.failed;
+    campaignData.pending = counts.pending;
+    campaignData.unconfirmed = counts.unconfirmed;
+
+    if (refresh) {
+      campaignData.lastUpdated = checkedAt;
+      // Conditional on the revision read above. A send that saved progress
+      // since then owns startIndex; losing this write, to that (412) or to
+      // Sync's rate (429), costs a stale counter until the next poll.
       try {
-        const message = await client.messages(sid).fetch();
-        statusUpdates[sid] = {
-          ...statusInfo,
-          status: message.status,
-          errorCode: message.errorCode,
-          errorMessage: message.errorMessage,
-          dateSent: message.dateSent,
-          dateUpdated: message.dateUpdated,
-          // Preserve webhook-delivered flags
-          delivered: statusInfo.delivered || message.status === 'delivered' || message.status === 'read',
-          read: statusInfo.read || message.status === 'read'
-        };
+        await syncClient.documents(campaignId).update({ data: campaignData, ifMatch: revision });
       } catch (error) {
-        statusUpdates[sid] = {
-          ...statusInfo,
-          error: error.message
-        };
+        const throttled = error.status === 429 || error.code === 20429;
+        if (error.status !== 412 && !throttled) throw error;
+        if (throttled) console.error(`Could not save counters for ${campaignId}:`, error);
       }
     }
 
-    campaignData.statuses = statusUpdates;
-    campaignData.lastUpdated = new Date().toISOString();
-
-    // Single source of truth for the derived counters. The webhook records
-    // per-message status; this is the only place that counts them, so a badge
-    // and a counter cannot disagree.
-    //
-    // Terminal failure is `failed` or `undelivered`. `undelivered` matters: Meta
-    // rejecting a WhatsApp template (error 63049) lands here, and reporting that
-    // as a success is worse than reporting nothing.
-    const TERMINAL_FAILURE = new Set(['failed', 'undelivered']);
-
-    let delivered = 0;
-    let read = 0;
-    let failed = 0;
-    for (const statusInfo of Object.values(statusUpdates)) {
-      const status = String(statusInfo.status || '').toLowerCase();
-      if (statusInfo.delivered || status === 'delivered' || status === 'read') {
-        delivered++;
-      }
-      if (statusInfo.read || status === 'read') {
-        read++;
-      }
-      if (TERMINAL_FAILURE.has(status)) {
-        failed++;
-      }
-    }
-
-    campaignData.delivered = delivered;
-    campaignData.read = read;
-    campaignData.failed = failed;
-    // Anything accepted by Twilio that has not yet reached a terminal state.
-    // Clamped at zero: a chunk sent twice inflates `sent` past the recipient
-    // count, and a negative "pending" is noise rather than information.
-    campaignData.pending = Math.max(0, (campaignData.sent || 0) - delivered - failed);
-
-    // Update Sync document
-    await syncClient.documents(campaignId).update({
-      data: campaignData
-    });
+    const statusesFit = Buffer.byteLength(JSON.stringify(statuses), 'utf8') <= MAX_STATUSES_BYTES;
 
     // A campaign sent before details were recorded has only its template's
     // SID, so look the name up rather than show the SID.
@@ -176,15 +184,15 @@ exports.handler = async function(context, event, callback) {
         sent: campaignData.sent,
         failed: campaignData.failed,
         pending: campaignData.pending,
+        unconfirmed: campaignData.unconfirmed,
         delivered: campaignData.delivered || 0,
         read: campaignData.read || 0,
         startIndex: campaignData.startIndex,
         isComplete: campaignData.startIndex >= campaignData.totalMessages,
         createdAt: campaignData.createdAt,
         lastUpdated: campaignData.lastUpdated,
-        statuses: statusUpdates,
-        // Include resume data if available
-        messages: campaignData.messages || null,
+        statuses: statusesFit ? statuses : {},
+        statusesOmitted: !statusesFit,
         channel: campaignData.channel || null,
         from: campaignData.from || null,
         details

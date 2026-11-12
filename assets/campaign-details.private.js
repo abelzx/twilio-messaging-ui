@@ -8,11 +8,11 @@
  * it actually sent, and those win over anything the browser claims for the
  * same field: a template name with no template SID behind it is dropped.
  *
- * A classic campaign document already holds the recipient list and every
- * message status, and sits close to Sync's 16 KiB item limit (see
- * docs/superpowers/specs/2026-09-02-sync-storage-ceiling-design.md). So a
- * classic `details` leaves out the body and variable values, which
- * `messages[0]` already holds, and every `details` is held to 2 KiB.
+ * A classic campaign document already holds the fields its messages share
+ * (`shared`, or `messages[0]` on documents from before
+ * classic-campaign.private.js), and every checkpoint rewrites the whole
+ * document. So a classic `details` leaves out the body and variable values,
+ * and every `details` is held to 2 KiB.
  *
  * This is a *private* asset. Require it as:
  *
@@ -216,7 +216,10 @@ function resolveDetails(campaignData) {
   const data = asObject(campaignData) || {};
   const bulk = data.mode === 'bulk';
   const stored = asObject(data.details);
-  const first = (!bulk && Array.isArray(data.messages) && asObject(data.messages[0])) || {};
+  // A lean classic campaign stores what every message had in common as
+  // `shared`. An older one held its whole list, so messages[0] stands in.
+  const first = (!bulk && (asObject(data.shared) ||
+    (Array.isArray(data.messages) && asObject(data.messages[0])))) || {};
   const from = typeof data.from === 'string' && data.from.trim() ? data.from.trim() : null;
 
   const storedSender = (stored && asObject(stored.sender)) || {};

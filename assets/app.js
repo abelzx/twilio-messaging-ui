@@ -17,8 +17,13 @@ let currentCampaignId = null;
 // opened while the toggle reads "classic" must still be polled as bulk, or its
 // auto-refresh timer would call check-status and get a 409 every 5 seconds.
 let currentCampaignMode = 'classic';
-let resumeInterval = null;
+// The classic campaign this tab is sending or continuing, if any. The campaign
+// list offers no Resume button for it while the send is running.
+let activeSendCampaignId = null;
 let statusRefreshInterval = null;
+// True while a status poll is in flight, so the 5-second timer and the send
+// loop never run two at once.
+let refreshInFlight = false;
 // Content templates loaded for the current channel (full objects from the API)
 let loadedTemplates = [];
 
@@ -42,11 +47,157 @@ let displayedCampaign = null;
 
 /**
  * A real Twilio message SID: two-letter prefix plus 32 hex. Sends Twilio
- * rejected outright never got one, so send-messages.js records them under a
- * synthetic "failed-<n>" key; this tells the two apart for display. Mirrors the
- * same constant in functions/check-status.js.
+ * rejected outright never got one, so check-status reports them under a
+ * synthetic "failed-<n>" key, and recipients with no saved result under
+ * "unconfirmed-<n>"; this tells them apart for display. Mirrors MESSAGE_SID in
+ * assets/classic-campaign.private.js.
  */
 const MESSAGE_SID = /^[A-Z]{2}[0-9a-f]{32}$/i;
+
+/**
+ * The size above which a Programmable Messaging campaign gets a notice
+ * suggesting Bulk Messaging. Advice only: nothing refuses a larger campaign.
+ * Bulk takes up to 10,000 recipients in one request and needs no open tab.
+ */
+const CLASSIC_SUGGESTED_MAX = 1000;
+
+/**
+ * Recipients per chunk. Mirrors CHUNK_SIZE in assets/classic-campaign.private.js:
+ * each slice sent holds whole chunks, so a chunk is never split across calls.
+ */
+const CHUNK_SIZE = 128;
+
+/**
+ * Most chunks per send-messages call: a little more than one call sends in its
+ * 7-second budget, so a slice is rarely sent twice. The rest is sent again by
+ * the next call, from where this one reached.
+ */
+const SLICE_MAX_CHUNKS = 8;
+
+/** Most JSON per send-messages call. A Function request is capped at 1 MB. */
+const SLICE_MAX_BYTES = 700 * 1024;
+
+/** Most JSON for one chunk, which is always sent whole, in one request. */
+const CHUNK_MAX_BYTES = 950 * 1024;
+
+/** Times in a row to wait and retry when Sync refuses writes for its rate. */
+const THROTTLE_RETRIES = 5;
+
+/**
+ * Times in a row to retry a call that got no response, no JSON, a 5xx, or no
+ * progress for no stated reason, 2, 4 then 8 seconds later. Sending a slice
+ * again is safe: claimed chunks are skipped.
+ */
+const TRANSIENT_RETRIES = 3;
+
+/** Shown when a send finished but some results could not be saved. */
+const CHECKPOINT_WARNING = 'Sending finished, but some results could not be saved. '
+    + 'Those recipients show as "not confirmed": the Messaging logs in the Twilio Console say whether they were sent.';
+
+/** How a stopped classic campaign is continued. */
+const SEND_STOPPED = 'Sending stopped. To continue, load the same recipients with the same settings and click '
+    + 'Send Messages: the app recognizes the campaign and skips everyone already sent.';
+
+/** What the Resume button explains: the server keeps no copy of the list. */
+const RESUME_HOW = 'To resume, load the same recipients (the same CSV, or the same typed list) with the same '
+    + 'sender and message settings, then click Send Messages. The app recognizes this campaign, asks to '
+    + 'continue it, and skips everyone already sent.';
+
+/** Campaigns as list-campaigns last returned them, for recognising a list sent before. */
+let loadedCampaigns = [];
+
+function classicLimitMessage(count) {
+    return `This campaign has ${count.toLocaleString('en-US')} recipients. Programmable Messaging is suggested `
+        + `for up to ${CLASSIC_SUGGESTED_MAX.toLocaleString('en-US')} per campaign; for larger campaigns, `
+        + 'switch the API to Bulk Messaging.';
+}
+
+/** Recipients the form would send right now: the CSV's rows, or the typed list. */
+function currentRecipientCount() {
+    if (csvIsActive()) return csvUpload.rows.length;
+    const text = document.getElementById('recipients').value.trim();
+    return text ? text.split(/[\n,]+/).map(r => r.trim()).filter(r => r.length > 0).length : 0;
+}
+
+/** Shows the size notice only for a Programmable Messaging campaign over the suggested size. */
+function updateClassicLimitNotice() {
+    const notice = document.getElementById('classic-limit-notice');
+    if (!notice) return;
+    const count = isBulkMode() ? 0 : currentRecipientCount();
+    notice.hidden = count <= CLASSIC_SUGGESTED_MAX;
+    notice.textContent = notice.hidden ? '' : classicLimitMessage(count);
+}
+
+/**
+ * Where the slice starting at `start` ends: whole chunks only (the last may be
+ * short), at most SLICE_MAX_CHUNKS, under SLICE_MAX_BYTES of JSON, and at least
+ * one chunk. Throws when a chunk alone would not fit a request.
+ */
+function sliceEnd(messages, start) {
+    const encoder = new TextEncoder();
+    let end = start;
+    let bytes = 0;
+    while (end < messages.length && end - start < SLICE_MAX_CHUNKS * CHUNK_SIZE) {
+        const chunkEnd = Math.min(end + CHUNK_SIZE, messages.length);
+        let chunkBytes = 0;
+        for (let i = end; i < chunkEnd; i++) chunkBytes += encoder.encode(JSON.stringify(messages[i])).length + 1;
+        if (chunkBytes > CHUNK_MAX_BYTES) {
+            throw new Error(`These messages are too large to send ${CHUNK_SIZE} at a time (over 1 MB). `
+                + 'Shorten the per-recipient messages, or use Bulk Messaging.');
+        }
+        if (end > start && bytes + chunkBytes > SLICE_MAX_BYTES) break;
+        bytes += chunkBytes;
+        end = chunkEnd;
+    }
+    return end;
+}
+
+/** SHA-256 of the messages as sent, in hex: how a list sent before is recognised. */
+async function listFingerprint(messages) {
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify(messages)));
+    return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+/**
+ * An unfinished classic campaign sent with exactly these messages, if any.
+ * Known limit: list-campaigns reads at most 1,000 Sync Documents, so in a
+ * service holding more, a much older campaign may not be recognised.
+ */
+function findUnfinishedCampaign(fingerprint, total) {
+    return loadedCampaigns.find((campaign) => campaign.mode === 'classic' && campaign.resumable
+        && campaign.fingerprint === fingerprint && campaign.totalMessages === total) || null;
+}
+
+/** Shows the progress indicator; with no `total`, its bar is indeterminate. */
+function updateSendProgress(text, done = 0, total = 0) {
+    const panel = document.getElementById('send-progress');
+    if (!panel) return;
+    panel.hidden = false;
+    document.getElementById('send-progress-text').textContent = text;
+    const bar = document.getElementById('send-progress-bar');
+    if (total) {
+        bar.max = total;
+        bar.value = done;
+    } else {
+        bar.removeAttribute('value');
+    }
+}
+
+function hideSendProgress() {
+    const panel = document.getElementById('send-progress');
+    if (panel) panel.hidden = true;
+}
+
+/** A Function's JSON reply, or null when there is none (a gateway timeout, a dropped connection). */
+async function readJson(response) {
+    try {
+        return await response.json();
+    } catch (error) {
+        return null;
+    }
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // The 5s poll rebuilds whole panels with innerHTML, which destroys the scroll
 // container and snaps the user back to the top. Two defences: skip the write
@@ -192,6 +343,8 @@ function applySendMode(refetchSenders = true) {
             : 'One message per recipient, driven from this tab.';
     }
 
+    updateClassicLimitNotice();
+
     const sendNote = document.getElementById('send-note');
     // Shared with setSendingState() below so the idle wording can never drift
     // between the two call sites.
@@ -284,6 +437,9 @@ function setupEventListeners() {
     // Message form
     document.getElementById('message-form').addEventListener('submit', handleSendMessages);
 
+    // Typed recipients drive the size notice as they are entered.
+    document.getElementById('recipients').addEventListener('input', updateClassicLimitNotice);
+
     // Channel change handler to load content templates
     document.getElementById('channel').addEventListener('change', handleChannelChange);
 
@@ -306,6 +462,21 @@ function setupEventListeners() {
     const refreshCampaignsBtn = document.getElementById('refresh-campaigns-btn');
     if (refreshCampaignsBtn) {
         refreshCampaignsBtn.addEventListener('click', loadCampaigns);
+    }
+
+    // Campaign cards carry their ID in data- attributes rather than in inline
+    // onclick code, where an escaped quote is decoded back before the script runs.
+    const campaignsContent = document.getElementById('campaigns-content');
+    if (campaignsContent) {
+        campaignsContent.addEventListener('click', (event) => {
+            const item = event.target.closest('.campaign-item');
+            if (!item) return;
+            if (event.target.closest('.btn-resume-campaign')) {
+                resumeCampaignById(item.dataset.campaignId);
+                return;
+            }
+            viewCampaign(item.dataset.campaignId, item.dataset.mode);
+        });
     }
 
     // Close message details button
@@ -377,6 +548,7 @@ function csvIsActive() {
  * would block submit on an empty field the user was told to ignore.
  */
 function renderCsvState() {
+    updateClassicLimitNotice();
     const summary = document.getElementById('csv-summary');
     const clearBtn = document.getElementById('csv-clear-btn');
     const recipients = document.getElementById('recipients');
@@ -560,10 +732,7 @@ function handleLogout() {
     clearCreds();
     currentCampaignId = null;
     currentCampaignMode = 'classic';
-    if (resumeInterval) {
-        clearInterval(resumeInterval);
-        resumeInterval = null;
-    }
+    loadedCampaigns = [];
     if (statusRefreshInterval) {
         clearInterval(statusRefreshInterval);
         statusRefreshInterval = null;
@@ -670,7 +839,7 @@ function sendNoteIdleText() {
 }
 
 const SEND_NOTE_ACTIVE = 'Sending — keep this tab open. Closing it stops the campaign, '
-    + 'though progress is saved and you can resume from Campaigns.';
+    + 'though progress is saved: send the same list again to continue it.';
 
 // Bulk has no chunk loop and no client-driven checkpoint to lose, so the
 // in-flight note only needs to cover the brief window of the single request.
@@ -679,9 +848,9 @@ const SEND_NOTE_ACTIVE_BULK = 'Submitting to Twilio…';
 /**
  * Single owner of the Send button's state, and of the advisory beneath it.
  *
- * The chunk loop lives in sendMessagesBatch() in this file, not on the server:
- * each round trip sends what fits in one 9-second Function invocation and the
- * browser initiates the next. Credentials live only in sessionStorage, so
+ * The send loop lives in sendMessagesBatch() in this file, not on the server:
+ * each round trip sends one slice of the list, starting no chunk after 7
+ * seconds, and the browser sends the next. Credentials live only in sessionStorage, so
  * nothing server-side could continue the campaign on its own. Closing the tab
  * therefore halts sending — hence the promotion to a warning while in flight.
  *
@@ -1349,9 +1518,12 @@ async function handleSendMessages(e) {
         channel, from, contentSid, body, contentVariables
     }));
 
-    // Generate campaign ID
-    currentCampaignId = `campaign_${Date.now()}`;
-    currentCampaignMode = isBulkMode() ? 'bulk' : 'classic';
+    // A classic campaign is named in sendMessagesBatch, just before its first
+    // call, so a send stopped earlier leaves the open campaign and its poll alone.
+    if (isBulkMode()) {
+        currentCampaignId = `campaign_${Date.now()}`;
+        currentCampaignMode = 'bulk';
+    }
 
     // Display data only: if collecting it fails, send without it rather than
     // not at all. buildDetails() on the server copes with a missing object.
@@ -1364,68 +1536,160 @@ async function handleSendMessages(e) {
 
     try {
         if (isBulkMode()) {
+            updateSendProgress('Submitting to Bulk Messaging…');
             await sendBulkCampaign(messages, channel, from, campaignName, details);
         } else {
             await sendMessagesBatch(messages, channel, from, campaignName, details);
         }
     } catch (error) {
+        hideSendProgress();
         alert('Error: ' + error.message);
         setSendingState(false);
+    } finally {
+        hideSendProgress();
     }
 }
 
+/** A Function's error, with the underlying cause when it sent one. */
+function functionError(data, fallback) {
+    const error = (data && data.error) || fallback;
+    return data && data.message ? `${error} (${data.message})` : error;
+}
+
+/**
+ * Sends a classic campaign slice by slice: each call sends what fits its time
+ * budget and says where it reached, and the next starts there. The list stays
+ * in this tab. A list matching an unfinished campaign, by fingerprint, can be
+ * continued instead of sent again; its claimed chunks are skipped either way.
+ */
 async function sendMessagesBatch(messages, channel, from, campaignName, details) {
-    let resumeFrom = 0;
-    let isComplete = false;
+    const total = messages.length;
+    const count = (n) => n.toLocaleString('en-US');
 
-    while (!isComplete) {
-        try {
-            const response = await postToFunction('send-messages', {
-                messages,
-                campaignId: currentCampaignId,
-                channel,
-                from,
-                resumeFrom,
-                campaignName: campaignName || null,
-                // Stored only when the first call creates the campaign.
-                ...(resumeFrom === 0 ? { details } : {})
-            });
+    updateSendProgress('Preparing the recipient list…');
+    // Every slice is measured once first, so a chunk too large to send stops
+    // the campaign before anything is sent.
+    for (let at = 0; at < total; at = sliceEnd(messages, at));
+    const fingerprint = await listFingerprint(messages);
+    // Without the list of campaigns, a partly sent list would go to everyone again.
+    if (!(await loadCampaigns())) {
+        throw new Error('Could not check whether this list was already partly sent. '
+            + 'Nothing was sent — try again in a moment.');
+    }
 
-            const data = await response.json();
-
-            if (!response.ok) {
-                throw new Error(data.error || 'Failed to send messages');
-            }
-
-            resumeFrom = data.resumeFrom;
-            isComplete = data.isComplete;
-
-            // Update UI - fetch full campaign status to get delivery/read info
-            await refreshCurrentCampaign();
-
-            if (!isComplete) {
-                // Wait a bit before resuming (to avoid hitting rate limits)
-                await new Promise(resolve => setTimeout(resolve, 1000));
-            }
-        } catch (error) {
-            console.error('Error sending messages:', error);
-
-            // Show error but allow manual resume
-            showResumeOption();
-            throw error;
+    let campaignId = null;
+    let offset = 0;
+    const match = findUnfinishedCampaign(fingerprint, total);
+    if (match) {
+        const sentBefore = match.startIndex || 0;
+        if (confirm(`This list matches "${match.campaignName || match.campaignId}", which stopped after `
+            + `${count(sentBefore)} of ${count(total)} recipients. Continue that campaign? `
+            + 'Everyone already sent is skipped. Cancel to send it as a new campaign instead.')) {
+            campaignId = match.campaignId;
+            offset = Math.floor(sentBefore / CHUNK_SIZE) * CHUNK_SIZE;
+        } else if (!confirm(`Send to all ${count(total)} recipients again as a new campaign? Everyone on the `
+            + `list gets the message again, including the ${count(sentBefore)} already sent.`)) {
+            setSendingState(false);
+            return;
         }
     }
 
-    // Final status check
-    await refreshCurrentCampaign();
+    // Captured once: opening another campaign mid-send moves currentCampaignId.
+    campaignId = campaignId || `campaign_${Date.now()}`;
+    currentCampaignId = campaignId;
+    currentCampaignMode = 'classic';
+    activeSendCampaignId = campaignId;
+    let checkpointFailed = false;
+    let waits = 0;
+    let retries = 0;
+    // Sending a slice again is safe: claimed chunks are skipped.
+    const backOff = async (text) => {
+        retries++;
+        updateSendProgress(text, offset, total);
+        await sleep(1000 * 2 ** retries);
+    };
+    try {
+        while (offset < total) {
+            updateSendProgress(`Sending… ${count(offset)} of ${count(total)}`, offset, total);
 
-    // Reload campaigns list
-    await loadCampaigns();
-    
-    // Start auto-refresh
-    startStatusAutoRefresh();
-    
-    setSendingState(false);
+            const end = sliceEnd(messages, offset);
+            let response = null;
+            try {
+                response = await postToFunction('send-messages', {
+                    messages: messages.slice(offset, end),
+                    offset,
+                    totalMessages: total,
+                    fingerprint,
+                    campaignId,
+                    channel,
+                    from,
+                    campaignName: campaignName || null,
+                    // Stored only when the first call creates the campaign.
+                    ...(offset === 0 ? { details } : {})
+                });
+            } catch (error) {
+                console.error('send-messages call failed:', error);
+            }
+            const data = response ? await readJson(response) : null;
+
+            // A 4xx is an answer, and sending it again would get the same one.
+            const transient = !response || response.status >= 500 || (!data && response.status < 400);
+            if (transient && retries < TRANSIENT_RETRIES) {
+                await backOff('Connection problem — retrying…');
+                continue;
+            }
+
+            if (!data || !response.ok) {
+                const status = response ? `HTTP ${response.status}` : 'no response';
+                activeSendCampaignId = null;
+                await loadCampaigns();
+                throw new Error(`${functionError(data, `Failed to send messages (${status})`)}. ${SEND_STOPPED}`);
+            }
+
+            checkpointFailed = checkpointFailed || Boolean(data.checkpointFailed);
+            if (data.resumeFrom > offset) {
+                offset = data.resumeFrom;
+                waits = 0;
+                retries = 0;
+            } else if (data.throttled && waits < THROTTLE_RETRIES) {
+                waits++;
+            } else if (!data.throttled && retries < TRANSIENT_RETRIES) {
+                // Neither progress nor throttling: the call ran out of time
+                // before its first chunk (a failed first claim is a 500).
+                await backOff('Twilio was slow to respond — retrying…');
+                continue;
+            } else {
+                activeSendCampaignId = null;
+                await loadCampaigns();
+                throw new Error(`Failed to send messages (no progress). ${SEND_STOPPED}`);
+            }
+
+            await refreshCurrentCampaign({ refresh: false });
+            if (offset < total) {
+                if (data.throttled) updateSendProgress('Twilio Sync is busy — waiting before sending more…', offset, total);
+                await sleep(data.throttled ? 2000 * Math.max(1, waits) : 500);
+            }
+        }
+
+        updateSendProgress('Finishing…', total, total);
+        if (checkpointFailed) {
+            hideSendProgress();
+            alert(CHECKPOINT_WARNING);
+        }
+
+        // Final status check
+        await refreshCurrentCampaign();
+
+        // Reload campaigns list
+        await loadCampaigns();
+
+        // Start auto-refresh
+        startStatusAutoRefresh();
+
+        setSendingState(false);
+    } finally {
+        activeSendCampaignId = null;
+    }
 }
 
 /**
@@ -1491,6 +1755,7 @@ async function sendBulkCampaign(messages, channel, from, campaignName, details) 
 
     currentCampaignId = data.campaignId;
 
+    if (data.warning || data.partial) hideSendProgress();
     if (data.warning) alert(data.warning);
     if (data.partial) alert(data.error);
 
@@ -1504,12 +1769,14 @@ async function sendBulkCampaign(messages, channel, from, campaignName, details) 
     return data;
 }
 
-async function checkCampaignStatus() {
+async function checkCampaignStatus(options = {}) {
     if (!currentCampaignId || !creds) return;
 
     try {
         const response = await postToFunction('check-status', {
-            campaignId: currentCampaignId
+            campaignId: currentCampaignId,
+            // While this tab sends, polls only read, leaving Sync's write rate to sending.
+            ...(options.refresh === false ? { refresh: false } : {})
         });
 
         const data = await response.json();
@@ -1700,118 +1967,47 @@ function bulkRowsToStatuses(rows) {
  * and check-bulk-status returns 404 for a classic one, so calling the wrong
  * one is never harmless.
  */
-async function refreshCurrentCampaign() {
-    if (currentCampaignMode === 'bulk') return checkBulkCampaignStatus();
-    return checkCampaignStatus();
-}
-
-async function resumeCampaignById(campaignId, event) {
-    if (!creds) {
-        alert('Please sign in to resume campaigns');
-        return;
-    }
-
-    // Show loading state
-    const resumeBtn = event?.target;
-    if (resumeBtn) {
-        resumeBtn.disabled = true;
-        resumeBtn.textContent = 'Resuming...';
-    }
-
+async function refreshCurrentCampaign(options = {}) {
+    if (refreshInFlight) return;
+    refreshInFlight = true;
     try {
-        // Fetch campaign details including messages
-        const response = await postToFunction('check-status', { campaignId });
-        const data = await response.json();
-
-        if (!response.ok) {
-            throw new Error(data.error || 'Failed to fetch campaign details');
-        }
-
-        const campaign = data.campaign;
-        
-        // Check if campaign has resume data
-        if (!campaign.messages || !campaign.channel || !campaign.from) {
-            throw new Error('Campaign data is missing. Cannot resume this campaign.');
-        }
-
-        // Set current campaign ID. Resume only ever reaches a classic campaign
-        // — the Resume button is not offered for bulk (see displayCampaigns).
-        currentCampaignId = campaignId;
-        currentCampaignMode = 'classic';
-
-        // Continue resuming until complete
-        let isComplete = false;
-        while (!isComplete) {
-            const resumeResponse = await postToFunction('resume-execution', {
-                campaignId: campaignId,
-                messages: campaign.messages,
-                channel: campaign.channel,
-                from: campaign.from
-            });
-
-            const resumeData = await resumeResponse.json();
-
-            if (!resumeResponse.ok) {
-                throw new Error(resumeData.error || 'Failed to resume campaign');
-            }
-
-            isComplete = resumeData.isComplete;
-
-            // Update UI
-            await checkCampaignStatus();
-
-            if (!isComplete) {
-                // Wait a bit before resuming (to avoid hitting rate limits)
-                await new Promise(resolve => setTimeout(resolve, 1000));
-            }
-        }
-
-        // Campaign completed
-        await checkCampaignStatus();
-        await loadCampaigns();
-        startStatusAutoRefresh();
-
-    } catch (error) {
-        console.error('Error resuming campaign:', error);
-        alert('Error resuming campaign: ' + error.message);
+        if (currentCampaignMode === 'bulk') return await checkBulkCampaignStatus();
+        return await checkCampaignStatus(options);
     } finally {
-        // Restore button state
-        if (resumeBtn) {
-            resumeBtn.disabled = false;
-            resumeBtn.textContent = 'Resume';
-        }
+        refreshInFlight = false;
     }
 }
 
-function showResumeOption() {
-    // Show alert and refresh campaigns list to show resume option
-    alert('Execution was interrupted. You can resume the campaign from the campaigns list.');
-    loadCampaigns();
+/**
+ * Classic campaigns are continued by sending the same list again (the server
+ * keeps no copy of it), so the Resume button says how rather than doing it.
+ */
+function resumeCampaignById(campaignId) {
+    alert(RESUME_HOW);
 }
 
-// resumeCampaignById is reached from an onclick in the campaign list markup.
-window.resumeCampaignById = resumeCampaignById;
-
-// Campaign listing functions
+// Campaign listing functions. Resolves to whether the list was loaded.
 async function loadCampaigns() {
-    if (!creds) return;
+    if (!creds) return false;
 
     const campaignsContent = document.getElementById('campaigns-content');
-    if (!campaignsContent) return;
+    if (!campaignsContent) return false;
 
     try {
         const response = await postToFunction('list-campaigns');
         const data = await response.json();
 
         if (response.ok && data.campaigns) {
+            loadedCampaigns = data.campaigns;
             displayCampaigns(data.campaigns);
-        } else {
-            campaignsContent.innerHTML = '<p style="color: #666; text-align: center; padding: 20px;">No campaigns found</p>';
+            return true;
         }
+        campaignsContent.innerHTML = '<p style="color: #666; text-align: center; padding: 20px;">No campaigns found</p>';
     } catch (error) {
         console.error('Error loading campaigns:', error);
         campaignsContent.innerHTML = '<p style="color: #d32f2f; text-align: center; padding: 20px;">Error loading campaigns</p>';
     }
+    return false;
 }
 
 /** The channel's name as the Messaging Channel dropdown shows it. */
@@ -1945,6 +2141,7 @@ function displayCampaigns(campaigns) {
 
     const signature = JSON.stringify([
         currentCampaignId,
+        activeSendCampaignId,
         campaigns.map((c) => [
             c.campaignId, c.campaignName, c.totalMessages, c.sent, c.failed,
             c.delivered, c.read, c.startIndex, c.isComplete, c.lastUpdated,
@@ -1960,8 +2157,7 @@ function displayCampaigns(campaigns) {
     campaigns.forEach(campaign => {
         const isActive = campaign.campaignId === currentCampaignId;
         // Progress is how far through the recipient list we are, not a ratio of
-        // send attempts — a resent chunk would otherwise push this past 100%.
-        // Bulk rows have no startIndex, and their `sent` deliberately excludes
+        // send attempts. Bulk rows have no startIndex, and their `sent` deliberately excludes
         // failed/unaddressable recipients while totalMessages counts everyone —
         // so a finished bulk campaign with any failures would otherwise read
         // under 100% next to a "Complete" badge. totalMessages - pending counts
@@ -1975,11 +2171,9 @@ function displayCampaigns(campaigns) {
         const progress = campaign.totalMessages > 0
             ? Math.min(100, (processed / campaign.totalMessages) * 100).toFixed(1)
             : 0;
-        // Total is the campaign's message count. That normally equals the number of
-        // recipients, but a resent chunk creates more messages than recipients, and
-        // the delivery table lists every one — so show the larger of the two. The
-        // progress bar above deliberately keeps dividing by totalMessages, or a
-        // finished campaign with a resend would read 60% instead of 100%.
+        // Total is the campaign's message count, or its sends where a campaign
+        // saved in an older layout recorded more; the delivery table lists every
+        // one. The progress bar above keeps dividing by totalMessages.
         const messageCount = Math.max(campaign.totalMessages || 0, campaign.sent || 0);
         
         const createdDate = campaign.createdAt 
@@ -1991,13 +2185,17 @@ function displayCampaigns(campaigns) {
 
         // Bulk campaigns cannot be resumed: Twilio owns the processing, and no
         // recipient list is stored to resume from. An operation continues on its
-        // own or has already finished.
-        const canResume = campaign.mode !== 'bulk' && !campaign.isComplete && campaign.startIndex < campaign.totalMessages;
+        // own or has already finished. Nor can classic campaigns saved in the
+        // older format, which has no chunk records to continue.
+        // Nor is one this tab is already sending.
+        const canResume = campaign.mode !== 'bulk' && campaign.resumable !== false
+            && !campaign.isComplete && campaign.startIndex < campaign.totalMessages
+            && campaign.campaignId !== activeSendCampaignId;
 
         // Use campaign name if available, otherwise fall back to formatted timestamp
-        const displayName = campaign.campaignName ||
+        const displayName = escapeHtml(campaign.campaignName ||
             (campaign.createdAt ? new Date(campaign.createdAt).toLocaleString() :
-            campaign.campaignId.replace('campaign_', ''));
+            campaign.campaignId.replace('campaign_', '')));
 
         const summaryText = campaignSummaryText(campaign.summary);
 
@@ -2006,7 +2204,7 @@ function displayCampaigns(campaigns) {
             : '<span class="mode-badge mode-badge--classic">Classic</span> ';
 
         html += `
-            <div class="campaign-item ${isActive ? 'active' : ''}" onclick="viewCampaign('${campaign.campaignId}', '${campaign.mode || 'classic'}')">
+            <div class="campaign-item ${isActive ? 'active' : ''}" data-campaign-id="${escapeHtml(campaign.campaignId)}" data-mode="${campaign.mode === 'bulk' ? 'bulk' : 'classic'}">
                 <div class="campaign-header">
                     <div class="campaign-id">${modeBadge}${displayName}</div>
                     <div style="display: flex; gap: 8px; align-items: center;">
@@ -2014,7 +2212,7 @@ function displayCampaigns(campaigns) {
                             ${campaign.isComplete ? 'Complete' : 'In Progress'}
                         </div>
                         ${canResume ? `
-                            <button class="btn-resume-campaign" onclick="event.stopPropagation(); resumeCampaignById('${campaign.campaignId}', event);" title="Resume sending messages">
+                            <button type="button" class="btn-resume-campaign" title="Resume sending messages">
                                 Resume
                             </button>
                         ` : ''}
@@ -2115,7 +2313,11 @@ async function fetchAndDisplayCampaignDetails(campaignId, mode) {
     }
 
     try {
-        const response = await postToFunction('check-status', { campaignId });
+        const response = await postToFunction('check-status', {
+            campaignId,
+            // While this tab sends it, polls only read (see checkCampaignStatus).
+            ...(campaignId === activeSendCampaignId ? { refresh: false } : {})
+        });
 
         const data = await response.json();
 
@@ -2132,6 +2334,30 @@ async function fetchAndDisplayCampaignDetails(campaignId, mode) {
     }
 }
 
+const UNCONFIRMED_NOTE = 'Recipients not confirmed were in a chunk that was interrupted before its result '
+    + 'was saved, so they may or may not have been sent. Check the Messaging logs in the Twilio Console '
+    + 'before sending to them again.';
+
+/**
+ * The Message SID column for a classic row. Twilio issued no SID for a send it
+ * refused ("failed-<n>"), and none is known yet for a recipient whose chunk is
+ * being sent, or was cut off before its result was saved ("unconfirmed-<n>",
+ * which check-status reports as `sending` or `unconfirmed`). Showing those
+ * internal keys in a column headed "Message SID" would read as real
+ * identifiers, so say what happened instead.
+ */
+function classicSidLabel(key, entry) {
+    if (MESSAGE_SID.test(key)) return key;
+    if (!key.startsWith('unconfirmed-')) return 'not accepted';
+    return entry.status === 'sending' ? 'sending' : 'not confirmed';
+}
+
+/** A row's status. A placeholder is stored with only `to`: its key says what it is. */
+function rowStatus(key, entry) {
+    if (entry.status) return entry.status;
+    return key.startsWith('unconfirmed-') ? 'unconfirmed' : '';
+}
+
 function displayMessageDetails(campaign) {
     const messageDetailsContent = document.getElementById('message-details-content');
     if (!messageDetailsContent) return;
@@ -2142,6 +2368,7 @@ function displayMessageDetails(campaign) {
 
     const statuses = campaign.statuses || {};
     const statusEntries = Object.entries(statuses);
+    const unconfirmed = campaign.unconfirmed || 0;
 
     const summary = `
         <div style="margin-bottom: 15px; padding: 12px; background: var(--twilio-gray-50); border-radius: 6px;">
@@ -2151,11 +2378,21 @@ function displayMessageDetails(campaign) {
                 <div><strong>Failed:</strong> <span style="color: var(--twilio-error);">${campaign.failed || 0}</span></div>
                 <div><strong>Delivered:</strong> <span style="color: var(--twilio-success);">${campaign.delivered || 0}</span></div>
                 <div><strong>Read:</strong> ${campaign.read || 0}</div>
+                ${unconfirmed > 0 ? `<div><strong>Not confirmed:</strong> ${unconfirmed}</div>` : ''}
             </div>
         </div>
+        ${unconfirmed > 0 ? `<p class="details-note">${UNCONFIRMED_NOTE}</p>` : ''}
     `;
     const note = campaign.detailsNote ? `<p class="details-note">${campaign.detailsNote}</p>` : '';
     const detailsBlock = renderCampaignDetails(campaign.details);
+
+    if (campaign.statusesOmitted) {
+        // check-status leaves the per-message list out when it would not fit a
+        // Function response; the counts it sends are still complete.
+        messageDetailsContent.innerHTML = detailsBlock + summary +
+            '<p class="details-note">This campaign is too large to list message by message here. The counts above are complete.</p>';
+        return;
+    }
 
     if (statusEntries.length === 0) {
         // A bulk campaign's totals are kept in Sync and outlast Twilio's
@@ -2177,7 +2414,7 @@ function displayMessageDetails(campaign) {
 
     const signature = JSON.stringify([
         campaign.campaignId, campaign.sent, campaign.failed, campaign.delivered,
-        campaign.read, campaign.totalMessages, campaign.detailsNote, campaign.details,
+        campaign.read, campaign.unconfirmed, campaign.totalMessages, campaign.detailsNote, campaign.details,
         statusEntries.map(([sid, s]) => [sid, s.status, s.delivered, s.read, s.errorCode, s.dateUpdated]),
     ]);
     if (renderUnchanged('details', signature, Boolean(messageDetailsContent.querySelector('.message-status-scroll')))) {
@@ -2198,14 +2435,13 @@ function displayMessageDetails(campaign) {
                         <th>Error Message</th>
                         <th>Sent At</th>
                         <th>Updated At</th>
-                        <th>Webhook Received</th>
                     </tr>
                 </thead>
                 <tbody>
     `;
 
     statusEntries.forEach(([sid, statusInfo]) => {
-        const status = statusInfo.status || 'unknown';
+        const status = rowStatus(sid, statusInfo) || 'unknown';
         const statusClass = status === 'delivered' || status === 'read' ? 'success' : 
                            status === 'failed' || status === 'undelivered' ? 'failed' : 'pending';
         
@@ -2214,21 +2450,16 @@ function displayMessageDetails(campaign) {
         
         const sentAt = statusInfo.sentAt || statusInfo.dateSent || null;
         const updatedAt = statusInfo.dateUpdated || statusInfo.webhookReceivedAt || null;
-        const webhookReceived = statusInfo.webhookReceivedAt || null;
         
+        // Escaped below: `to` is from the user's list, and every field is read back from Sync.
         const errorCode = statusInfo.errorCode || '-';
-        const errorMessage = (statusInfo.errorMessage || '-').replace(/"/g, '&quot;');
+        const errorMessage = statusInfo.errorMessage || '-';
         const to = statusInfo.to || '-';
-        // Rejected sends are keyed "failed-<n>" because Twilio never issued a
-        // SID. Showing that internal key in a column headed "Message SID" would
-        // read as a real identifier, so say what actually happened instead.
         // Bulk identifiers are not classic Twilio SIDs at all, so they always
         // fail MESSAGE_SID — testing them against it would label every
         // successfully delivered bulk message as rejected. Show the bulk
         // identifier as-is instead; the regex only applies to classic rows.
-        const sidLabel = campaign.mode === 'bulk'
-            ? sid
-            : (MESSAGE_SID.test(sid) ? sid : 'not accepted');
+        const sidLabel = campaign.mode === 'bulk' ? sid : classicSidLabel(sid, statusInfo);
 
         const formatDate = (dateValue) => {
             if (!dateValue) return 'N/A';
@@ -2241,16 +2472,15 @@ function displayMessageDetails(campaign) {
 
         html += `
             <tr>
-                <td style="font-family: monospace; font-size: 11px; word-break: break-all;">${sidLabel}</td>
-                <td>${to}</td>
-                <td><span class="status-badge ${statusClass}">${status}</span></td>
+                <td style="font-family: monospace; font-size: 11px; word-break: break-all;">${escapeHtml(sidLabel)}</td>
+                <td>${escapeHtml(to)}</td>
+                <td><span class="status-badge ${statusClass}">${escapeHtml(status)}</span></td>
                 <td>${delivered}</td>
                 <td>${read}</td>
-                <td>${errorCode}</td>
-                <td style="max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${errorMessage}">${errorMessage}</td>
-                <td>${formatDate(sentAt)}</td>
-                <td>${formatDate(updatedAt)}</td>
-                <td>${formatDate(webhookReceived)}</td>
+                <td>${escapeHtml(errorCode)}</td>
+                <td style="max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${escapeHtml(errorMessage)}">${escapeHtml(errorMessage)}</td>
+                <td>${escapeHtml(formatDate(sentAt))}</td>
+                <td>${escapeHtml(formatDate(updatedAt))}</td>
             </tr>
         `;
     });
@@ -2528,16 +2758,15 @@ function exportMessageStatusCsv() {
     // displayMessageDetails for why they must not be tested against MESSAGE_SID.
     const bulk = campaign.mode === 'bulk';
     const rows = entries.map(([sid, s]) => ({
-        'Message SID': bulk ? sid : (MESSAGE_SID.test(sid) ? sid : 'not accepted'),
+        'Message SID': bulk ? sid : classicSidLabel(sid, s),
         'To': s.to || '',
-        'Status': s.status || '',
+        'Status': rowStatus(sid, s),
         'Delivered': s.delivered ? 'Yes' : 'No',
         'Read': s.read ? 'Yes' : 'No',
         'Error Code': s.errorCode == null ? '' : s.errorCode,
         'Error Message': s.errorMessage || '',
         'Sent At': s.sentAt || s.dateSent || '',
         'Updated At': s.dateUpdated || '',
-        'Webhook Received': s.webhookReceivedAt || '',
     }));
 
     const label = (campaign.campaignName || campaign.campaignId || 'campaign')
@@ -2559,7 +2788,7 @@ function startStatusAutoRefresh() {
     if (currentCampaignId && creds) {
         // Refresh every 5 seconds
         statusRefreshInterval = setInterval(async () => {
-            await refreshCurrentCampaign();
+            await refreshCurrentCampaign({ refresh: activeSendCampaignId !== currentCampaignId });
             await loadCampaigns(); // Also refresh the campaigns list
         }, 5000);
     }
@@ -2571,7 +2800,3 @@ function stopStatusAutoRefresh() {
         statusRefreshInterval = null;
     }
 }
-
-// Make viewCampaign available globally
-window.viewCampaign = viewCampaign;
-
