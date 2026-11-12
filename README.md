@@ -98,7 +98,7 @@ While a file is loaded it is the single source of truth: the Recipients box and 
 
 Rows with a problem are skipped and listed by line number — a missing number, or a column count that doesn't match the header — and the rest still send. A blank variable cell sends as empty text rather than falling back to the template's sample value, which would put someone else's placeholder data in a real message. A blank `Body` cell does fall back to the message body typed above, and the summary says how many rows that affected.
 
-> **On Programmable Messaging, keep the tab open while sending.** The send loop runs in your browser, not on Twilio. Each request sends one slice of the list, starting no chunk after 7 seconds, and returns; the page then sends the next slice. Your credentials live only in this tab, so nothing server-side can carry the campaign on by itself.
+> **On Programmable Messaging, keep the tab open while sending.** The send loop runs in your browser, not on Twilio. Each request sends one slice of the list, as much as fits in its time limit, and returns; the page then sends the next slice. Your credentials live only in this tab, so nothing server-side can carry the campaign on by itself.
 >
 > This does not apply in Bulk Messaging mode: one request covers the whole campaign (up to 10,000 recipients), Twilio processes it after that, and you can close the tab as soon as the request is accepted.
 >
@@ -138,7 +138,7 @@ A template with no type the channel can render is omitted rather than offered, s
 
 ## How resumable execution works
 
-The page keeps the recipient list and sends it to `send-messages.js` in slices of whole 128-recipient chunks, at most eight chunks and 700 KB at a time, since a Function request is capped at 1 MB. Each call sends what fits its budget, starting no chunk after 7 seconds so the last finishes inside the platform's 10-second ceiling, and says where it reached; the next call starts there. A progress indicator beside **Send Messages** shows each stage.
+The page keeps the recipient list and sends it to `send-messages.js` in slices of whole 128-recipient chunks, at most eight chunks and 700 KB at a time, since a Function request is capped at 1 MB. Each call sends what fits its budget and says where it reached; the next call starts there. So that the last chunk finishes inside the platform's 10-second ceiling, a call starts no chunk after 7 seconds, nor one that would end after 9 seconds if it took as long as the slowest chunk so far, and no send after 8.5 seconds. Within a chunk, sends go out 20 at a time, the most connections the Twilio client opens. A call that gets no answer, no JSON or a server error is tried again up to three times, 2, 4 and 8 seconds later; that is safe, because chunks already claimed are skipped. A progress indicator beside **Send Messages** shows each stage.
 
 Sync records as little as possible, because it accepts only about 2 writes a second per Map for items of a few KB (measured: 22 of 48 9 KB writes sent eight at a time, 20 of 20 at two a second). Each chunk has one record in the `campaign_<id>_chunks` Map. It is created, holding the recipients' numbers, before the chunk is sent — Sync allows that only once, so no chunk is ever sent twice — and updated afterwards with one compact row per recipient: message SID, status, error code, time. Chunks are paced 1.1 seconds apart. The campaign Document holds the owner, counters, progress, display fields, and a SHA-256 fingerprint of the list, which is how a list sent again is recognized. While a chunk is being sent, its recipients show as "sending"; if its result was never saved, they show as "not confirmed" — the Messaging logs in the Twilio Console say whether they were sent.
 
@@ -198,7 +198,7 @@ Two limits worth stating plainly:
 
 **Sync errors.** Confirm the Sync API is enabled on the account and that the runtime credentials have Sync access.
 
-**Timeouts.** Handled automatically by chunking. If a single chunk still overruns, lower `CHUNK_SIZE` in both `assets/classic-campaign.private.js` and `assets/app.js`.
+**Timeouts.** Handled automatically by chunking. The Function logs show where a call's time went, one line per chunk: `chunk 0 of campaign_…: claim 120 ms, send 2400 ms, record 150 ms`. If a single chunk still overruns, lower `CHUNK_SIZE` in both `assets/classic-campaign.private.js` and `assets/app.js`.
 
 **"Twilio Sync is busy".** Sync refused writes for its rate; the page waits and carries on. If it gives up, send the same list again to continue.
 
