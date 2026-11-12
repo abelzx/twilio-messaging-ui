@@ -146,7 +146,7 @@ function withDeadline(promise, ms, message) {
  * token endpoint strands the whole invocation: the platform kills it and the
  * caller gets no response at all rather than a readable error.
  *
- * That matters most in `send-messages.js` and `resume-execution.js`, which call
+ * That matters most in `send-messages.js`, which calls
  * this once per 100-message chunk — roughly 50 times for a 5,000-message
  * campaign, each one a fresh chance to lose an invocation. Worse, a kill
  * mid-chunk can leave messages sent but not yet recorded in Sync, so the

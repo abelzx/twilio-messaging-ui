@@ -6,7 +6,7 @@ A web app for sending message campaigns across SMS, MMS, RCS, WhatsApp and Faceb
 
 - **Five channels** on Programmable Messaging, four on Bulk Messaging (no Messenger) — with per-channel sender lists and content-template pickers
 - **OAuth sign-in** with an account-level [OAuth app](https://www.twilio.com/docs/iam/oauth-apps/account-oauth-apps) using the Client Credentials grant — scoped, independently revocable, and never stored server-side
-- **Resumable campaigns** on Programmable Messaging, tested to 10,000 recipients, surviving the 10-second Function timeout by chunking and checkpointing to Twilio Sync
+- **Resumable campaigns** on Programmable Messaging, tested to 2,000 recipients, surviving the 10-second Function timeout by chunking and checkpointing to Twilio Sync
 - **Live delivery tracking**, with CSV export — per message on Programmable Messaging, aggregate stats plus on-demand recipient rows on Bulk Messaging
 
 ## Two sending APIs
@@ -18,7 +18,7 @@ The app can send through either of Twilio's messaging APIs, chosen per campaign.
 | Request shape | one per recipient; suggested for up to 1,000 per campaign | one request for up to 10,000 recipients |
 | Channels | SMS, MMS, RCS, WhatsApp, Messenger | SMS, MMS, RCS, WhatsApp |
 | Tab must stay open | yes — the chunk loop runs in your browser | no — Twilio processes the request server-side |
-| Resumable | yes, checkpointed to Sync | not needed; there is no browser-driven loop to interrupt |
+| Resumable | yes: send the same list again and the app continues it | not needed; there is no browser-driven loop to interrupt |
 | Sender | phone number, sender, or Messaging Service | phone number, sender, or sender pool — no Messaging Service |
 | Delivery detail | per message, polled every 5s | aggregate stats polled every 5s; per-recipient rows fetched only when the delivery panel opens or a CSV export is requested |
 | Scheduling | not exposed | up to 7 days ahead |
@@ -104,7 +104,7 @@ Rows with a problem are skipped and listed by line number — a missing number, 
 >
 > Closing the tab, navigating away, or letting the machine sleep stops sending. Switching to another tab or app is fine — background tabs keep running, though browsers throttle timers to about one per second, which matches the delay already in the loop.
 >
-> Nothing is lost if sending is interrupted. Progress is checkpointed to Sync, so the campaign shows as **In Progress** with a **Resume** button that picks up after the last chunk sent. If a checkpoint cannot be saved, the page carries on from where sending really reached and warns you that some messages may show as "not confirmed", rather than sending that chunk again. Closing the tab also clears your credentials, so you will need to sign in again before resuming.
+> Nothing is sent twice if sending is interrupted. Progress is saved in Sync, so the campaign shows as **In Progress**. To continue, load the same recipients with the same settings and click **Send Messages**: the app recognizes the list, asks to continue the campaign, and skips everyone already sent. The **Resume** button explains this, since the deployment keeps no copy of your list. Closing the tab also clears your credentials, so you will need to sign in again first.
 >
 > Above 1,000 recipients the page suggests Bulk Messaging, which sends up to 10,000 in one request and does not need the tab kept open. Programmable Messaging still sends larger campaigns.
 
@@ -138,13 +138,11 @@ A template with no type the channel can render is omitted rather than offered, s
 
 ## How resumable execution works
 
-The page uploads the recipient list to `send-messages.js` in slices of up to 700 KB, since a Function request is capped at 1 MB. Once the whole list is in Sync, sending starts: up to 128 messages per chunk, chunk after chunk, saving the position after each. No chunk starts after 7 seconds, so that the last one finishes inside the platform's 10-second ceiling. A send still rate limited at 9 seconds is recorded as failed, to be sent again, rather than retried past the ceiling. The page then calls `resume-execution.js`, which reads the next recipients back from Sync, until the campaign completes.
+The page keeps the recipient list and sends it to `send-messages.js` in slices of whole 128-recipient chunks, at most eight chunks and 700 KB at a time, since a Function request is capped at 1 MB. Each call sends what fits its budget, starting no chunk after 7 seconds so the last finishes inside the platform's 10-second ceiling, and says where it reached; the next call starts there. A progress indicator beside **Send Messages** shows each stage.
 
-Each chunk is claimed in Sync before it is sent, by creating one item that holds a placeholder for each of its recipients, which Sync allows only once. A chunk already claimed is skipped, so no chunk is ever sent twice: not by two tabs, nor by a resume clicked while sending, nor by a retry after a failed request. While a chunk is being sent, its recipients show as "sending" in the delivery panel. If the send is cut off mid-chunk, they show as "not confirmed" once its claim is 15 seconds old: they may or may not have been sent, and the Messaging logs in the Twilio Console say which.
+Sync records as little as possible, because it accepts only about 2 writes a second per Map for items of a few KB (measured: 22 of 48 9 KB writes sent eight at a time, 20 of 20 at two a second). Each chunk has one record in the `campaign_<id>_chunks` Map. It is created, holding the recipients' numbers, before the chunk is sent — Sync allows that only once, so no chunk is ever sent twice — and updated afterwards with one compact row per recipient: message SID, status, error code, time. Chunks are paced 1.1 seconds apart. The campaign Document holds the owner, counters, progress, display fields, and a SHA-256 fingerprint of the list, which is how a list sent again is recognized. While a chunk is being sent, its recipients show as "sending"; if its result was never saved, they show as "not confirmed" — the Messaging logs in the Twilio Console say whether they were sent.
 
-A campaign's Sync Document holds only what does not grow with it: owner, counters, position, and the fields every message shares. Recipients live in the `campaign_<id>_recipients` Map, in buckets of up to 128 recipients and 9 KiB; statuses live in `campaign_<id>_statuses`, in buckets of 32. Every key is the index of the first recipient its bucket covers. That keeps every item under Sync's 16 KiB limit. Campaigns saved before this layout still open, but cannot be resumed.
-
-`check-status.js` refreshes the 24 status buckets checked least recently that still have a status to change, 20 messages at a time, and starts no fetch after 6.5 seconds. A large campaign's buckets take turns over several 5-second polls. Past roughly 13,000 messages, the per-message list no longer fits the 4 MB Function response, so the delivery panel shows the counts only.
+`check-status.js` fetches statuses from Twilio for at most 3 chunks per poll, least recently checked first, and writes back only those, so a large campaign's statuses catch up over several 5-second polls. While the page is sending, its polls only read. Past roughly 13,000 messages the per-message list no longer fits the 4 MB Function response, so the delivery panel shows the counts only. Campaigns saved in earlier layouts still open, but cannot be continued.
 
 **The browser drives that loop** — `sendMessagesBatch()` in `assets/app.js`, not a Twilio-side scheduler. This follows from never storing user credentials server-side: the Functions receive a Client ID and Secret per request and keep nothing, so no queue or cron could authenticate a continuation. Hence the tab must stay open. Making sending fire-and-forget would mean granting the deployment standing authorization to send on the user's behalf.
 
@@ -155,8 +153,7 @@ None of this applies to Bulk Messaging mode. `send-bulk.js` submits the whole ca
 ```
 functions/
   verify.js                 Validates OAuth credentials at sign-in
-  send-messages.js          Stores the recipient list in Sync, then starts sending
-  resume-execution.js       Continues a campaign from Sync, chunk by chunk
+  send-messages.js          Sends one slice of a campaign, chunk by chunk
   check-status.js           Campaign status, re-fetching unsettled messages from Twilio
   send-bulk.js              One-request sending via the Bulk Messaging API
   check-bulk-status.js      Bulk operation stats, and recipients on demand
@@ -168,8 +165,8 @@ assets/
   twilio-oauth.private.js   Shared OAuth client helper (private, not web-reachable)
   twilio-comms.private.js   comms.twilio.com client (no SDK support exists)
   bulk-payload.private.js   Pure request mapping for the Bulk API
-  classic-campaign.private.js  Sync layout and chunk loop for Programmable Messaging
-  classic-messages.private.js  Sending and status refresh for Programmable Messaging
+  classic-campaign.private.js  Chunk records and the send loop for Programmable Messaging
+  classic-messages.private.js  Sending and status fetches for Programmable Messaging
 ```
 
 Every Function receives `clientId` and `clientSecret` in its POST body and builds a per-request Twilio client through `assets/twilio-oauth.private.js`. The runtime credentials (`context.ACCOUNT_SID` / `context.AUTH_TOKEN`) are used for Sync access throughout, never for the user's own account. Messages are sent with no status callback, so no endpoint takes calls from Twilio.
@@ -201,11 +198,13 @@ Two limits worth stating plainly:
 
 **Sync errors.** Confirm the Sync API is enabled on the account and that the runtime credentials have Sync access.
 
-**Timeouts.** Handled automatically by chunking. If a single chunk still overruns, lower `RECIPIENT_BUCKET_MAX_ENTRIES` in `assets/classic-campaign.private.js`.
+**Timeouts.** Handled automatically by chunking. If a single chunk still overruns, lower `CHUNK_SIZE` in both `assets/classic-campaign.private.js` and `assets/app.js`.
+
+**"Twilio Sync is busy".** Sync refused writes for its rate; the page waits and carries on. If it gives up, send the same list again to continue.
 
 **Debugger shows error 11200 for `/webhook`.** The status webhook was removed: messages are now sent with no status callback, and `check-status.js` fetches their statuses instead. Messages sent before upgrading still report to `/webhook`, as does any Messaging Service whose status callback URL points there; clear that callback in the Console. The errors are harmless.
 
-**No Resume button on an unfinished campaign.** Either its recipient list was not fully uploaded, in which case nothing was sent and it can be sent again as a new campaign, or it was saved before the current storage layout. An older campaign's saved position can be behind what was actually sent, so check the Messaging logs in the Twilio Console before sending the remainder.
+**Resume says to send the list again.** The deployment keeps no copy of your recipients. Load the same CSV (or typed list) with the same sender, template and message, and click Send Messages; the app recognizes the campaign by its fingerprint and continues it. A list that differs in any way is a new campaign. An unfinished campaign with no Resume button was saved in an earlier layout and cannot be continued: check the Messaging logs before sending the rest.
 
 **Bulk mode rejects the sender.** A Messaging Service cannot be used as a bulk sender — the Bulk API's `from` accepts a phone number, a sender, or a sender pool, and a Messaging Service is none of those. Pick a phone number or sender pool, or switch to Programmable Messaging.
 

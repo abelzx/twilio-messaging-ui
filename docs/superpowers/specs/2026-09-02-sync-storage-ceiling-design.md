@@ -101,3 +101,7 @@ Implemented with these deviations, each argued in the plan:
 - Legacy documents render but cannot be resumed, because their stored index can be behind what was sent.
 - `check-status` writes the Document conditionally on its revision.
 - No hard recipient limit. Above 1,000 the page suggests Bulk Messaging.
+
+## Lean records (2026-11-12)
+
+The bucketed layout failed live: uploading 2,000 recipients with their own bodies hit `Rate limit exceeded for write-map-…_recipients`. Measured, a Map accepts about 2 writes a second of items over 1 KiB, after a burst of about 20 — not the 20 a second the docs give for small items. The layout was replaced by lean records (plan `2026-11-12-classic-lean-sync.md`): the list stays in the browser and is sent slice by slice; Sync holds one claimed-then-recorded record per 128-recipient chunk and the campaign's fingerprint; statuses come from Twilio, with at most 3 records rewritten per poll.
