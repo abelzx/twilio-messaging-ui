@@ -77,8 +77,17 @@ const SLICE_MAX_CHUNKS = 8;
 /** Most JSON per send-messages call. A Function request is capped at 1 MB. */
 const SLICE_MAX_BYTES = 700 * 1024;
 
+/** Most JSON for one chunk, which is always sent whole, in one request. */
+const CHUNK_MAX_BYTES = 950 * 1024;
+
 /** Times in a row to wait and retry when Sync refuses writes for its rate. */
 const THROTTLE_RETRIES = 5;
+
+/**
+ * Times in a row to retry a call that got no response, no JSON or a 5xx, 2, 4
+ * then 8 seconds later. Sending a slice again is safe: claimed chunks are skipped.
+ */
+const TRANSIENT_RETRIES = 3;
 
 /** Shown when a send finished but some results could not be saved. */
 const CHECKPOINT_WARNING = 'Sending finished, but some results could not be saved. '
@@ -121,7 +130,7 @@ function updateClassicLimitNotice() {
 /**
  * Where the slice starting at `start` ends: whole chunks only (the last may be
  * short), at most SLICE_MAX_CHUNKS, under SLICE_MAX_BYTES of JSON, and at least
- * one chunk.
+ * one chunk. Throws when a chunk alone would not fit a request.
  */
 function sliceEnd(messages, start) {
     const encoder = new TextEncoder();
@@ -131,6 +140,10 @@ function sliceEnd(messages, start) {
         const chunkEnd = Math.min(end + CHUNK_SIZE, messages.length);
         let chunkBytes = 0;
         for (let i = end; i < chunkEnd; i++) chunkBytes += encoder.encode(JSON.stringify(messages[i])).length + 1;
+        if (chunkBytes > CHUNK_MAX_BYTES) {
+            throw new Error(`These messages are too large to send ${CHUNK_SIZE} at a time (over 1 MB). `
+                + 'Shorten the per-recipient messages, or use Bulk Messaging.');
+        }
         if (end > start && bytes + chunkBytes > SLICE_MAX_BYTES) break;
         bytes += chunkBytes;
         end = chunkEnd;
@@ -144,7 +157,11 @@ async function listFingerprint(messages) {
     return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
-/** An unfinished classic campaign sent with exactly these messages, if any. */
+/**
+ * An unfinished classic campaign sent with exactly these messages, if any.
+ * Known limit: list-campaigns reads at most 1,000 Sync Documents, so in a
+ * service holding more, a much older campaign may not be recognised.
+ */
 function findUnfinishedCampaign(fingerprint, total) {
     return loadedCampaigns.find((campaign) => campaign.mode === 'classic' && campaign.resumable
         && campaign.fingerprint === fingerprint && campaign.totalMessages === total) || null;
@@ -714,6 +731,7 @@ function handleLogout() {
     clearCreds();
     currentCampaignId = null;
     currentCampaignMode = 'classic';
+    loadedCampaigns = [];
     if (resumeInterval) {
         clearInterval(resumeInterval);
         resumeInterval = null;
@@ -1524,6 +1542,7 @@ async function handleSendMessages(e) {
             await sendMessagesBatch(messages, channel, from, campaignName, details);
         }
     } catch (error) {
+        hideSendProgress();
         alert('Error: ' + error.message);
         setSendingState(false);
     } finally {
@@ -1548,29 +1567,42 @@ async function sendMessagesBatch(messages, channel, from, campaignName, details)
     const count = (n) => n.toLocaleString('en-US');
 
     updateSendProgress('Preparing the recipient list…');
+    // Every slice is measured once first, so a chunk too large to send stops
+    // the campaign before anything is sent.
+    for (let at = 0; at < total; at = sliceEnd(messages, at));
     const fingerprint = await listFingerprint(messages);
-    await loadCampaigns();
+    // Without the list of campaigns, a partly sent list would go to everyone again.
+    if (!(await loadCampaigns())) {
+        throw new Error('Could not check whether this list was already partly sent. '
+            + 'Nothing was sent — try again in a moment.');
+    }
 
     // Captured once: opening another campaign mid-send moves currentCampaignId.
     let campaignId = currentCampaignId;
     let offset = 0;
     const match = findUnfinishedCampaign(fingerprint, total);
-    if (match && confirm(`This list matches "${match.campaignName || match.campaignId}", which stopped after `
-        + `${count(match.startIndex || 0)} of ${count(total)} recipients. Continue that campaign? `
-        + 'Everyone already sent is skipped. Cancel starts a new campaign, which sends to everyone again.')) {
-        campaignId = match.campaignId;
-        offset = Math.floor((match.startIndex || 0) / CHUNK_SIZE) * CHUNK_SIZE;
-        currentCampaignId = campaignId;
+    if (match) {
+        const sentBefore = match.startIndex || 0;
+        if (confirm(`This list matches "${match.campaignName || match.campaignId}", which stopped after `
+            + `${count(sentBefore)} of ${count(total)} recipients. Continue that campaign? `
+            + 'Everyone already sent is skipped. Cancel to send it as a new campaign instead.')) {
+            campaignId = match.campaignId;
+            offset = Math.floor(sentBefore / CHUNK_SIZE) * CHUNK_SIZE;
+            currentCampaignId = campaignId;
+        } else if (!confirm(`Send to all ${count(total)} recipients again as a new campaign? Everyone on the `
+            + `list gets the message again, including the ${count(sentBefore)} already sent.`)) {
+            setSendingState(false);
+            return;
+        }
     }
 
     activeSendCampaignId = campaignId;
     let checkpointFailed = false;
     let waits = 0;
+    let retries = 0;
     try {
         while (offset < total) {
-            updateSendProgress(waits
-                ? 'Twilio Sync is busy — waiting before sending more…'
-                : `Sending… ${count(offset)} of ${count(total)}`, offset, total);
+            updateSendProgress(`Sending… ${count(offset)} of ${count(total)}`, offset, total);
 
             const end = sliceEnd(messages, offset);
             let response = null;
@@ -1592,6 +1624,15 @@ async function sendMessagesBatch(messages, channel, from, campaignName, details)
             }
             const data = response ? await readJson(response) : null;
 
+            // A 4xx is an answer, and sending it again would get the same one.
+            const transient = !response || response.status >= 500 || (!data && response.status < 400);
+            if (transient && retries < TRANSIENT_RETRIES) {
+                retries++;
+                updateSendProgress('Connection problem — retrying…', offset, total);
+                await sleep(1000 * 2 ** retries);
+                continue;
+            }
+
             if (!data || !response.ok) {
                 const status = response ? `HTTP ${response.status}` : 'no response';
                 activeSendCampaignId = null;
@@ -1603,6 +1644,7 @@ async function sendMessagesBatch(messages, channel, from, campaignName, details)
             if (data.resumeFrom > offset) {
                 offset = data.resumeFrom;
                 waits = 0;
+                retries = 0;
             } else if (data.throttled && waits < THROTTLE_RETRIES) {
                 waits++;
             } else {
@@ -1612,11 +1654,17 @@ async function sendMessagesBatch(messages, channel, from, campaignName, details)
             }
 
             await refreshCurrentCampaign({ refresh: false });
-            if (offset < total) await sleep(data.throttled ? 2000 * Math.max(1, waits) : 500);
+            if (offset < total) {
+                if (data.throttled) updateSendProgress('Twilio Sync is busy — waiting before sending more…', offset, total);
+                await sleep(data.throttled ? 2000 * Math.max(1, waits) : 500);
+            }
         }
 
         updateSendProgress('Finishing…', total, total);
-        if (checkpointFailed) alert(CHECKPOINT_WARNING);
+        if (checkpointFailed) {
+            hideSendProgress();
+            alert(CHECKPOINT_WARNING);
+        }
 
         // Final status check
         await refreshCurrentCampaign();
@@ -1696,6 +1744,7 @@ async function sendBulkCampaign(messages, channel, from, campaignName, details) 
 
     currentCampaignId = data.campaignId;
 
+    if (data.warning || data.partial) hideSendProgress();
     if (data.warning) alert(data.warning);
     if (data.partial) alert(data.error);
 
@@ -1926,12 +1975,12 @@ function resumeCampaignById(campaignId) {
     alert(RESUME_HOW);
 }
 
-// Campaign listing functions
+// Campaign listing functions. Resolves to whether the list was loaded.
 async function loadCampaigns() {
-    if (!creds) return;
+    if (!creds) return false;
 
     const campaignsContent = document.getElementById('campaigns-content');
-    if (!campaignsContent) return;
+    if (!campaignsContent) return false;
 
     try {
         const response = await postToFunction('list-campaigns');
@@ -1940,13 +1989,14 @@ async function loadCampaigns() {
         if (response.ok && data.campaigns) {
             loadedCampaigns = data.campaigns;
             displayCampaigns(data.campaigns);
-        } else {
-            campaignsContent.innerHTML = '<p style="color: #666; text-align: center; padding: 20px;">No campaigns found</p>';
+            return true;
         }
+        campaignsContent.innerHTML = '<p style="color: #666; text-align: center; padding: 20px;">No campaigns found</p>';
     } catch (error) {
         console.error('Error loading campaigns:', error);
         campaignsContent.innerHTML = '<p style="color: #d32f2f; text-align: center; padding: 20px;">Error loading campaigns</p>';
     }
+    return false;
 }
 
 /** The channel's name as the Messaging Channel dropdown shows it. */
@@ -2255,7 +2305,11 @@ async function fetchAndDisplayCampaignDetails(campaignId, mode) {
     }
 
     try {
-        const response = await postToFunction('check-status', { campaignId });
+        const response = await postToFunction('check-status', {
+            campaignId,
+            // While this tab sends it, polls only read (see checkCampaignStatus).
+            ...(campaignId === activeSendCampaignId ? { refresh: false } : {})
+        });
 
         const data = await response.json();
 
