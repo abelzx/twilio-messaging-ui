@@ -2436,8 +2436,9 @@ function displayMessageDetails(campaign) {
         const sentAt = statusInfo.sentAt || statusInfo.dateSent || null;
         const updatedAt = statusInfo.dateUpdated || statusInfo.webhookReceivedAt || null;
         
+        // Escaped below: `to` is from the user's list, and every field is read back from Sync.
         const errorCode = statusInfo.errorCode || '-';
-        const errorMessage = (statusInfo.errorMessage || '-').replace(/"/g, '&quot;');
+        const errorMessage = statusInfo.errorMessage || '-';
         const to = statusInfo.to || '-';
         // Bulk identifiers are not classic Twilio SIDs at all, so they always
         // fail MESSAGE_SID — testing them against it would label every
@@ -2456,15 +2457,15 @@ function displayMessageDetails(campaign) {
 
         html += `
             <tr>
-                <td style="font-family: monospace; font-size: 11px; word-break: break-all;">${sidLabel}</td>
-                <td>${to}</td>
-                <td><span class="status-badge ${statusClass}">${status}</span></td>
+                <td style="font-family: monospace; font-size: 11px; word-break: break-all;">${escapeHtml(sidLabel)}</td>
+                <td>${escapeHtml(to)}</td>
+                <td><span class="status-badge ${statusClass}">${escapeHtml(status)}</span></td>
                 <td>${delivered}</td>
                 <td>${read}</td>
-                <td>${errorCode}</td>
-                <td style="max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${errorMessage}">${errorMessage}</td>
-                <td>${formatDate(sentAt)}</td>
-                <td>${formatDate(updatedAt)}</td>
+                <td>${escapeHtml(errorCode)}</td>
+                <td style="max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${escapeHtml(errorMessage)}">${escapeHtml(errorMessage)}</td>
+                <td>${escapeHtml(formatDate(sentAt))}</td>
+                <td>${escapeHtml(formatDate(updatedAt))}</td>
             </tr>
         `;
     });
