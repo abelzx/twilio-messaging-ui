@@ -1517,9 +1517,12 @@ async function handleSendMessages(e) {
         channel, from, contentSid, body, contentVariables
     }));
 
-    // Generate campaign ID
-    currentCampaignId = `campaign_${Date.now()}`;
-    currentCampaignMode = isBulkMode() ? 'bulk' : 'classic';
+    // A classic campaign is named in sendMessagesBatch, just before its first
+    // call, so a send stopped earlier leaves the open campaign and its poll alone.
+    if (isBulkMode()) {
+        currentCampaignId = `campaign_${Date.now()}`;
+        currentCampaignMode = 'bulk';
+    }
 
     // Display data only: if collecting it fails, send without it rather than
     // not at all. buildDetails() on the server copes with a missing object.
@@ -1573,8 +1576,7 @@ async function sendMessagesBatch(messages, channel, from, campaignName, details)
             + 'Nothing was sent — try again in a moment.');
     }
 
-    // Captured once: opening another campaign mid-send moves currentCampaignId.
-    let campaignId = currentCampaignId;
+    let campaignId = null;
     let offset = 0;
     const match = findUnfinishedCampaign(fingerprint, total);
     if (match) {
@@ -1584,7 +1586,6 @@ async function sendMessagesBatch(messages, channel, from, campaignName, details)
             + 'Everyone already sent is skipped. Cancel to send it as a new campaign instead.')) {
             campaignId = match.campaignId;
             offset = Math.floor(sentBefore / CHUNK_SIZE) * CHUNK_SIZE;
-            currentCampaignId = campaignId;
         } else if (!confirm(`Send to all ${count(total)} recipients again as a new campaign? Everyone on the `
             + `list gets the message again, including the ${count(sentBefore)} already sent.`)) {
             setSendingState(false);
@@ -1592,6 +1593,10 @@ async function sendMessagesBatch(messages, channel, from, campaignName, details)
         }
     }
 
+    // Captured once: opening another campaign mid-send moves currentCampaignId.
+    campaignId = campaignId || `campaign_${Date.now()}`;
+    currentCampaignId = campaignId;
+    currentCampaignMode = 'classic';
     activeSendCampaignId = campaignId;
     let checkpointFailed = false;
     let waits = 0;
