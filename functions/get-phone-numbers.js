@@ -4,6 +4,7 @@
 
 const oauth = require(Runtime.getAssets()['/twilio-oauth.js'].path);
 const comms = require(Runtime.getAssets()['/twilio-comms.js'].path);
+const { filterToBulkSenders } = require(Runtime.getAssets()['/bulk-senders.js'].path);
 
 exports.handler = async function(context, event, callback) {
   const response = new Twilio.Response();
@@ -77,6 +78,21 @@ exports.handler = async function(context, event, callback) {
           }))
         );
 
+    // The Bulk API sends only from an address with an ACTIVATED Sender and
+    // rejects any other number at send time, however capable it is. MMS sends
+    // from an SMS Sender: the API has no MMS sender channel. Run alongside the
+    // other lookups for the same 10s budget reason. A failed lookup leaves the
+    // list unfiltered rather than empty, and `senderListFailed` says so.
+    const checksBulkSenders = mode === 'bulk' && (channel === 'sms' || channel === 'mms');
+    let senderListFailed = false;
+    const bulkSendersPromise = checksBulkSenders
+      ? comms.listSenders(authString, 'SMS').catch((error) => {
+          console.error('Bulk sender list failed:', error.message);
+          senderListFailed = true;
+          return null;
+        })
+      : Promise.resolve(null);
+
     let directPromise;
     if (channel === 'whatsapp' || channel === 'rcs') {
       // `channel` is required by this endpoint; omitting it throws.
@@ -127,7 +143,21 @@ exports.handler = async function(context, event, callback) {
       });
     }
 
-    const [direct, serviceSenders] = await Promise.all([directPromise, secondaryPromise]);
+    const [listed, serviceSenders, bulkSenders] = await Promise.all([
+      directPromise,
+      secondaryPromise,
+      bulkSendersPromise,
+    ]);
+
+    // `total` becomes the filtered count, so the "not online" figure never
+    // counts a number dropped for having no Sender; `notBulkSenders` does that.
+    let direct = listed;
+    let notBulkSenders = 0;
+    if (bulkSenders) {
+      const filtered = filterToBulkSenders(listed.senders, bulkSenders);
+      direct = { total: filtered.kept.length, senders: filtered.kept };
+      notBulkSenders = filtered.notBulkSenders;
+    }
 
     response.setStatusCode(200);
     response.setBody({
@@ -146,6 +176,9 @@ exports.handler = async function(context, event, callback) {
       // account with no pools configured, and both collapse usableCount the
       // same way. Absent in classic mode, where it would mean nothing.
       ...(mode === 'bulk' ? { poolListFailed } : {}),
+      // Bulk SMS and MMS only: how many capable numbers were left out for
+      // having no Bulk API Sender, and whether that lookup failed.
+      ...(checksBulkSenders ? { notBulkSenders, senderListFailed } : {}),
       // Kept so nothing that still reads `phoneNumbers` breaks silently.
       phoneNumbers: direct.senders.map((s) => ({ phoneNumber: s.value })),
     });

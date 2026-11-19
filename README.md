@@ -126,7 +126,7 @@ In Bulk Messaging mode the campaign card reports recipients **accepted**, not se
 
 A Messaging Service can be used as the sender on any channel. WhatsApp senders and recipients are auto-prefixed with `whatsapp:`, so either form works.
 
-This table describes what Programmable Messaging supports. Bulk Messaging mode offers the same four channels except Facebook Messenger, and cannot take a Messaging Service as the sender — see [Two sending APIs](#two-sending-apis).
+This table describes what Programmable Messaging supports. Bulk Messaging mode offers the same four channels except Facebook Messenger, and cannot take a Messaging Service as the sender — see [Two sending APIs](#two-sending-apis). For SMS and MMS, bulk mode offers only numbers with an active Bulk API Sender (`GET /v1/Senders`), and the help text under the dropdown counts the numbers left out.
 
 ### How SMS and MMS templates are filtered
 
@@ -165,6 +165,7 @@ assets/
   twilio-oauth.private.js   Shared OAuth client helper (private, not web-reachable)
   twilio-comms.private.js   comms.twilio.com client (no SDK support exists)
   bulk-payload.private.js   Pure request mapping for the Bulk API
+  bulk-senders.private.js   Which numbers the Bulk API will send from
   classic-campaign.private.js  Chunk records and the send loop for Programmable Messaging
   classic-messages.private.js  Sending and status fetches for Programmable Messaging
 ```
@@ -207,6 +208,8 @@ Two limits worth stating plainly:
 **Resume says to send the list again.** The deployment keeps no copy of your recipients. Load the same CSV (or typed list) with the same sender, template and message, and click Send Messages; the app recognizes the campaign by its fingerprint and continues it. A list that differs in any way is a new campaign. An unfinished campaign with no Resume button was saved in an earlier layout and cannot be continued: check the Messaging logs before sending the rest.
 
 **Bulk mode rejects the sender.** A Messaging Service cannot be used as a bulk sender — the Bulk API's `from` accepts a phone number, a sender, or a sender pool, and a Messaging Service is none of those. Pick a phone number or sender pool, or switch to Programmable Messaging.
+
+**Bulk mode says "from address must be a valid sender".** The Bulk API sends only from numbers with an `ACTIVATED` Sender, and a number can be SMS- and MMS-capable without one. US local numbers may need A2P 10DLC registration first, and toll-free numbers need verification. The sender dropdown leaves such numbers out; if it could not check, its help text says so.
 
 **Bulk mode returns 401 but sign-in worked.** Sign-in only proves the Messaging and Phone Numbers scopes. Bulk Messaging authenticates against `comms.twilio.com`, which needs the Comms scopes granted separately on the OAuth app.
 
