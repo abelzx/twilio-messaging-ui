@@ -377,4 +377,37 @@ async function listSenderPools(authString, retryOptions) {
   return Array.isArray(pools) ? pools : [];
 }
 
-module.exports = { createMessages, fetchOperation, listMessages, listSenderPools, BASE_URL };
+/** The API's maximum: 1001 is rejected with "must be less than or equal to 1000". */
+const SENDER_PAGE_SIZE = 1000;
+
+/** Bounds the lookup inside the Function budget: 10,000 Senders is far past any real account. */
+const MAX_SENDER_PAGES = 10;
+
+/**
+ * Senders on one channel that the Bulk API will send from now.
+ *
+ * Only an address with an ACTIVATED Sender is accepted as `from`; any other
+ * number is rejected at send time with "from address must be a valid sender",
+ * even when it is SMS- and MMS-capable. `pagination.next` is an opaque page
+ * token, not a URL, and goes back as `pageToken`.
+ */
+async function listSenders(authString, channel, retryOptions) {
+  const senders = [];
+  let pageToken;
+  for (let page = 0; page < MAX_SENDER_PAGES; page += 1) {
+    const response = await withRateLimitRetry(
+      () =>
+        request(authString, 'GET', '/Senders', {
+          query: { channel, status: 'ACTIVATED', pageSize: SENDER_PAGE_SIZE, pageToken },
+        }),
+      retryOptions
+    );
+    const body = await response.json();
+    if (Array.isArray(body.senders)) senders.push(...body.senders);
+    pageToken = body.pagination && body.pagination.next;
+    if (!pageToken) break;
+  }
+  return senders;
+}
+
+module.exports = { createMessages, fetchOperation, listMessages, listSenderPools, listSenders, BASE_URL };

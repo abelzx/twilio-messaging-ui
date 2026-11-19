@@ -315,3 +315,66 @@ test('retries a 429 when listing sender pools', async (t) => {
   assert.strictEqual(attempts, 2);
   assert.deepStrictEqual(pools, [{ id: 'SP1', friendlyName: 'Marketing' }]);
 });
+
+test('lists ACTIVATED senders on one channel at the maximum page size', async (t) => {
+  const sender = { address: '+18665550100', channel: 'SMS', status: 'ACTIVATED' };
+  const calls = stubFetch(t, () => jsonResponse(200, { senders: [sender], pagination: { next: null } }));
+
+  const senders = await comms.listSenders(AUTH, 'SMS');
+
+  const url = new URL(calls[0].url);
+  assert.strictEqual(url.pathname, '/v1/Senders');
+  assert.strictEqual(url.searchParams.get('channel'), 'SMS');
+  assert.strictEqual(url.searchParams.get('status'), 'ACTIVATED');
+  assert.strictEqual(url.searchParams.get('pageSize'), '1000');
+  assert.strictEqual(url.searchParams.has('pageToken'), false);
+  assert.deepStrictEqual(senders, [sender]);
+});
+
+test('follows pagination.next as a pageToken until it runs out', async (t) => {
+  const pages = {
+    '': { senders: [{ address: '+1' }], pagination: { next: 'tok2' } },
+    tok2: { senders: [{ address: '+2' }], pagination: { next: 'tok3' } },
+    tok3: { senders: [{ address: '+3' }], pagination: { next: null } },
+  };
+  const calls = stubFetch(t, (url) =>
+    jsonResponse(200, pages[new URL(url).searchParams.get('pageToken') || ''])
+  );
+
+  const senders = await comms.listSenders(AUTH, 'SMS');
+
+  assert.deepStrictEqual(senders.map((s) => s.address), ['+1', '+2', '+3']);
+  assert.strictEqual(calls.length, 3);
+});
+
+test('stops after 10 pages of senders', async (t) => {
+  const calls = stubFetch(t, () =>
+    jsonResponse(200, { senders: [{ address: '+1' }], pagination: { next: 'more' } })
+  );
+
+  const senders = await comms.listSenders(AUTH, 'SMS');
+
+  assert.strictEqual(calls.length, 10);
+  assert.strictEqual(senders.length, 10);
+});
+
+test('returns an empty array when the body has no senders array', async (t) => {
+  stubFetch(t, () => jsonResponse(200, {}));
+
+  assert.deepStrictEqual(await comms.listSenders(AUTH, 'SMS'), []);
+});
+
+test('retries a 429 while listing senders', async (t) => {
+  let attempts = 0;
+  stubFetch(t, () => {
+    attempts += 1;
+    return attempts === 1
+      ? jsonResponse(429, { code: 20429, message: 'Too Many Requests' })
+      : jsonResponse(200, { senders: [{ address: '+1' }] });
+  });
+
+  const senders = await comms.listSenders(AUTH, 'SMS', { baseDelay: 1 });
+
+  assert.strictEqual(attempts, 2);
+  assert.strictEqual(senders.length, 1);
+});
