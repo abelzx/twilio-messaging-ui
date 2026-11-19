@@ -120,13 +120,13 @@ In Bulk Messaging mode the campaign card reports recipients **accepted**, not se
 | --- | --- | --- |
 | SMS | Twilio phone number | templates defining `twilio/text` |
 | MMS | MMS-capable number | templates defining `twilio/media` |
-| RCS | RCS agent | text, media, card, carousel, quick-reply |
+| RCS | RCS agent; one awaiting carrier approval is offered as *test devices only* | text, media, card, carousel, quick-reply |
 | WhatsApp | WhatsApp-enabled sender, approved for messaging | any template, subject to Meta approval status |
 | Facebook Messenger | Facebook Page ID | not supported |
 
 A Messaging Service can be used as the sender on any channel. WhatsApp senders and recipients are auto-prefixed with `whatsapp:`, so either form works.
 
-This table describes what Programmable Messaging supports. Bulk Messaging mode offers the same four channels except Facebook Messenger, and cannot take a Messaging Service as the sender — see [Two sending APIs](#two-sending-apis). For SMS and MMS, bulk mode offers only numbers with an active Bulk API Sender (`GET /v1/Senders`), and the help text under the dropdown counts the numbers left out.
+This table describes what Programmable Messaging supports. Bulk Messaging mode offers the same four channels except Facebook Messenger, and cannot take a Messaging Service as the sender — see [Two sending APIs](#two-sending-apis). For SMS, MMS and RCS, bulk mode offers only senders with an active Bulk API Sender (`GET /v1/Senders`), and the help text under the dropdown counts the senders left out.
 
 ### How SMS and MMS templates are filtered
 

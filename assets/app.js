@@ -897,13 +897,13 @@ function renderSenderOptions(data) {
     const poolWarning = data.poolListFailed
         ? ' Sender pool list could not be loaded — any pools on this account are missing from the list above.'
         : '';
-    // Set only in bulk mode for SMS and MMS, when the Bulk API's Sender list
-    // could not be read and the numbers above are therefore unfiltered.
+    // Set only in bulk mode for SMS, MMS and RCS, when the Bulk API's Sender
+    // list could not be read and the senders above are therefore unfiltered.
     const senderListWarning = data.senderListFailed
-        ? ' Bulk API sender list could not be loaded — some numbers above may be rejected at send time.'
+        ? ' Bulk API sender list could not be loaded — some senders above may be rejected at send time.'
         : '';
     const warnings = poolWarning + senderListWarning;
-    // Capable numbers with no Bulk API Sender, which the Bulk API would reject.
+    // Senders with no Bulk API Sender, which the Bulk API would reject.
     const notBulk = data.notBulkSenders || 0;
 
     if (!senders.length) {
@@ -918,7 +918,9 @@ function renderSenderOptions(data) {
             help = (notBulk === 1
                 ? `This account's one ${noun} is not a Bulk API sender.`
                 : `None of this account's ${notBulk} ${noun}s is a Bulk API sender.`)
-                + ' US local numbers may need A2P 10DLC registration, and toll-free numbers verification.';
+                + (data.channel === 'sms' || data.channel === 'mms'
+                    ? ' US local numbers may need A2P 10DLC registration, and toll-free numbers verification.'
+                    : '');
         } else {
             // Distinguish "none exist" from "some exist but none usable" — the
             // second is a fixable configuration problem and should say so. Now that
