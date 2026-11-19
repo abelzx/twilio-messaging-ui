@@ -23,8 +23,8 @@ In bulk mode, for SMS and MMS, a number is offered only if it is capable for the
 
 ### `listSenders(authString, channel, retryOptions)` in `assets/twilio-comms.private.js`
 
-- Calls `GET /v1/Senders?channel=<channel>&status=ACTIVATED&pageSize=100`. The server-side filters were checked against the live API: `channel=SMS&status=ACTIVATED` returned exactly the 21 SMS Senders.
-- Follows `pagination.next` until it is null. A `next` that names a host other than `comms.twilio.com` is not followed, so credentials never go anywhere else.
+- Calls `GET /v1/Senders?channel=<channel>&status=ACTIVATED&pageSize=1000`. The server-side filters were checked against the live API: `channel=SMS&status=ACTIVATED` returned exactly the 21 SMS Senders. 1000 is the API's maximum page size; 1001 returns `400 must be less than or equal to 1000`.
+- `pagination.next` is an opaque page token, not a URL. It is sent back as `pageToken` until it is null, which was checked live (`pageSize=5` gave 5 pages, 21 unique Senders). At most 10 pages are read, to stay inside the Function budget; anything beyond 10,000 Senders is not offered.
 - Wrapped in `withRateLimitRetry`, like the other calls in that module.
 - Returns the raw Sender objects, or `[]` when the body has no `senders` array.
 
@@ -47,7 +47,13 @@ A pure function, so it can be unit-tested without a Function runtime.
 ### `assets/app.js`, `renderSenderOptions`
 
 - When `notBulkSenders > 0`, append ` · N not Bulk API senders` to the help text.
-- When the list is empty and `notBulkSenders > 0`, the option and help text read: `No phone numbers are Bulk API senders — N on this account are not. US local numbers need A2P 10DLC registration; toll-free numbers need verification.` This replaces the "registered but not online" text, which would be wrong here.
+- When the list is empty and `notBulkSenders > 0`, the option reads `No <noun>s are Bulk API senders`. The help text reads `None of this account's N <noun>s is a Bulk API sender. US local numbers may need A2P 10DLC registration, and toll-free numbers verification.` This replaces the "registered but not online" text, which would be wrong here.
+
+### `README.md`
+
+- The Two sending APIs note (after the channel table) says bulk mode offers only numbers that are active Bulk API Senders.
+- A troubleshooting entry for `from address must be a valid sender`.
+- `bulk-senders.private.js` is added to the file tree.
 - When `senderListFailed` is set, append a warning like the pool one: ` Bulk API sender list could not be loaded — some numbers above may be rejected at send time.`
 
 ## Error handling
@@ -61,6 +67,6 @@ A pure function, so it can be unit-tested without a Function runtime.
 
 ## Testing
 
-- `test/twilio-comms.test.js`: `listSenders` sends `channel` and `status=ACTIVATED`, follows `pagination.next`, refuses a `next` on another host, tolerates a body with no `senders` array, and retries a 429.
+- `test/twilio-comms.test.js`: `listSenders` sends `channel`, `status=ACTIVATED` and `pageSize=1000`, follows `pagination.next` as `pageToken`, stops after 10 pages, tolerates a body with no `senders` array, and retries a 429.
 - `test/bulk-senders.test.js`: `filterToBulkSenders` keeps matches in their original order, counts what it drops, and handles empty inputs.
 - After deploy: in the dev UI, bulk mode, SMS, the dropdown offers no US local number, and the help text's "not Bulk API senders" count equals the capable numbers dropped. Expected values are worked out from `/v1/Senders` and the account's numbers just before the check.
