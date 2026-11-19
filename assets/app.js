@@ -897,20 +897,40 @@ function renderSenderOptions(data) {
     const poolWarning = data.poolListFailed
         ? ' Sender pool list could not be loaded — any pools on this account are missing from the list above.'
         : '';
+    // Set only in bulk mode for SMS and MMS, when the Bulk API's Sender list
+    // could not be read and the numbers above are therefore unfiltered.
+    const senderListWarning = data.senderListFailed
+        ? ' Bulk API sender list could not be loaded — some numbers above may be rejected at send time.'
+        : '';
+    const warnings = poolWarning + senderListWarning;
+    // Capable numbers with no Bulk API Sender, which the Bulk API would reject.
+    const notBulk = data.notBulkSenders || 0;
 
     if (!senders.length) {
         const opt = document.createElement('option');
         opt.value = '';
         opt.disabled = true;
-        // Distinguish "none exist" from "some exist but none usable" — the
-        // second is a fixable configuration problem and should say so. Now that
-        // Messaging Services are offered on every channel, "none" also means no
-        // services exist on the account.
-        opt.textContent = data.totalRegistered
-            ? `No usable ${noun}s — ${data.totalRegistered} registered but not online`
-            : `No ${noun}s or Messaging Services registered on this account`;
+        let help;
+        if (notBulk > 0) {
+            // Every capable number was dropped for having no Bulk API Sender,
+            // so "registered but not online" would be wrong here.
+            opt.textContent = `No ${noun}s are Bulk API senders`;
+            help = (notBulk === 1
+                ? `This account's one ${noun} is not a Bulk API sender.`
+                : `None of this account's ${notBulk} ${noun}s is a Bulk API sender.`)
+                + ' US local numbers may need A2P 10DLC registration, and toll-free numbers verification.';
+        } else {
+            // Distinguish "none exist" from "some exist but none usable" — the
+            // second is a fixable configuration problem and should say so. Now that
+            // Messaging Services are offered on every channel, "none" also means no
+            // services exist on the account.
+            opt.textContent = data.totalRegistered
+                ? `No usable ${noun}s — ${data.totalRegistered} registered but not online`
+                : `No ${noun}s or Messaging Services registered on this account`;
+            help = opt.textContent;
+        }
         select.appendChild(opt);
-        setSenderHelp(opt.textContent + poolWarning, true);
+        setSenderHelp(help + warnings, true);
         return;
     }
 
@@ -960,10 +980,11 @@ function renderSenderOptions(data) {
     if (direct.length) parts.push(`${direct.length} ${noun}${direct.length === 1 ? '' : 's'}`);
     if (services.length) parts.push(`${services.length} Messaging Service${services.length === 1 ? '' : 's'}`);
     if (pools.length) parts.push(`${pools.length} sender pool${pools.length === 1 ? '' : 's'}`);
+    if (notBulk > 0) parts.push(`${notBulk} not Bulk API sender${notBulk === 1 ? '' : 's'}`);
     const hidden = (data.totalRegistered || 0) - (data.directCount || 0);
     setSenderHelp(
-        parts.join(' · ') + (hidden > 0 ? ` · ${hidden} not online` : '') + poolWarning,
-        Boolean(data.poolListFailed)
+        parts.join(' · ') + (hidden > 0 ? ` · ${hidden} not online` : '') + warnings,
+        Boolean(data.poolListFailed || data.senderListFailed)
     );
 }
 
