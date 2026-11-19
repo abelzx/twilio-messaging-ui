@@ -63,6 +63,22 @@ test('MMS media goes out as an array', () => {
   assert.deepStrictEqual(params.mediaUrl, ['https://example.com/a.jpg']);
 });
 
+test('an RCS agent as From sends to an rcs: recipient, prefixed once', () => {
+  const opts = { channel: 'rcs', from: 'rcs:tmo_qsvqcst9_agent' };
+  assert.deepStrictEqual(
+    classicMessages.messageParams({ to: '+6580998266', body: 'Hi' }, opts),
+    { to: 'rcs:+6580998266', from: 'rcs:tmo_qsvqcst9_agent', body: 'Hi' }
+  );
+  assert.strictEqual(classicMessages.messageParams({ to: 'rcs:+6580998266', body: 'Hi' }, opts).to, 'rcs:+6580998266');
+});
+
+test('RCS through a Messaging Service keeps the recipient bare, so SMS fallback still works', () => {
+  assert.deepStrictEqual(
+    classicMessages.messageParams({ to: '+6580998266', body: 'Hi' }, { channel: 'rcs', from: MG }),
+    { to: '+6580998266', messagingServiceSid: MG, body: 'Hi' }
+  );
+});
+
 test('sendChunk numbers results from startIndex and never rejects', async () => {
   let n = 0;
   const client = fakeClient({

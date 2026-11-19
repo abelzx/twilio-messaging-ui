@@ -121,6 +121,12 @@ function messageParams(message, { channel, from, messagingServiceSid } = {}) {
       if (service) params.messagingServiceSid = service;
     }
   } else if (channel === 'mms' || channel === 'rcs') {
+    // An RCS agent as From needs an rcs: recipient, or Twilio refuses the pair
+    // with 21910. A Messaging Service keeps the recipient bare, so it can still
+    // fall back to SMS where RCS is unavailable.
+    if (channel === 'rcs' && String(params.from || '').startsWith('rcs:')) {
+      params.to = String(params.to).startsWith('rcs:') ? String(params.to) : `rcs:${params.to}`;
+    }
     if (message.mediaUrl) {
       params.mediaUrl = Array.isArray(message.mediaUrl) ? message.mediaUrl : [message.mediaUrl];
     }
