@@ -38,3 +38,14 @@ test('returns nothing kept and nothing dropped for an account with no numbers', 
     notBulkSenders: 0,
   });
 });
+
+test('matches an RCS agent whether or not its rcs: prefix is present', () => {
+  const agent = { value: 'rcs:tmo_qsvqcst9_agent', label: 'tmo_qsvqcst9_agent', status: 'DRAFT', kind: 'direct' };
+
+  const result = filterToBulkSenders(
+    [agent, option('rcs:other_agent')],
+    [{ address: 'tmo_qsvqcst9_agent' }]
+  );
+
+  assert.deepStrictEqual(result, { kept: [agent], notBulkSenders: 1 });
+});
