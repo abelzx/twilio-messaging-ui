@@ -22,11 +22,13 @@ test('maps SMS to a PHONE recipient', () => {
   assert.deepStrictEqual(out.to, [{ address: '+15558675310', channel: 'PHONE' }]);
 });
 
-test('maps MMS and RCS senders to their own channel, recipients to PHONE', () => {
+test('sends MMS from an SMS sender, since the API has no MMS sender channel', () => {
   const mms = payload.buildPayloads({ ...BASE, channel: 'mms' })[0];
-  assert.strictEqual(mms.from.channel, 'MMS');
+  assert.strictEqual(mms.from.channel, 'SMS');
   assert.strictEqual(mms.to[0].channel, 'PHONE');
+});
 
+test('maps RCS senders to their own channel, recipients to PHONE', () => {
   const rcs = payload.buildPayloads({ ...BASE, channel: 'rcs' })[0];
   assert.strictEqual(rcs.from.channel, 'RCS');
   assert.strictEqual(rcs.to[0].channel, 'PHONE');
@@ -273,7 +275,7 @@ test('attaches media on MMS', () => {
   });
   assert.deepStrictEqual(out.content, {
     text: 'Hello',
-    media: ['https://example.com/a.jpg'],
+    media: [{ url: 'https://example.com/a.jpg' }],
   });
 });
 
@@ -284,8 +286,8 @@ test('accepts an array of media URLs', () => {
     mediaUrl: ['https://example.com/a.jpg', 'https://example.com/b.jpg'],
   });
   assert.deepStrictEqual(out.content.media, [
-    'https://example.com/a.jpg',
-    'https://example.com/b.jpg',
+    { url: 'https://example.com/a.jpg' },
+    { url: 'https://example.com/b.jpg' },
   ]);
 });
 
@@ -329,9 +331,9 @@ test('omits schedule when no sendAt is given', () => {
   assert.strictEqual('schedule' in out, false);
 });
 
-test('passes sendAt through as a schedule', () => {
+test('passes sendAt through as a one-item schedule array', () => {
   const [out] = payload.buildPayloads({ ...BASE, sendAt: '2026-09-10T09:30:00Z' });
-  assert.deepStrictEqual(out.schedule, { sendAt: '2026-09-10T09:30:00Z' });
+  assert.deepStrictEqual(out.schedule, { sendAt: ['2026-09-10T09:30:00Z'] });
 });
 
 test('rejects a sendAt that is not RFC 3339', () => {
