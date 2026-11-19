@@ -15,10 +15,15 @@
 
 'use strict';
 
-/** Sender channel and recipient channel per app channel. Only WhatsApp differs. */
+/**
+ * Sender channel and recipient channel per app channel. Only WhatsApp differs.
+ *
+ * MMS has no sender channel of its own: the API's sender channels are SMS, RCS
+ * and WhatsApp, and a message becomes MMS by carrying `content.media`.
+ */
 const CHANNEL_MAP = {
   sms: { from: 'SMS', to: 'PHONE' },
-  mms: { from: 'MMS', to: 'PHONE' },
+  mms: { from: 'SMS', to: 'PHONE' },
   rcs: { from: 'RCS', to: 'PHONE' },
   whatsapp: { from: 'WHATSAPP', to: 'WHATSAPP' },
 };
@@ -118,8 +123,9 @@ function resolveContent(request, recipients) {
     (recipient) => String(recipient.body == null ? '' : recipient.body).trim() !== ''
   );
 
+  // Each item is a `MediaUrl` object, not a bare string.
   const media = MEDIA_CHANNELS.has(String(request.channel).toLowerCase())
-    ? [].concat(request.mediaUrl || []).filter(Boolean)
+    ? [].concat(request.mediaUrl || []).filter(Boolean).map((url) => ({ url }))
     : [];
 
   if (anyOwnBody) {
@@ -208,10 +214,9 @@ function buildTags(request, channel) {
 /**
  * Validates `sendAt` without normalising it.
  *
- * Passed through exactly as received: the API reference renders the field as
- * `{sendAt: [RFC 3339 date-time]}` while the scheduling guide shows a literal
- * array, so the shape is confirmed against a live call rather than guessed. If
- * it turns out to want an array, this function is the only thing that changes.
+ * The value is passed through as received, but wrapped in an array: the API
+ * schema types `sendAt` as an array of RFC 3339 strings, of which only the
+ * first is used.
  */
 function resolveSchedule(sendAt) {
   if (sendAt == null || String(sendAt).trim() === '') return null;
@@ -219,7 +224,7 @@ function resolveSchedule(sendAt) {
   if (Number.isNaN(Date.parse(value))) {
     throw httpError(400, `"${value}" is not a valid RFC 3339 date and time.`);
   }
-  return { sendAt: value };
+  return { sendAt: [value] };
 }
 
 /**
